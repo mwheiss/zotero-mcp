@@ -658,6 +658,14 @@ class ChromaClient:
             logger.error(f"Error upserting documents to ChromaDB: {e}")
             raise
 
+    def embed_documents(self, documents: list[str]) -> list[list[float]]:
+        """Compute document embeddings without mutating the collection."""
+        embeddings = self.embedding_function(documents)
+        return [
+            embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
+            for embedding in embeddings
+        ]
+
     def upsert_embeddings(self,
                          documents: list[str],
                          metadatas: list[dict[str, Any]],
@@ -670,12 +678,17 @@ class ChromaClient:
         returned asynchronously without calling the realtime embeddings API.
         """
         try:
-            self.collection.upsert(
-                documents=documents,
-                metadatas=metadatas,
-                ids=ids,
-                embeddings=embeddings,
-            )
+            try:
+                max_batch = int(self.client.get_max_batch_size())
+            except Exception:
+                max_batch = 5000
+            for i in range(0, len(ids), max_batch):
+                self.collection.upsert(
+                    documents=documents[i:i + max_batch],
+                    metadatas=metadatas[i:i + max_batch],
+                    ids=ids[i:i + max_batch],
+                    embeddings=embeddings[i:i + max_batch],
+                )
             logger.info(f"Upserted {len(documents)} precomputed embeddings to ChromaDB collection")
         except Exception as e:
             logger.error(f"Error upserting precomputed embeddings to ChromaDB: {e}")

@@ -13,6 +13,9 @@ import os
 import re
 import sys
 import threading
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -33,6 +36,17 @@ from .local_db import LocalZoteroReader
 from .utils import format_creators, is_local_mode, suppress_stdout
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PreparedIndexBatch:
+    """An embedding batch prepared in memory but not yet written to ChromaDB."""
+
+    documents: list[str]
+    metadatas: list[dict[str, Any]]
+    ids: list[str]
+    item_keys: list[str]
+    stats: dict[str, int]
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -1603,6 +1617,7 @@ class ZoteroSemanticSearch:
         extract_fulltext: bool = False,
         include_fulltext: bool | None = None,
         use_openai_batch: bool | None = None,
+        embedding_concurrency: int = 1,
     ) -> dict[str, Any]:
         """
         Update the semantic search database with Zotero items.
@@ -1619,6 +1634,9 @@ class ZoteroSemanticSearch:
                 `extract_fulltext` provides richer local extraction.
             use_openai_batch: Override for OpenAI Batch API indexing. None
                 uses `semantic_search.openai_batch.enabled`.
+            embedding_concurrency: Number of realtime OpenAI-compatible
+                embedding batches to run concurrently. ChromaDB reads and
+                writes remain sequential. Defaults to 1.
 
         Returns:
             Update statistics
@@ -1679,6 +1697,23 @@ class ZoteroSemanticSearch:
             # extractor (extract_fulltext=True takes precedence in local mode)
             include_fulltext_via_api = include_fulltext and not extract_fulltext
             use_openai_batch = self._resolve_openai_batch_enabled(use_openai_batch)
+            if embedding_concurrency < 1:
+                raise ValueError("embedding_concurrency must be at least 1")
+            if embedding_concurrency > 1:
+                if use_openai_batch:
+                    raise ValueError(
+                        "embedding_concurrency cannot be combined with OpenAI Batch mode"
+                    )
+                if self.chroma_client.embedding_model != "openai":
+                    raise ValueError(
+                        "embedding_concurrency above 1 requires realtime "
+                        "OpenAI-compatible embeddings"
+                    )
+                stats["embedding_concurrency"] = embedding_concurrency
+                logger.info(
+                    "Using %s concurrent realtime embedding batches",
+                    embedding_concurrency,
+                )
 
             # In batch mode, defer destructive rebuilds until import so the
             # existing search index remains usable while the batch runs.
@@ -1876,10 +1911,10 @@ class ZoteroSemanticSearch:
             batch_size = 25
             seen_items = 0
             _failed_docs = []  # Collect failures for end-of-run retry
-            for i in range(0, len(all_items), batch_size):
-                batch = all_items[i : i + batch_size]
+            failed_concurrent_batches: list[_PreparedIndexBatch] = []
 
-                # Show per-item progress within this batch
+            def report_batch_progress(batch: list[dict[str, Any]]) -> None:
+                nonlocal seen_items
                 for item in batch:
                     seen_items += 1
                     title = item.get("data", {}).get("title", "")
@@ -1892,8 +1927,7 @@ class ZoteroSemanticSearch:
                     except Exception:
                         pass
 
-                batch_stats = self._process_item_batch(batch, force_full_rebuild, _failed_docs)
-
+            def accumulate_batch_stats(batch_stats: dict[str, int]) -> None:
                 stats["processed_items"] += batch_stats["processed"]
                 stats["added_items"] += batch_stats["added"]
                 stats["updated_items"] += batch_stats["updated"]
@@ -1903,6 +1937,126 @@ class ZoteroSemanticSearch:
                 logger.info(
                     f"Processed {seen_items}/{total} items (added: {stats['added_items']}, skipped: {stats['skipped_items']})"
                 )
+
+            batches = [
+                all_items[i : i + batch_size]
+                for i in range(0, len(all_items), batch_size)
+            ]
+            if embedding_concurrency == 1:
+                for batch in batches:
+                    report_batch_progress(batch)
+                    batch_stats = self._process_item_batch(
+                        batch,
+                        force_full_rebuild,
+                        _failed_docs,
+                    )
+                    accumulate_batch_stats(batch_stats)
+            else:
+                pending: deque[
+                    tuple[
+                        list[dict[str, Any]],
+                        _PreparedIndexBatch,
+                        Future[list[list[float]]] | None,
+                    ]
+                ] = deque()
+                batch_iter = iter(batches)
+
+                def submit_batch(
+                    executor: ThreadPoolExecutor,
+                    batch: list[dict[str, Any]],
+                ) -> None:
+                    prepared = self._prepare_item_batch(batch)
+                    future = (
+                        executor.submit(
+                            self.chroma_client.embed_documents,
+                            prepared.documents,
+                        )
+                        if prepared.documents
+                        else None
+                    )
+                    pending.append((batch, prepared, future))
+
+                with ThreadPoolExecutor(
+                    max_workers=embedding_concurrency,
+                    thread_name_prefix="zotero-embedding",
+                ) as executor:
+                    for _ in range(embedding_concurrency):
+                        try:
+                            submit_batch(executor, next(batch_iter))
+                        except StopIteration:
+                            break
+
+                    while pending:
+                        batch, prepared, future = pending.popleft()
+                        report_batch_progress(batch)
+                        if future is not None:
+                            try:
+                                embeddings = future.result()
+                                self._commit_prepared_batch(
+                                    prepared,
+                                    force_rebuild=force_full_rebuild,
+                                    embeddings=embeddings,
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Concurrent embedding batch failed (%s), "
+                                    "saving it for a sequential retry",
+                                    e,
+                                )
+                                prepared.stats["errors"] += len(prepared.documents)
+                                failed_concurrent_batches.append(prepared)
+                        accumulate_batch_stats(prepared.stats)
+
+                        try:
+                            submit_batch(executor, next(batch_iter))
+                        except StopIteration:
+                            pass
+
+                if failed_concurrent_batches:
+                    import time as _retry_time
+
+                    failed_items = sum(
+                        batch.stats["processed"]
+                        for batch in failed_concurrent_batches
+                    )
+                    try:
+                        sys.stderr.write(
+                            f"\n  Retrying {failed_items} failed items sequentially...\n"
+                        )
+                    except Exception:
+                        pass
+                    _retry_time.sleep(1)
+
+                    retry_ok = 0
+                    retry_fail = 0
+                    for prepared in failed_concurrent_batches:
+                        try:
+                            embeddings = self.chroma_client.embed_documents(
+                                prepared.documents
+                            )
+                            self._commit_prepared_batch(
+                                prepared,
+                                force_rebuild=force_full_rebuild,
+                                embeddings=embeddings,
+                            )
+                            stats["errors"] -= len(prepared.documents)
+                            recovered = prepared.stats["processed"]
+                            stats["recovered_items"] += recovered
+                            retry_ok += recovered
+                        except Exception as e:
+                            retry_fail += prepared.stats["processed"]
+                            logger.error(
+                                "Sequential retry failed for batch starting %s: %s",
+                                prepared.ids[0] if prepared.ids else "unknown",
+                                e,
+                            )
+                    try:
+                        sys.stderr.write(
+                            f"  Retry: {retry_ok} recovered, "
+                            f"{retry_fail} still failed\n"
+                        )
+                    except Exception:
+                        pass
 
             # Retry any documents that failed during the main run
             if _failed_docs:
@@ -1976,20 +2130,11 @@ class ZoteroSemanticSearch:
             # for the path where we actually hold the lock.
             lock_cm.__exit__(None, None, None)
 
-    def _process_item_batch(
+    def _prepare_item_batch(
         self,
         items: list[dict[str, Any]],
-        force_rebuild: bool = False,
-        _failed_docs: list | None = None,
-    ) -> dict[str, int]:
-        """Process a batch of items.
-
-        _failed_docs: optional list (passed by reference from update_database)
-        that collects (doc_text, metadata, doc_id) tuples for batches that fail
-        mid-run. Without this, the retry path at update_database:839-865 is
-        dead code — a NameError raised here would crash the whole reindex,
-        making every transient ChromaDB error fatal instead of recoverable.
-        """
+    ) -> _PreparedIndexBatch:
+        """Prepare an item batch without embedding or mutating ChromaDB."""
         stats = {"processed": 0, "added": 0, "updated": 0, "skipped": 0, "errors": 0}
 
         chunking = self._chunking_enabled
@@ -2060,50 +2205,103 @@ class ZoteroSemanticSearch:
                 logger.error(f"Error processing item {item.get('key', 'unknown')}: {e}")
                 stats["errors"] += 1
 
-        # Add documents to ChromaDB if any
-        if documents:
-            # Which items already existed (drives added-vs-updated). When
-            # chunking, also clear an item's stale passages before re-adding so
-            # a shrinking document never leaves orphaned chunks behind.
-            existing_item_keys: set[str] = set()
-            if not force_rebuild:
-                if chunking:
-                    probe_ids = [f"{k}#0" for k in item_keys_order]
-                    existing_chunk0 = self.chroma_client.get_existing_ids(probe_ids)
-                    existing_item_keys = {cid.split("#", 1)[0] for cid in existing_chunk0}
-                    if hasattr(self.chroma_client, "delete_item_chunks"):
-                        for k in dict.fromkeys(item_keys_order):
-                            try:
-                                self.chroma_client.delete_item_chunks(k)
-                            except Exception as e:
-                                logger.debug(f"delete_item_chunks({k}) failed: {e}")
-                else:
-                    existing_item_keys = self.chroma_client.get_existing_ids(ids)
+        return _PreparedIndexBatch(
+            documents=documents,
+            metadatas=metadatas,
+            ids=ids,
+            item_keys=item_keys_order,
+            stats=stats,
+        )
 
-            try:
+    def _commit_prepared_batch(
+        self,
+        prepared: _PreparedIndexBatch,
+        force_rebuild: bool = False,
+        _failed_docs: list | None = None,
+        embeddings: list[list[float]] | None = None,
+    ) -> dict[str, int]:
+        """Write one prepared batch, optionally using precomputed embeddings."""
+        documents = prepared.documents
+        metadatas = prepared.metadatas
+        ids = prepared.ids
+        item_keys_order = prepared.item_keys
+        stats = prepared.stats
+
+        if not documents:
+            return stats
+        if embeddings is not None and len(embeddings) != len(documents):
+            raise ValueError(
+                "Embedding provider returned "
+                f"{len(embeddings)} vectors for {len(documents)} documents"
+            )
+
+        # Which items already existed (drives added-vs-updated). When
+        # chunking, also clear an item's stale passages before re-adding so
+        # a shrinking document never leaves orphaned chunks behind.
+        existing_item_keys: set[str] = set()
+        if not force_rebuild:
+            if self._chunking_enabled:
+                probe_ids = [f"{k}#0" for k in item_keys_order]
+                existing_chunk0 = self.chroma_client.get_existing_ids(probe_ids)
+                existing_item_keys = {
+                    cid.split("#", 1)[0] for cid in existing_chunk0
+                }
+                if hasattr(self.chroma_client, "delete_item_chunks"):
+                    for key in dict.fromkeys(item_keys_order):
+                        try:
+                            self.chroma_client.delete_item_chunks(key)
+                        except Exception as e:
+                            logger.debug(
+                                "delete_item_chunks(%s) failed: %s",
+                                key,
+                                e,
+                            )
+            else:
+                existing_item_keys = self.chroma_client.get_existing_ids(ids)
+
+        try:
+            if embeddings is None:
                 self.chroma_client.upsert_documents(documents, metadatas, ids)
-                for k in item_keys_order:
-                    if k in existing_item_keys:
-                        stats["updated"] += 1
-                    else:
-                        stats["added"] += 1
-            except Exception as e:
-                # Batch failed — collect failures for end-of-run retry.
-                # ChromaDB's ONNX tokenizer can fail intermittently in bursts;
-                # retrying immediately usually fails too. Collecting failures
-                # and retrying after all batches are done is more effective.
-                logger.warning(f"Batch upsert failed ({e}), saving for retry")
-                if _failed_docs is not None:
-                    for j in range(len(documents)):
-                        _failed_docs.append((documents[j], metadatas[j], ids[j]))
-                    # Count them as errors so stats are accurate
-                    stats["errors"] += len(documents)
+            else:
+                self.chroma_client.upsert_embeddings(
+                    documents,
+                    metadatas,
+                    ids,
+                    embeddings,
+                )
+            for key in item_keys_order:
+                if key in existing_item_keys:
+                    stats["updated"] += 1
                 else:
-                    # No retry list — this is the legacy crash path; re-raise
-                    # so caller sees the real error instead of hiding it.
-                    raise
+                    stats["added"] += 1
+        except Exception as e:
+            # Batch failed — collect failures for end-of-run retry.
+            # ChromaDB's ONNX tokenizer can fail intermittently in bursts;
+            # retrying immediately usually fails too. Collecting failures
+            # and retrying after all batches are done is more effective.
+            logger.warning(f"Batch upsert failed ({e}), saving for retry")
+            if _failed_docs is not None:
+                for j in range(len(documents)):
+                    _failed_docs.append((documents[j], metadatas[j], ids[j]))
+                stats["errors"] += len(documents)
+            else:
+                raise
 
         return stats
+
+    def _process_item_batch(
+        self,
+        items: list[dict[str, Any]],
+        force_rebuild: bool = False,
+        _failed_docs: list | None = None,
+    ) -> dict[str, int]:
+        """Prepare, embed, and write a batch through the sequential path."""
+        prepared = self._prepare_item_batch(items)
+        return self._commit_prepared_batch(
+            prepared,
+            force_rebuild=force_rebuild,
+            _failed_docs=_failed_docs,
+        )
 
     def get_openai_batch_status(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
         """Refresh and return OpenAI Batch API status for the latest run or selected batches."""
