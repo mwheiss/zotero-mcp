@@ -9,10 +9,13 @@ over research libraries.
 import contextlib
 import json
 import logging
+import math
 import os
 import re
+import statistics
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -47,6 +50,50 @@ class _PreparedIndexBatch:
     ids: list[str]
     item_keys: list[str]
     stats: dict[str, int]
+
+
+class _MedianETA:
+    """Estimate remaining time from all observed per-entry durations."""
+
+    def __init__(
+        self,
+        total: int,
+        parallelism: int = 1,
+    ):
+        self.total = max(0, total)
+        self.parallelism = max(1, parallelism)
+        self._durations: list[float] = []
+
+    def record(self, duration: float) -> None:
+        """Record one completed entry's processing duration."""
+        self._durations.append(max(0.0, duration))
+
+    def estimate(self, completed: int) -> float | None:
+        """Return ETA in seconds using the median of all recorded entries."""
+        completed = min(max(0, completed), self.total)
+        if completed >= self.total:
+            return 0.0
+        if not self._durations:
+            return None
+        typical_duration = statistics.median(self._durations)
+        return typical_duration * (self.total - completed) / self.parallelism
+
+
+def _format_eta(seconds: float | None) -> str:
+    """Format an ETA compactly for a single-line terminal progress display."""
+    if seconds is None:
+        return "calculating"
+    remaining = max(0, math.ceil(seconds))
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, secs = divmod(remaining, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -937,8 +984,10 @@ class ZoteroSemanticSearch:
                     _local_db_logger = logging.getLogger("zotero_mcp.local_db")
                     _prev_level = _local_db_logger.level
                     _local_db_logger.setLevel(logging.CRITICAL)
+                    extraction_eta = _MedianETA(total_local)
 
                     for item_idx, it in enumerate(local_items, 1):
+                        item_started = time.monotonic()
                         # Build display string: Author (Year) — Title
                         title = getattr(it, "title", "") or ""
                         creators = getattr(it, "creators", "") or ""
@@ -976,7 +1025,11 @@ class ZoteroSemanticSearch:
                             if extracted > 0:
                                 status_parts.append(f"{extracted} extracted")
                             status = f" ({', '.join(status_parts)})" if status_parts else ""
-                            prefix = f"  Processing {item_idx}/{total_local}{status} — "
+                            eta = _format_eta(extraction_eta.estimate(item_idx - 1))
+                            prefix = (
+                                f"  Processing {item_idx}/{total_local}{status} "
+                                f"| ETA {eta} — "
+                            )
                             # Truncate display to fit remaining space
                             remaining = max_len - len(prefix) - 3  # -3 for "..."
                             if remaining > 0 and display and len(display) > remaining:
@@ -1104,6 +1157,8 @@ class ZoteroSemanticSearch:
                             items_to_process.append(it)
 
                             # (progress shown inline above via \r)
+
+                        extraction_eta.record(time.monotonic() - item_started)
 
                     # Restore local_db logger
                     _local_db_logger.setLevel(_prev_level)
@@ -1906,22 +1961,29 @@ class ZoteroSemanticSearch:
                 pass
 
             seen_items = 0
+            indexing_eta = _MedianETA(
+                total,
+                parallelism=embedding_concurrency,
+            )
             _failed_docs = []  # Collect failures for end-of-run retry
             failed_concurrent_batches: list[_PreparedIndexBatch] = []
 
-            def report_batch_progress(batch: list[dict[str, Any]]) -> None:
+            def report_item_progress(item: dict[str, Any]) -> None:
                 nonlocal seen_items
-                for item in batch:
-                    seen_items += 1
-                    title = item.get("data", {}).get("title", "")
-                    if title and len(title) > 60:
-                        title = title[:57] + "..."
-                    pct = int(seen_items / total * 100) if total else 0
-                    try:
-                        sys.stderr.write(f"\r  [{pct:3d}%] {seen_items}/{total} — {title or 'processing...'}")
-                        sys.stderr.flush()
-                    except Exception:
-                        pass
+                seen_items += 1
+                title = item.get("data", {}).get("title", "")
+                if title and len(title) > 60:
+                    title = title[:57] + "..."
+                pct = int(seen_items / total * 100) if total else 0
+                eta = _format_eta(indexing_eta.estimate(seen_items))
+                try:
+                    sys.stderr.write(
+                        f"\r  [{pct:3d}%] {seen_items}/{total} "
+                        f"| ETA {eta} — {title or 'processing...'}"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
 
             def accumulate_batch_stats(batch_stats: dict[str, int]) -> None:
                 stats["processed_items"] += batch_stats["processed"]
@@ -1936,12 +1998,14 @@ class ZoteroSemanticSearch:
 
             if embedding_concurrency == 1:
                 for item in all_items:
-                    report_batch_progress([item])
+                    item_started = time.monotonic()
                     batch_stats = self._process_item_batch(
                         [item],
                         force_full_rebuild,
                         _failed_docs,
                     )
+                    indexing_eta.record(time.monotonic() - item_started)
+                    report_item_progress(item)
                     accumulate_batch_stats(batch_stats)
             else:
                 queue_depth = embedding_concurrency * 2
@@ -1989,6 +2053,7 @@ class ZoteroSemanticSearch:
                             item, prepared = job
                             embeddings = None
                             error = None
+                            item_started = time.monotonic()
                             if prepared.documents:
                                 try:
                                     embeddings = (
@@ -1998,9 +2063,16 @@ class ZoteroSemanticSearch:
                                     )
                                 except Exception as e:
                                     error = e
+                            duration = time.monotonic() - item_started
                             if not put_with_backpressure(
                                 result_queue,
-                                (item, prepared, embeddings, error),
+                                (
+                                    item,
+                                    prepared,
+                                    embeddings,
+                                    error,
+                                    duration,
+                                ),
                             ):
                                 return
                     finally:
@@ -2029,7 +2101,14 @@ class ZoteroSemanticSearch:
                                 completed_workers += 1
                                 continue
 
-                            item, prepared, embeddings, error = result
+                            (
+                                item,
+                                prepared,
+                                embeddings,
+                                error,
+                                item_duration,
+                            ) = result
+                            commit_started = time.monotonic()
                             if error is None:
                                 try:
                                     if prepared.documents:
@@ -2052,7 +2131,9 @@ class ZoteroSemanticSearch:
                                 )
                                 failed_concurrent_batches.append(prepared)
 
-                            report_batch_progress([item])
+                            item_duration += time.monotonic() - commit_started
+                            indexing_eta.record(item_duration)
+                            report_item_progress(item)
                             accumulate_batch_stats(prepared.stats)
                     finally:
                         stop_pipeline.set()

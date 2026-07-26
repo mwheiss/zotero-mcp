@@ -110,7 +110,10 @@ def test_concurrent_embeddings_overlap_with_per_entry_serialized_writes(monkeypa
     } == {item["key"] for item in items}
 
 
-def test_default_update_path_writes_each_entry_immediately(monkeypatch):
+def test_default_update_path_writes_each_entry_immediately(
+    monkeypatch,
+    capsys,
+):
     chroma = _ConcurrentChroma()
     search = _search(monkeypatch, chroma, _items(2))
 
@@ -121,6 +124,7 @@ def test_default_update_path_writes_each_entry_immediately(monkeypatch):
     assert chroma.upserted_batches == [["ITEM0000"], ["ITEM0001"]]
     assert chroma.max_active_embeddings == 0
     assert "embedding_concurrency" not in stats
+    assert "| ETA " in capsys.readouterr().err
 
 
 class _SkewedChroma(_ConcurrentChroma):
