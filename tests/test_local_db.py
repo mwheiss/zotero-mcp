@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 from zotero_mcp.local_db import LocalZoteroReader, ZoteroItem
@@ -68,6 +69,57 @@ def test_get_searchable_text_truncates_at_limit():
     assert "z" * 50000 in text
     assert "z" * 50001 not in text
     assert "..." in text
+
+
+def test_attachment_signature_changes_with_zotero_fulltext_cache(tmp_path):
+    db_path = tmp_path / "zotero.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE items (
+            itemID INTEGER PRIMARY KEY,
+            key TEXT,
+            dateModified TEXT
+        );
+        CREATE TABLE itemAttachments (
+            itemID INTEGER PRIMARY KEY,
+            parentItemID INTEGER,
+            path TEXT,
+            contentType TEXT,
+            storageModTime INTEGER,
+            storageHash TEXT,
+            lastProcessedModificationTime INTEGER
+        );
+        CREATE TABLE fulltextItems (
+            itemID INTEGER PRIMARY KEY,
+            indexedChars INTEGER,
+            totalChars INTEGER,
+            version INTEGER
+        );
+        INSERT INTO items VALUES (1, 'PARENT', '2026-01-01 00:00:00');
+        INSERT INTO items VALUES (2, 'ATTACH', '2026-01-01 00:00:00');
+        INSERT INTO itemAttachments VALUES (
+            2, 1, 'storage:paper.pdf', 'application/pdf',
+            1000, 'stored-hash', 1000
+        );
+        INSERT INTO fulltextItems VALUES (2, 3, 3, 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    storage_dir = tmp_path / "storage" / "ATTACH"
+    storage_dir.mkdir(parents=True)
+    (storage_dir / "paper.pdf").write_bytes(b"%PDF")
+    cache = storage_dir / ".zotero-ft-cache"
+    cache.write_text("old")
+
+    with LocalZoteroReader(db_path=str(db_path)) as reader:
+        old_signature = reader.get_attachment_signature(1)
+        cache.write_text("revised full text")
+        new_signature = reader.get_attachment_signature(1)
+
+    assert new_signature != old_signature
 
 
 class TestResolveAttachmentPath:

@@ -5,6 +5,7 @@ Provides direct SQLite access to Zotero's local database for faster semantic sea
 when running in local mode.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -499,6 +500,75 @@ class LocalZoteroReader:
             meta.append([key, path, ctype])
 
         return meta
+
+    def get_attachment_signature(self, item_id: int) -> str:
+        """Return a stable change token for an item's extractable content.
+
+        Zotero records hashes/modification times for stored attachments and a
+        version for its extracted full-text cache. Linked files do not always
+        have those values, so resolved file and cache stats are included as a
+        fallback. This avoids reading and hashing every PDF during each scan
+        while still detecting normal replacements and full-text reindexing.
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            """
+            SELECT att.key AS attachmentKey,
+                   att.dateModified AS attachmentDateModified,
+                   ia.path AS path,
+                   ia.contentType AS contentType,
+                   ia.storageModTime AS storageModTime,
+                   ia.storageHash AS storageHash,
+                   ia.lastProcessedModificationTime AS lastProcessedModificationTime,
+                   fi.version AS fulltextVersion,
+                   fi.indexedChars AS indexedChars,
+                   fi.totalChars AS totalChars
+            FROM itemAttachments ia
+            JOIN items att ON att.itemID = ia.itemID
+            LEFT JOIN fulltextItems fi ON fi.itemID = ia.itemID
+            WHERE ia.parentItemID = ?
+            ORDER BY att.key
+            """,
+            (item_id,),
+        ).fetchall()
+
+        def stat_token(path: Path | None) -> tuple[int, int] | None:
+            if path is None:
+                return None
+            try:
+                stat = path.stat()
+            except OSError:
+                return None
+            return stat.st_size, stat.st_mtime_ns
+
+        attachments = []
+        for row in rows:
+            key = row["attachmentKey"]
+            content_type = row["contentType"]
+            zotero_path = row["path"] or ""
+            resolved = self._resolve_attachment_path(key, zotero_path)
+            if not resolved or not resolved.exists():
+                resolved = self._scan_storage_for_attachment(key, content_type)
+            cache_path = self._get_storage_dir() / key / ".zotero-ft-cache"
+            attachments.append(
+                {
+                    "key": key,
+                    "path": zotero_path,
+                    "content_type": content_type,
+                    "date_modified": row["attachmentDateModified"],
+                    "storage_mod_time": row["storageModTime"],
+                    "storage_hash": row["storageHash"],
+                    "last_processed_modification_time": row["lastProcessedModificationTime"],
+                    "fulltext_version": row["fulltextVersion"],
+                    "indexed_chars": row["indexedChars"],
+                    "total_chars": row["totalChars"],
+                    "file_stat": stat_token(resolved),
+                    "cache_stat": stat_token(cache_path),
+                }
+            )
+
+        encoded = json.dumps(attachments, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _read_zotero_ft_cache(self, attachment_key: str) -> str | None:
         """Return the text in Zotero's ``.zotero-ft-cache`` for an attachment.

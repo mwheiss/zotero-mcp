@@ -78,21 +78,32 @@ class FakeVersionsZotero:
 class FakeChroma:
     """ChromaClient stub for update_database runs with no items."""
 
+    def __init__(self, ids=()):
+        self.ids = set(ids)
+        self.deleted = []
+
     def reset_collection(self):
         raise AssertionError("reset_collection should not be called")
 
     def get_all_ids(self):
-        return set()
+        return set(self.ids)
+
+    def delete_documents(self, ids):
+        self.deleted.extend(ids)
+        self.ids.difference_update(ids)
 
 
-def make_search(db_path, zotero, config_path=None):
+def make_search(db_path, zotero, config_path=None, chroma=None):
     """Build a ZoteroSemanticSearch without touching Chroma or pyzotero."""
     s = object.__new__(ZoteroSemanticSearch)
     s.zotero_client = zotero
     s.db_path = str(db_path)
     s.config_path = str(config_path) if config_path else None
-    s.chroma_client = FakeChroma()
+    s.chroma_client = chroma or FakeChroma()
     s.update_config = {"auto_update": False, "update_frequency": "manual"}
+    s._chunking_config = {"enabled": False}
+    s._last_scan_snapshot_keys = None
+    s._last_scan_indexable_keys = None
     return s
 
 
@@ -216,3 +227,61 @@ def test_update_database_promotes_watermark_when_snapshot_complete(
 
     saved = json.loads(config.read_text())
     assert saved["semantic_search"]["last_sync_version"] == 12
+
+
+def test_local_fulltext_update_prunes_items_missing_from_complete_snapshot(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "zotero.sqlite"
+    make_zotero_db(db, ["KEEP"])
+    config = tmp_path / "config.json"
+    _write_config(config, last_sync_version=10)
+    chroma = FakeChroma(ids={"KEEP", "DELETE_ME"})
+    s = make_search(
+        db,
+        FakeVersionsZotero({"KEEP": 12}, library_version=12),
+        config_path=config,
+        chroma=chroma,
+    )
+
+    def scan(**kwargs):
+        s._last_scan_snapshot_keys = {"KEEP"}
+        s._last_scan_indexable_keys = {"KEEP"}
+        return []
+
+    monkeypatch.setattr(s, "_get_items_from_source", scan)
+
+    stats = s.update_database(extract_fulltext=True, include_fulltext=False)
+
+    assert chroma.deleted == ["DELETE_ME"]
+    assert stats["deleted_items"] == 1
+
+
+def test_local_fulltext_update_does_not_prune_stale_snapshot(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "zotero.sqlite"
+    make_zotero_db(db, ["KEEP"])
+    config = tmp_path / "config.json"
+    _write_config(config, last_sync_version=10)
+    chroma = FakeChroma(ids={"KEEP", "WALHIDDEN1"})
+    s = make_search(
+        db,
+        FakeVersionsZotero(
+            {"KEEP": 5, "WALHIDDEN1": 12}, library_version=12
+        ),
+        config_path=config,
+        chroma=chroma,
+    )
+
+    def scan(**kwargs):
+        s._last_scan_snapshot_keys = {"KEEP"}
+        s._last_scan_indexable_keys = {"KEEP"}
+        return []
+
+    monkeypatch.setattr(s, "_get_items_from_source", scan)
+
+    stats = s.update_database(extract_fulltext=True, include_fulltext=False)
+
+    assert chroma.deleted == []
+    assert stats["deleted_items"] == 0

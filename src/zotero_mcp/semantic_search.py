@@ -421,6 +421,10 @@ class ZoteroSemanticSearch:
         # Item keys seen by the most recent local sqlite scan (set by
         # _get_items_from_local_db); used to verify watermark promotion.
         self._last_scan_snapshot_keys: set[str] | None = None
+        # Top-level keys that belong in the configured semantic corpus. Unlike
+        # the snapshot set, this excludes deleted, child, filtered, and
+        # deduplicated items and can be reconciled against ChromaDB.
+        self._last_scan_indexable_keys: set[str] | None = None
 
         # Load update configuration
         self.update_config = self._load_update_config()
@@ -688,6 +692,8 @@ class ZoteroSemanticSearch:
         # does not bump the parent's dateModified.
         if (att_keys := data.get("attachmentKeys")) is not None:
             metadata["attachment_keys"] = att_keys
+        if (attachment_signature := data.get("attachmentSignature")) is not None:
+            metadata["attachment_signature"] = attachment_signature
 
         # Add tags as a single string
         if tags := data.get("tags"):
@@ -773,6 +779,7 @@ class ZoteroSemanticSearch:
             List of items in API-compatible format
         """
         logger.info("Fetching items from local Zotero database...")
+        self._last_scan_indexable_keys = None
 
         try:
             # Load per-run config, including extraction limits and db path if provided
@@ -869,6 +876,7 @@ class ZoteroSemanticSearch:
                     filtered_items.append(it)
 
                 local_items = filtered_items
+                self._last_scan_indexable_keys = {it.key for it in local_items}
                 total_to_extract = len(local_items)
                 if total_to_extract != candidate_count:
                     try:
@@ -977,6 +985,13 @@ class ZoteroSemanticSearch:
                             sorted(k for k, _p, _c in reader.get_fulltext_meta_for_item(it.item_id))
                         )
                         it._attachment_keys = att_keys
+                        if hasattr(reader, "get_attachment_signature"):
+                            attachment_signature = reader.get_attachment_signature(it.item_id)
+                        else:
+                            # Compatibility for custom/legacy readers. The key
+                            # set still detects added and removed attachments.
+                            attachment_signature = att_keys
+                        it._attachment_signature = attachment_signature
 
                         # CHECK IF ITEM ALREADY EXISTS (unless force_rebuild or no client)
                         if chroma_client and not force_rebuild:
@@ -987,16 +1002,27 @@ class ZoteroSemanticSearch:
                             if existing_metadata:
                                 chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
                                 local_has_fulltext = bool(att_keys)
+                                chroma_date = existing_metadata.get("date_modified", "")
+                                item_date = getattr(it, "date_modified", "") or ""
+                                metadata_changed = chroma_date != item_date
+                                stored_signature = existing_metadata.get("attachment_signature")
+                                signature_changed = (
+                                    stored_signature is not None
+                                    and stored_signature != attachment_signature
+                                )
 
                                 # Skip if extraction previously failed AND neither the item
                                 # nor its attachment set has changed since (handles both a
                                 # replaced bad PDF and a PDF newly attached to an item that
                                 # was indexed metadata-only)
                                 if chroma_has_fulltext == "failed":
-                                    chroma_date = existing_metadata.get("date_modified", "")
-                                    item_date = getattr(it, "date_modified", "") or ""
                                     stored_att_keys = existing_metadata.get("attachment_keys")
-                                    if chroma_date == item_date and stored_att_keys == att_keys:
+                                    attachment_unchanged = (
+                                        stored_signature == attachment_signature
+                                        if stored_signature is not None
+                                        else stored_att_keys == att_keys
+                                    )
+                                    if not metadata_changed and attachment_unchanged:
                                         # Nothing changed since the failure — don't retry
                                         should_extract = False
                                         skipped_existing += 1
@@ -1006,8 +1032,17 @@ class ZoteroSemanticSearch:
                                         # failure (legacy records without attachment_keys
                                         # retry once, then converge) — retry
                                         updated_existing += 1
-                                elif not chroma_has_fulltext and local_has_fulltext:
-                                    # Document exists but lacks fulltext - we need to update it
+                                elif chroma_has_fulltext:
+                                    # Successful legacy records have no signature.
+                                    # Reindex them once to establish a baseline.
+                                    if metadata_changed or signature_changed or stored_signature is None:
+                                        updated_existing += 1
+                                    else:
+                                        should_extract = False
+                                        skipped_existing += 1
+                                elif metadata_changed or signature_changed or local_has_fulltext:
+                                    # Metadata changed, attachment content changed, or
+                                    # a metadata-only item gained extractable content.
                                     updated_existing += 1
                                 else:
                                     should_extract = False
@@ -1122,6 +1157,8 @@ class ZoteroSemanticSearch:
                     # newly attached files on previously-failed items.
                     if (att := getattr(item, "_attachment_keys", None)) is not None:
                         api_item["data"]["attachmentKeys"] = att
+                    if (signature := getattr(item, "_attachment_signature", None)) is not None:
+                        api_item["data"]["attachmentSignature"] = signature
 
                     # Add notes if available
                     if item.notes:
@@ -1133,6 +1170,7 @@ class ZoteroSemanticSearch:
                 return api_items
 
         except Exception as e:
+            self._last_scan_indexable_keys = None
             logger.error(f"Error reading from local database: {e}")
             logger.info("Falling back to API...")
             return self._get_items_from_api(limit)
@@ -1466,6 +1504,21 @@ class ZoteroSemanticSearch:
             return None
         return target_sync_version
 
+    def _delete_missing_index_items(self, current_item_keys: set[str]) -> int:
+        """Delete indexed items absent from an authoritative current-key set."""
+        stored_ids = self.chroma_client.get_all_ids()
+        stored_item_keys = {doc_id.split("#", 1)[0] for doc_id in stored_ids}
+        to_delete_keys = sorted(k for k in (stored_item_keys - current_item_keys) if k)
+        if not to_delete_keys:
+            return 0
+
+        if self._chunking_enabled and hasattr(self.chroma_client, "delete_item_chunks"):
+            for key in to_delete_keys:
+                self.chroma_client.delete_item_chunks(key)
+        else:
+            self.chroma_client.delete_documents(to_delete_keys)
+        return len(to_delete_keys)
+
     def _prepare_index_records(self, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
         """Prepare ChromaDB records without embedding or writing them."""
         stats = {"processed": 0, "skipped": 0, "errors": 0}
@@ -1664,6 +1717,7 @@ class ZoteroSemanticSearch:
 
             target_sync_version: int | None = None
             all_items: list[dict[str, Any]] = []
+            local_snapshot_complete = False
             if use_incremental:
                 try:
                     target_sync_version = self.zotero_client.last_modified_version()
@@ -1701,18 +1755,11 @@ class ZoteroSemanticSearch:
                     )
                 else:
                     try:
-                        stored_ids = self.chroma_client.get_all_ids()
-                        stored_item_keys = {i.split("#", 1)[0] for i in stored_ids}
-                        to_delete_keys = [k for k in (stored_item_keys - current_library_keys) if k]
-                        if to_delete_keys:
-                            if self._chunking_enabled and hasattr(self.chroma_client, "delete_item_chunks"):
-                                for k in to_delete_keys:
-                                    self.chroma_client.delete_item_chunks(k)
-                            else:
-                                self.chroma_client.delete_documents(to_delete_keys)
-                            stats["deleted_items"] = len(to_delete_keys)
+                        deleted = self._delete_missing_index_items(current_library_keys)
+                        if deleted:
+                            stats["deleted_items"] = deleted
                             try:
-                                sys.stderr.write(f"\nDeleted {len(to_delete_keys)} items no longer present in Zotero.\n")
+                                sys.stderr.write(f"\nDeleted {deleted} items no longer present in Zotero.\n")
                             except Exception:
                                 pass
                     except Exception as e:
@@ -1731,6 +1778,8 @@ class ZoteroSemanticSearch:
                 except Exception as e:
                     logger.warning(f"last_modified_version() failed: {e}")
                     target_sync_version = None
+                if extract_fulltext:
+                    self._last_scan_indexable_keys = None
                 all_items = self._get_items_from_source(
                     limit=limit,
                     extract_fulltext=extract_fulltext,
@@ -1742,9 +1791,37 @@ class ZoteroSemanticSearch:
                 # captured above (immutable sqlite reads skip WAL contents);
                 # only promote the watermark if the snapshot was complete.
                 if extract_fulltext and target_sync_version is not None:
-                    target_sync_version = self._verify_local_snapshot_version(
+                    verified_sync_version = self._verify_local_snapshot_version(
                         target_sync_version
                     )
+                    local_snapshot_complete = verified_sync_version is not None
+                    target_sync_version = verified_sync_version
+
+                # Local full-text scans return only new/changed items for
+                # embedding, so reconcile against the complete indexable key
+                # set captured before that filtering. Never prune a partial,
+                # stale, or unverifiable sqlite snapshot.
+                if (
+                    extract_fulltext
+                    and not force_full_rebuild
+                    and limit is None
+                    and local_snapshot_complete
+                    and self._last_scan_indexable_keys is not None
+                ):
+                    try:
+                        deleted = self._delete_missing_index_items(
+                            self._last_scan_indexable_keys
+                        )
+                        if deleted:
+                            stats["deleted_items"] = deleted
+                            try:
+                                sys.stderr.write(
+                                    f"\nDeleted {deleted} items no longer present in the local Zotero corpus.\n"
+                                )
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.warning(f"Local deletion pass failed: {e}")
 
             stats["total_items"] = len(all_items)
             logger.info(f"Found {stats['total_items']} items to process")

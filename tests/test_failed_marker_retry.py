@@ -41,8 +41,21 @@ class FakeItem:
 class FakeReader:
     """Minimal LocalZoteroReader stand-in for the extraction scan."""
 
-    def __init__(self, *args, attachments=(), **kwargs):
+    def __init__(
+        self,
+        *args,
+        attachments=(),
+        attachment_signature=None,
+        extract_result=("extracted text", "pdf"),
+        **kwargs,
+    ):
         self._attachments = list(attachments)
+        self._attachment_signature = (
+            attachment_signature
+            if attachment_signature is not None
+            else ",".join(sorted(row[0] for row in self._attachments))
+        )
+        self._extract_result = extract_result
         self.extract_calls = 0
 
     def __enter__(self):
@@ -60,9 +73,12 @@ class FakeReader:
     def get_fulltext_meta_for_item(self, item_id):
         return [list(row) for row in self._attachments]
 
+    def get_attachment_signature(self, item_id):
+        return self._attachment_signature
+
     def extract_fulltext_for_item(self, item_id):
         self.extract_calls += 1
-        return ("extracted text", "pdf")
+        return self._extract_result
 
 
 class FakeChromaClient:
@@ -83,11 +99,22 @@ class FakeChromaClient:
         pass
 
 
-def _run_scan(monkeypatch, stored_metadata, attachments):
+def _run_scan(
+    monkeypatch,
+    stored_metadata,
+    attachments,
+    *,
+    attachment_signature=None,
+    extract_result=("extracted text", "pdf"),
+):
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
     monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
 
-    reader = FakeReader(attachments=attachments)
+    reader = FakeReader(
+        attachments=attachments,
+        attachment_signature=attachment_signature,
+        extract_result=extract_result,
+    )
     monkeypatch.setattr(
         semantic_search, "LocalZoteroReader", lambda *a, **kw: reader
     )
@@ -168,3 +195,86 @@ def test_legacy_failed_record_without_attachment_keys_retries_once(monkeypatch):
     items, reader = _run_scan(monkeypatch, stored, attachments=attachments)
     assert len(items) == 1
     assert reader.extract_calls == 1
+
+
+def test_successful_item_skipped_when_metadata_and_attachment_unchanged(monkeypatch):
+    attachments = [("ATTKEY1", "storage:paper.pdf", "application/pdf")]
+    stored = {
+        "has_fulltext": True,
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "ATTKEY1",
+        "attachment_signature": "same-signature",
+    }
+
+    items, reader = _run_scan(
+        monkeypatch,
+        stored,
+        attachments,
+        attachment_signature="same-signature",
+    )
+
+    assert items == []
+    assert reader.extract_calls == 0
+
+
+def test_successful_item_reindexed_when_metadata_changes(monkeypatch):
+    attachments = [("ATTKEY1", "storage:paper.pdf", "application/pdf")]
+    stored = {
+        "has_fulltext": True,
+        "date_modified": "2026-06-30 12:00:00",
+        "attachment_keys": "ATTKEY1",
+        "attachment_signature": "same-signature",
+    }
+
+    items, reader = _run_scan(
+        monkeypatch,
+        stored,
+        attachments,
+        attachment_signature="same-signature",
+    )
+
+    assert len(items) == 1
+    assert reader.extract_calls == 1
+
+
+def test_successful_item_reindexed_when_attachment_content_changes(monkeypatch):
+    attachments = [("ATTKEY1", "storage:paper.pdf", "application/pdf")]
+    stored = {
+        "has_fulltext": True,
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "ATTKEY1",
+        "attachment_signature": "old-signature",
+    }
+
+    items, reader = _run_scan(
+        monkeypatch,
+        stored,
+        attachments,
+        attachment_signature="new-signature",
+    )
+
+    assert len(items) == 1
+    assert reader.extract_calls == 1
+    assert items[0]["data"]["attachmentSignature"] == "new-signature"
+
+
+def test_successful_item_drops_stale_fulltext_when_attachment_removed(monkeypatch):
+    stored = {
+        "has_fulltext": True,
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "ATTKEY1",
+        "attachment_signature": "old-signature",
+    }
+
+    items, reader = _run_scan(
+        monkeypatch,
+        stored,
+        [],
+        attachment_signature="empty-signature",
+        extract_result=None,
+    )
+
+    assert len(items) == 1
+    assert reader.extract_calls == 1
+    assert items[0]["data"]["fulltext"] == ""
+    assert items[0]["data"]["fulltext_attempted"] is True
