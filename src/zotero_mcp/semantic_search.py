@@ -1327,18 +1327,20 @@ class ZoteroSemanticSearch:
 
     def _get_changed_items_from_api(
         self, since_version: int, include_fulltext: bool = False
-    ) -> tuple[list[dict[str, Any]], set[str]]:
+    ) -> tuple[list[dict[str, Any]], set[str] | None]:
         """Fetch only items changed in the Zotero library since a given version.
 
         Uses pyzotero's `item_versions(since=V)` to discover changed top-level
-        item keys, then fetches their full payloads one at a time. When
-        `include_fulltext` is True, also fetches server-side extracted text
-        for each changed item.
+        item keys. When `include_fulltext` is True, `new_fulltext(since=V)` and
+        changed attachment records are also resolved back to their top-level
+        parents before fetching server-side extracted text.
 
         Returns:
             (changed_items, all_current_top_level_keys). The second element
             powers deletion detection: any id present in the ChromaDB
             collection but absent from it has been removed from the library.
+            It is None when the current library keys could not be enumerated;
+            callers must skip deletion in that case.
         """
         logger.info(f"Fetching changed items since library version {since_version}...")
         try:
@@ -1346,18 +1348,35 @@ class ZoteroSemanticSearch:
         except Exception as e:
             raise Exception(f"Failed to fetch item_versions(since={since_version}): {e}") from e
 
+        changed_keys = set(changed_versions.keys())
+        if include_fulltext and hasattr(self.zotero_client, "new_fulltext"):
+            try:
+                fulltext_versions = self.zotero_client.new_fulltext(since_version) or {}
+                if isinstance(fulltext_versions, dict):
+                    changed_keys.update(fulltext_versions.keys())
+                elif isinstance(fulltext_versions, list):
+                    for entry in fulltext_versions:
+                        if isinstance(entry, str):
+                            changed_keys.add(entry)
+                        elif isinstance(entry, dict) and entry.get("key"):
+                            changed_keys.add(entry["key"])
+            except Exception as e:
+                logger.warning(f"Failed to fetch new_fulltext(since={since_version}): {e}")
+
         try:
             current_versions = self.zotero_client.item_versions() or {}
         except Exception as e:
             logger.warning(f"Failed to fetch current item_versions for deletion check: {e}")
-            current_versions = {}
-        current_keys = set(current_versions.keys())
+            current_versions = None
+        current_keys = set(current_versions.keys()) if current_versions is not None else None
 
-        if not changed_versions:
+        if not changed_keys:
             return [], current_keys
 
         changed_items: list[dict[str, Any]] = []
-        for key in changed_versions.keys():
+        changed_item_keys: set[str] = set()
+        changed_parent_keys: set[str] = set()
+        for key in changed_keys:
             try:
                 item = self.zotero_client.item(key)
             except Exception as e:
@@ -1369,8 +1388,25 @@ class ZoteroSemanticSearch:
             # Don't index attachments/notes as standalone entries; only
             # top-level research items participate in semantic search.
             if item_type in {"attachment", "note", "annotation"}:
+                if include_fulltext and item_type == "attachment":
+                    parent_key = item.get("data", {}).get("parentItem")
+                    if parent_key:
+                        changed_parent_keys.add(parent_key)
                 continue
             changed_items.append(item)
+            changed_item_keys.add(item.get("key", key))
+
+        for parent_key in changed_parent_keys - changed_item_keys:
+            try:
+                parent = self.zotero_client.item(parent_key)
+            except Exception as e:
+                logger.debug(f"item({parent_key}) failed while resolving changed attachment: {e}")
+                continue
+            parent_type = parent.get("data", {}).get("itemType")
+            if parent_type in {"attachment", "note", "annotation"}:
+                continue
+            changed_items.append(parent)
+            changed_item_keys.add(parent.get("key", parent_key))
 
         if include_fulltext and changed_items:
             self._attach_web_fulltext(changed_items)
@@ -1658,23 +1694,29 @@ class ZoteroSemanticSearch:
                 # Delete collection entries that are no longer present in the
                 # library. Map any chunk ids (``<key>#<n>``) back to item keys
                 # so deletion works identically whether or not chunking is on.
-                try:
-                    stored_ids = self.chroma_client.get_all_ids()
-                    stored_item_keys = {i.split("#", 1)[0] for i in stored_ids}
-                    to_delete_keys = [k for k in (stored_item_keys - current_library_keys) if k]
-                    if to_delete_keys:
-                        if self._chunking_enabled and hasattr(self.chroma_client, "delete_item_chunks"):
-                            for k in to_delete_keys:
-                                self.chroma_client.delete_item_chunks(k)
-                        else:
-                            self.chroma_client.delete_documents(to_delete_keys)
-                        stats["deleted_items"] = len(to_delete_keys)
-                        try:
-                            sys.stderr.write(f"\nDeleted {len(to_delete_keys)} items no longer present in Zotero.\n")
-                        except Exception:
-                            pass
-                except Exception as e:
-                    logger.warning(f"Deletion pass failed: {e}")
+                if current_library_keys is None:
+                    logger.warning(
+                        "Skipping deletion pass because current Zotero item keys "
+                        "could not be enumerated."
+                    )
+                else:
+                    try:
+                        stored_ids = self.chroma_client.get_all_ids()
+                        stored_item_keys = {i.split("#", 1)[0] for i in stored_ids}
+                        to_delete_keys = [k for k in (stored_item_keys - current_library_keys) if k]
+                        if to_delete_keys:
+                            if self._chunking_enabled and hasattr(self.chroma_client, "delete_item_chunks"):
+                                for k in to_delete_keys:
+                                    self.chroma_client.delete_item_chunks(k)
+                            else:
+                                self.chroma_client.delete_documents(to_delete_keys)
+                            stats["deleted_items"] = len(to_delete_keys)
+                            try:
+                                sys.stderr.write(f"\nDeleted {len(to_delete_keys)} items no longer present in Zotero.\n")
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.warning(f"Deletion pass failed: {e}")
             else:
                 # Full scan: bootstrap or forced rebuild.
                 # Capture the library version BEFORE scanning so any changes

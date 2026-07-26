@@ -66,10 +66,12 @@ class FakeZoteroClient:
     def __init__(self):
         self.items_by_key = {}
         self.fulltext_by_key = {}   # key -> dict (content, indexedChars, ...)
+        self.fulltext_versions_state = {}  # key -> library version
         self.children_by_parent = {}  # parent_key -> list[item]
         self.versions_state = {}    # key -> library_version (current state)
         self.version_history = []   # (since_version, changed_dict) pairs
         self.current_library_version = 0
+        self.current_versions_error = None
         # Pagination helper
         self.items_order = []
         # Recording calls for assertions
@@ -85,6 +87,7 @@ class FakeZoteroClient:
             self.versions_state[it["key"]] = library_version
         for k, v in (fulltext or {}).items():
             self.fulltext_by_key[k] = v
+            self.fulltext_versions_state[k] = library_version
         for k, v in (children or {}).items():
             self.children_by_parent[k] = v
         self.current_library_version = library_version
@@ -115,8 +118,14 @@ class FakeZoteroClient:
     def item_versions(self, since=None, **kwargs):
         self.calls.append(("item_versions", since))
         if since is None:
+            if self.current_versions_error:
+                raise self.current_versions_error
             return dict(self.versions_state)
         return {k: v for k, v in self.versions_state.items() if v > since}
+
+    def new_fulltext(self, since):
+        self.calls.append(("new_fulltext", since))
+        return {k: v for k, v in self.fulltext_versions_state.items() if v > since}
 
     def last_modified_version(self, **kwargs):
         self.calls.append(("last_modified_version",))
@@ -351,6 +360,63 @@ def test_update_database_incremental_deletes_removed_items(monkeypatch, tmp_path
 
     assert "DELETED_ME" in chroma.deleted
     assert stats["deleted_items"] == 1
+
+
+def test_update_database_skips_deletion_when_current_keys_fail(monkeypatch, tmp_path):
+    """A failed current-key enumeration must not look like an empty library."""
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 5})
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("NEW")], library_version=9)
+    zot.current_versions_error = RuntimeError("temporary API failure")
+    chroma = FakeChromaClient(preloaded_ids=["NEW", "KEEP_ME"])
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    stats = search.update_database()
+
+    assert chroma.deleted == []
+    assert stats["deleted_items"] == 0
+
+
+def test_update_database_reindexes_parent_when_attachment_fulltext_changes(
+    monkeypatch, tmp_path
+):
+    """new_fulltext attachment keys should refresh their top-level parent."""
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 5})
+    parent = _paper("PARENT", title="Parent", version=3)
+    attachment = {
+        "key": "ATTACH",
+        "version": 3,
+        "data": {
+            "key": "ATTACH",
+            "itemType": "attachment",
+            "parentItem": "PARENT",
+            "contentType": "application/pdf",
+        },
+    }
+    zot = FakeZoteroClient()
+    zot.load_scenario(
+        [parent, attachment],
+        fulltext={"ATTACH": {"content": "Revised attachment body"}},
+        children={"PARENT": [attachment]},
+        library_version=3,
+    )
+    zot.current_library_version = 9
+    zot.fulltext_versions_state["ATTACH"] = 9
+    chroma = FakeChromaClient(preloaded_ids=["PARENT"])
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    stats = search.update_database()
+
+    assert stats["processed_items"] == 1
+    indexed = [
+        (doc, doc_id)
+        for documents, _metadatas, ids in chroma.added
+        for doc, doc_id in zip(documents, ids, strict=True)
+    ]
+    assert len(indexed) == 1
+    assert indexed[0][1] == "PARENT"
+    assert "Revised attachment body" in indexed[0][0]
+    assert ("new_fulltext", 5) in zot.calls
 
 
 def test_update_database_incremental_noop_when_version_unchanged(monkeypatch, tmp_path):
