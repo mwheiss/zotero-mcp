@@ -72,6 +72,7 @@ class FakeZoteroClient:
         self.version_history = []   # (since_version, changed_dict) pairs
         self.current_library_version = 0
         self.current_versions_error = None
+        self.new_fulltext_error = None
         # Pagination helper
         self.items_order = []
         # Recording calls for assertions
@@ -125,6 +126,8 @@ class FakeZoteroClient:
 
     def new_fulltext(self, since):
         self.calls.append(("new_fulltext", since))
+        if self.new_fulltext_error:
+            raise self.new_fulltext_error
         return {k: v for k, v in self.fulltext_versions_state.items() if v > since}
 
     def last_modified_version(self, **kwargs):
@@ -375,6 +378,25 @@ def test_update_database_skips_deletion_when_current_keys_fail(monkeypatch, tmp_
 
     assert chroma.deleted == []
     assert stats["deleted_items"] == 0
+    saved = json.loads(open(config_path).read())
+    assert saved["semantic_search"]["last_sync_version"] == 5
+
+
+def test_update_database_keeps_watermark_when_fulltext_discovery_fails(
+    monkeypatch, tmp_path
+):
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 5})
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("NEW")], library_version=9)
+    zot.new_fulltext_error = RuntimeError("temporary fulltext API failure")
+    chroma = FakeChromaClient()
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    stats = search.update_database()
+
+    assert stats["processed_items"] == 1
+    saved = json.loads(open(config_path).read())
+    assert saved["semantic_search"]["last_sync_version"] == 5
 
 
 def test_update_database_reindexes_parent_when_attachment_fulltext_changes(

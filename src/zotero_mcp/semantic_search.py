@@ -1386,6 +1386,7 @@ class ZoteroSemanticSearch:
         except Exception as e:
             raise Exception(f"Failed to fetch item_versions(since={since_version}): {e}") from e
 
+        discovery_complete = True
         changed_keys = set(changed_versions.keys())
         if include_fulltext and hasattr(self.zotero_client, "new_fulltext"):
             try:
@@ -1400,16 +1401,18 @@ class ZoteroSemanticSearch:
                             changed_keys.add(entry["key"])
             except Exception as e:
                 logger.warning(f"Failed to fetch new_fulltext(since={since_version}): {e}")
+                discovery_complete = False
 
         try:
             current_versions = self.zotero_client.item_versions() or {}
         except Exception as e:
             logger.warning(f"Failed to fetch current item_versions for deletion check: {e}")
             current_versions = None
+            discovery_complete = False
         current_keys = set(current_versions.keys()) if current_versions is not None else None
 
         if not changed_keys:
-            return [], current_keys
+            return [], current_keys if discovery_complete else None
 
         changed_items: list[dict[str, Any]] = []
         changed_item_keys: set[str] = set()
@@ -1419,6 +1422,7 @@ class ZoteroSemanticSearch:
                 item = self.zotero_client.item(key)
             except Exception as e:
                 logger.debug(f"item({key}) failed during incremental fetch: {e}")
+                discovery_complete = False
                 continue
             if not item:
                 continue
@@ -1439,6 +1443,7 @@ class ZoteroSemanticSearch:
                 parent = self.zotero_client.item(parent_key)
             except Exception as e:
                 logger.debug(f"item({parent_key}) failed while resolving changed attachment: {e}")
+                discovery_complete = False
                 continue
             parent_type = parent.get("data", {}).get("itemType")
             if parent_type in {"attachment", "note", "annotation"}:
@@ -1449,7 +1454,7 @@ class ZoteroSemanticSearch:
         if include_fulltext and changed_items:
             self._attach_web_fulltext(changed_items)
 
-        return changed_items, current_keys
+        return changed_items, current_keys if discovery_complete else None
 
     def _verify_local_snapshot_version(self, target_sync_version: int) -> int | None:
         """Decide whether the local sqlite snapshot supports promoting the
@@ -1750,9 +1755,10 @@ class ZoteroSemanticSearch:
                 # so deletion works identically whether or not chunking is on.
                 if current_library_keys is None:
                     logger.warning(
-                        "Skipping deletion pass because current Zotero item keys "
-                        "could not be enumerated."
+                        "Skipping deletion pass and keeping the previous sync "
+                        "watermark because incremental discovery was incomplete."
                     )
+                    target_sync_version = None
                 else:
                     try:
                         deleted = self._delete_missing_index_items(current_library_keys)
@@ -1764,6 +1770,7 @@ class ZoteroSemanticSearch:
                                 pass
                     except Exception as e:
                         logger.warning(f"Deletion pass failed: {e}")
+                        target_sync_version = None
             else:
                 # Full scan: bootstrap or forced rebuild.
                 # Capture the library version BEFORE scanning so any changes
@@ -1822,6 +1829,7 @@ class ZoteroSemanticSearch:
                                 pass
                     except Exception as e:
                         logger.warning(f"Local deletion pass failed: {e}")
+                        target_sync_version = None
 
             stats["total_items"] = len(all_items)
             logger.info(f"Found {stats['total_items']} items to process")
@@ -1945,7 +1953,8 @@ class ZoteroSemanticSearch:
 
             # Update last update time, and promote last_sync_version on success
             self.update_config["last_update"] = datetime.now().isoformat()
-            self._save_update_config(last_sync_version=target_sync_version)
+            completed_sync_version = target_sync_version if stats["errors"] == 0 else None
+            self._save_update_config(last_sync_version=completed_sync_version)
 
             end_time = datetime.now()
             stats["duration"] = str(end_time - start_time)
