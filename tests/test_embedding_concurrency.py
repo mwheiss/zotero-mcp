@@ -86,7 +86,7 @@ def _search(monkeypatch, chroma, items):
     return search
 
 
-def test_concurrent_embeddings_overlap_but_chroma_writes_stay_ordered(monkeypatch):
+def test_concurrent_embeddings_overlap_with_per_entry_serialized_writes(monkeypatch):
     items = _items(51)
     chroma = _ConcurrentChroma()
     search = _search(monkeypatch, chroma, items)
@@ -102,23 +102,58 @@ def test_concurrent_embeddings_overlap_but_chroma_writes_stay_ordered(monkeypatc
     assert stats["embedding_concurrency"] == 2
     assert chroma.max_active_embeddings == 2
     assert chroma.writer_threads == {caller_thread}
-    assert [
+    assert all(len(batch_ids) == 1 for batch_ids in chroma.upserted_batches)
+    assert {
         item_id
         for batch_ids in chroma.upserted_batches
         for item_id in batch_ids
-    ] == [item["key"] for item in items]
+    } == {item["key"] for item in items}
 
 
-def test_default_update_path_remains_sequential(monkeypatch):
+def test_default_update_path_writes_each_entry_immediately(monkeypatch):
     chroma = _ConcurrentChroma()
     search = _search(monkeypatch, chroma, _items(2))
 
     stats = search.update_database(force_full_rebuild=True)
 
     assert stats["errors"] == 0
-    assert chroma.sequential_upserts == 1
+    assert chroma.sequential_upserts == 2
+    assert chroma.upserted_batches == [["ITEM0000"], ["ITEM0001"]]
     assert chroma.max_active_embeddings == 0
     assert "embedding_concurrency" not in stats
+
+
+class _SkewedChroma(_ConcurrentChroma):
+    def __init__(self):
+        super().__init__()
+        self.slow_started = threading.Event()
+        self.replacement_started = threading.Event()
+        self.slow_observed_replacement = False
+
+    def embed_documents(self, documents):
+        document = documents[0]
+        if "Item 0" in document:
+            self.slow_started.set()
+            self.slow_observed_replacement = self.replacement_started.wait(1)
+        elif "Item 1" in document:
+            assert self.slow_started.wait(1)
+        elif "Item 2" in document:
+            self.replacement_started.set()
+        return [[float(i), 1.0] for i, _ in enumerate(documents)]
+
+
+def test_fast_worker_takes_next_entry_while_other_worker_is_slow(monkeypatch):
+    chroma = _SkewedChroma()
+    search = _search(monkeypatch, chroma, _items(3))
+
+    stats = search.update_database(
+        force_full_rebuild=True,
+        embedding_concurrency=2,
+    )
+
+    assert stats["errors"] == 0
+    assert chroma.slow_observed_replacement is True
+    assert all(len(batch_ids) == 1 for batch_ids in chroma.upserted_batches)
 
 
 def test_concurrency_rejects_non_openai_embedding_models(monkeypatch):

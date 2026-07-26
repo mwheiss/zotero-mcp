@@ -13,11 +13,11 @@ import os
 import re
 import sys
 import threading
-from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from queue import Empty, Full, Queue
 from typing import Any
 
 try:
@@ -1905,10 +1905,6 @@ class ZoteroSemanticSearch:
             except Exception:
                 pass
 
-            # Process items in batches
-            # Keep batch size under OpenAI's 300k token-per-request limit
-            # (25 × 8000 max tokens = 200k, well within the limit)
-            batch_size = 25
             seen_items = 0
             _failed_docs = []  # Collect failures for end-of-run retry
             failed_concurrent_batches: list[_PreparedIndexBatch] = []
@@ -1938,79 +1934,134 @@ class ZoteroSemanticSearch:
                     f"Processed {seen_items}/{total} items (added: {stats['added_items']}, skipped: {stats['skipped_items']})"
                 )
 
-            batches = [
-                all_items[i : i + batch_size]
-                for i in range(0, len(all_items), batch_size)
-            ]
             if embedding_concurrency == 1:
-                for batch in batches:
-                    report_batch_progress(batch)
+                for item in all_items:
+                    report_batch_progress([item])
                     batch_stats = self._process_item_batch(
-                        batch,
+                        [item],
                         force_full_rebuild,
                         _failed_docs,
                     )
                     accumulate_batch_stats(batch_stats)
             else:
-                pending: deque[
-                    tuple[
-                        list[dict[str, Any]],
-                        _PreparedIndexBatch,
-                        Future[list[list[float]]] | None,
-                    ]
-                ] = deque()
-                batch_iter = iter(batches)
+                queue_depth = embedding_concurrency * 2
+                work_queue: Queue[Any] = Queue(maxsize=queue_depth)
+                result_queue: Queue[Any] = Queue(maxsize=queue_depth)
+                stop_pipeline = threading.Event()
+                work_done = object()
+                worker_done = object()
+                producer_errors: list[Exception] = []
 
-                def submit_batch(
-                    executor: ThreadPoolExecutor,
-                    batch: list[dict[str, Any]],
-                ) -> None:
-                    prepared = self._prepare_item_batch(batch)
-                    future = (
-                        executor.submit(
-                            self.chroma_client.embed_documents,
-                            prepared.documents,
-                        )
-                        if prepared.documents
-                        else None
-                    )
-                    pending.append((batch, prepared, future))
+                def put_with_backpressure(queue: Queue[Any], value: Any) -> bool:
+                    while not stop_pipeline.is_set():
+                        try:
+                            queue.put(value, timeout=0.1)
+                            return True
+                        except Full:
+                            continue
+                    return False
+
+                def prepare_entries() -> None:
+                    try:
+                        for item in all_items:
+                            prepared = self._prepare_item_batch([item])
+                            if not put_with_backpressure(
+                                work_queue,
+                                (item, prepared),
+                            ):
+                                return
+                    except Exception as e:
+                        producer_errors.append(e)
+                    finally:
+                        for _ in range(embedding_concurrency):
+                            if not put_with_backpressure(work_queue, work_done):
+                                break
+
+                def embedding_worker() -> None:
+                    try:
+                        while not stop_pipeline.is_set():
+                            try:
+                                job = work_queue.get(timeout=0.1)
+                            except Empty:
+                                continue
+                            if job is work_done:
+                                return
+                            item, prepared = job
+                            embeddings = None
+                            error = None
+                            if prepared.documents:
+                                try:
+                                    embeddings = (
+                                        self.chroma_client.embed_documents(
+                                            prepared.documents
+                                        )
+                                    )
+                                except Exception as e:
+                                    error = e
+                            if not put_with_backpressure(
+                                result_queue,
+                                (item, prepared, embeddings, error),
+                            ):
+                                return
+                    finally:
+                        put_with_backpressure(result_queue, worker_done)
 
                 with ThreadPoolExecutor(
                     max_workers=embedding_concurrency,
                     thread_name_prefix="zotero-embedding",
                 ) as executor:
-                    for _ in range(embedding_concurrency):
-                        try:
-                            submit_batch(executor, next(batch_iter))
-                        except StopIteration:
-                            break
+                    workers = [
+                        executor.submit(embedding_worker)
+                        for _ in range(embedding_concurrency)
+                    ]
+                    producer = threading.Thread(
+                        target=prepare_entries,
+                        name="zotero-embedding-producer",
+                        daemon=True,
+                    )
+                    producer.start()
 
-                    while pending:
-                        batch, prepared, future = pending.popleft()
-                        report_batch_progress(batch)
-                        if future is not None:
-                            try:
-                                embeddings = future.result()
-                                self._commit_prepared_batch(
-                                    prepared,
-                                    force_rebuild=force_full_rebuild,
-                                    embeddings=embeddings,
-                                )
-                            except Exception as e:
+                    completed_workers = 0
+                    try:
+                        while completed_workers < embedding_concurrency:
+                            result = result_queue.get()
+                            if result is worker_done:
+                                completed_workers += 1
+                                continue
+
+                            item, prepared, embeddings, error = result
+                            if error is None:
+                                try:
+                                    if prepared.documents:
+                                        self._commit_prepared_batch(
+                                            prepared,
+                                            force_rebuild=force_full_rebuild,
+                                            embeddings=embeddings,
+                                        )
+                                except Exception as e:
+                                    error = e
+
+                            if error is not None:
                                 logger.warning(
-                                    "Concurrent embedding batch failed (%s), "
+                                    "Concurrent embedding entry failed (%s), "
                                     "saving it for a sequential retry",
-                                    e,
+                                    error,
                                 )
-                                prepared.stats["errors"] += len(prepared.documents)
+                                prepared.stats["errors"] += len(
+                                    prepared.documents
+                                )
                                 failed_concurrent_batches.append(prepared)
-                        accumulate_batch_stats(prepared.stats)
 
-                        try:
-                            submit_batch(executor, next(batch_iter))
-                        except StopIteration:
-                            pass
+                            report_batch_progress([item])
+                            accumulate_batch_stats(prepared.stats)
+                    finally:
+                        stop_pipeline.set()
+                        producer.join()
+                        for worker in workers:
+                            worker.result()
+
+                    if producer_errors:
+                        raise producer_errors[0]
 
                 if failed_concurrent_batches:
                     import time as _retry_time

@@ -345,7 +345,7 @@ def main():
         default=1,
         metavar="N",
         help=(
-            "Run N realtime OpenAI-compatible embedding batches concurrently "
+            "Run N realtime OpenAI-compatible embedding jobs concurrently "
             "(default: 1; ChromaDB writes remain sequential)"
         ),
     )
