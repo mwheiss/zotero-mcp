@@ -79,6 +79,25 @@ class _MedianETA:
         return typical_duration * (self.total - completed) / self.parallelism
 
 
+class _CumulativeETA:
+    """Estimate remaining time from cumulative wall-clock throughput."""
+
+    def __init__(self, total: int, clock=None):
+        self.total = max(0, total)
+        self._clock = clock or time.monotonic
+        self._started = self._clock()
+
+    def estimate(self, completed: int) -> float | None:
+        """Return ETA using elapsed time across all completed entries."""
+        completed = min(max(0, completed), self.total)
+        if completed >= self.total:
+            return 0.0
+        elapsed = self._clock() - self._started
+        if completed <= 0 or elapsed <= 0:
+            return None
+        return elapsed * (self.total - completed) / completed
+
+
 def _format_eta(seconds: float | None) -> str:
     """Format an ETA compactly for a single-line terminal progress display."""
     if seconds is None:
@@ -984,10 +1003,9 @@ class ZoteroSemanticSearch:
                     _local_db_logger = logging.getLogger("zotero_mcp.local_db")
                     _prev_level = _local_db_logger.level
                     _local_db_logger.setLevel(logging.CRITICAL)
-                    extraction_eta = _MedianETA(total_local)
+                    extraction_eta = _CumulativeETA(total_local)
 
                     for item_idx, it in enumerate(local_items, 1):
-                        item_started = time.monotonic()
                         # Build display string: Author (Year) — Title
                         title = getattr(it, "title", "") or ""
                         creators = getattr(it, "creators", "") or ""
@@ -1157,8 +1175,6 @@ class ZoteroSemanticSearch:
                             items_to_process.append(it)
 
                             # (progress shown inline above via \r)
-
-                        extraction_eta.record(time.monotonic() - item_started)
 
                     # Restore local_db logger
                     _local_db_logger.setLevel(_prev_level)

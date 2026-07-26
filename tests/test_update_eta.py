@@ -2,7 +2,15 @@
 
 import pytest
 
-from zotero_mcp.semantic_search import _format_eta, _MedianETA
+from zotero_mcp.semantic_search import _CumulativeETA, _format_eta, _MedianETA
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
 
 
 def test_median_eta_uses_all_completed_entry_durations():
@@ -28,6 +36,19 @@ def test_median_eta_accounts_for_encoder_parallelism():
     eta.record(6)
 
     assert eta.estimate(2) == pytest.approx(20)
+
+
+def test_cumulative_eta_accounts_for_slow_extraction_tail():
+    clock = _Clock()
+    eta = _CumulativeETA(total=100, clock=clock)
+
+    # Nine cache hits are nearly free, but one real extraction is slow.
+    clock.now = 10
+    assert eta.estimate(10) == pytest.approx(90)
+
+    # Later fast cache hits do not erase the elapsed extraction cost.
+    clock.now = 11
+    assert eta.estimate(50) == pytest.approx(11)
 
 
 @pytest.mark.parametrize(
