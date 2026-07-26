@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 # Sentinel returned by _extract_text_from_pdf on timeout
 _EXTRACTION_TIMEOUT = "__EXTRACTION_TIMEOUT__"
 
+# Increment when named attachment precedence changes. It is included only in
+# signatures for items whose attachments use that precedence policy.
+_ATTACHMENT_SELECTION_VERSION = 1
+
 
 def _extract_pdf_worker(file_path: str, maxpages: int, result_queue):
     """Legacy worker — kept for backward compatibility but no longer used.
@@ -352,6 +356,32 @@ class LocalZoteroReader:
             for row in rows
         }
 
+    @staticmethod
+    def _uses_named_attachment_precedence(
+        title: str, path: str, content_type: str | None
+    ) -> bool:
+        """Return whether attachment selection policy can affect this item."""
+        filename = path.rsplit("/", 1)[-1]
+        words = re.sub(
+            r"[^a-z0-9]+", " ", f"{title} {filename}".casefold()
+        ).split()
+        is_pdf = (
+            (content_type or "").lower() == "application/pdf"
+            or path.lower().endswith(".pdf")
+        )
+        is_xml = (
+            (content_type or "").lower() in {"application/xml", "text/xml"}
+            or path.lower().endswith(".xml")
+        )
+        is_fulltext = "fulltext" in words or (
+            "full" in words and "text" in words
+        )
+        return (
+            (is_xml and ("grobid" in words or "tei" in words))
+            or (not is_pdf and not is_xml and is_fulltext)
+            or (is_pdf and ("ocr" in words or is_fulltext))
+        )
+
     def _resolve_attachment_path(self, attachment_key: str, zotero_path: str) -> Path | None:
         """Resolve a Zotero attachment path to a filesystem path.
 
@@ -633,6 +663,7 @@ class LocalZoteroReader:
             """,
             (item_id,),
         ).fetchall()
+        selection_metadata = self._get_attachment_selection_metadata(item_id)
 
         def stat_token(path: Path | None) -> tuple[int, int] | None:
             if path is None:
@@ -644,10 +675,18 @@ class LocalZoteroReader:
             return stat.st_size, stat.st_mtime_ns
 
         attachments = []
+        uses_named_precedence = False
         for row in rows:
             key = row["attachmentKey"]
             content_type = row["contentType"]
             zotero_path = row["path"] or ""
+            title = selection_metadata.get(key, {}).get("title", "")
+            uses_named_precedence = (
+                uses_named_precedence
+                or self._uses_named_attachment_precedence(
+                    title, zotero_path, content_type
+                )
+            )
             resolved = self._resolve_attachment_path(key, zotero_path)
             if not resolved or not resolved.exists():
                 resolved = self._scan_storage_for_attachment(key, content_type)
@@ -669,7 +708,15 @@ class LocalZoteroReader:
                 }
             )
 
-        encoded = json.dumps(attachments, sort_keys=True, separators=(",", ":"), default=str)
+        signature_data: Any = attachments
+        if uses_named_precedence:
+            signature_data = {
+                "attachments": attachments,
+                "selection_version": _ATTACHMENT_SELECTION_VERSION,
+            }
+        encoded = json.dumps(
+            signature_data, sort_keys=True, separators=(",", ":"), default=str
+        )
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _read_zotero_ft_cache(self, attachment_key: str) -> str | None:

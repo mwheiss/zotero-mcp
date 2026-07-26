@@ -67,6 +67,28 @@ def _attachment(key: str, filename: str, content_type: str):
     return key, f"storage:{filename}", content_type
 
 
+@pytest.mark.parametrize(
+    ("title", "path", "content_type", "expected"),
+    [
+        ("BetterIssa GROBID TEI", "storage:output.xml", "application/xml", True),
+        ("", "storage:BetterIssa-fulltext.txt", "text/plain", True),
+        ("BetterIssa OCR PDF", "storage:paper.pdf", "application/pdf", True),
+        ("Full Text PDF", "storage:paper.pdf", "application/pdf", True),
+        ("Supplement", "storage:supplement.pdf", "application/pdf", False),
+        ("Extraction metadata", "storage:metadata.json", "application/json", False),
+    ],
+)
+def test_named_attachment_precedence_classifier(
+    title, path, content_type, expected
+):
+    assert (
+        LocalZoteroReader._uses_named_attachment_precedence(
+            title, path, content_type
+        )
+        is expected
+    )
+
+
 def test_grobid_tei_extracts_only_abstract_and_body(tmp_path):
     tei = tmp_path / "paper.xml"
     tei.write_text(TEI)
