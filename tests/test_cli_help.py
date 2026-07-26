@@ -18,6 +18,19 @@ def test_zotero_mcp_help_mentions_openai_batch(capsys):
     assert "openai-batch-import" in out
 
 
+def test_update_db_help_mentions_embedding_concurrency(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["zotero-mcp", "help", "update-db"],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 0
+    assert "--embedding-concurrency N" in capsys.readouterr().out
+
+
 def test_zotero_mcp_help_update_db_shows_batch_flags(capsys):
     with patch("sys.argv", ["zotero-mcp", "help", "update-db"]):
         with pytest.raises(SystemExit) as exc:

@@ -339,6 +339,16 @@ def main():
                                  help="Path to semantic search configuration file")
     update_db_parser.add_argument("--db-path",
                                  help="Path to Zotero database file (zotero.sqlite), overrides config")
+    update_db_parser.add_argument(
+        "--embedding-concurrency",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Run N realtime OpenAI-compatible embedding batches concurrently "
+            "(default: 1; ChromaDB writes remain sequential)"
+        ),
+    )
     openai_batch_group = update_db_parser.add_mutually_exclusive_group()
     openai_batch_group.add_argument("--openai-batch", dest="openai_batch", action="store_true",
                                    help="Submit OpenAI embeddings through the asynchronous Batch API")
@@ -556,6 +566,7 @@ def main():
                 limit=args.limit,
                 extract_fulltext=args.fulltext,
                 use_openai_batch=args.openai_batch,
+                embedding_concurrency=args.embedding_concurrency,
             )
 
             _print_update_stats(stats)

@@ -202,6 +202,9 @@ zotero-mcp openai-batch-import
 # Force realtime OpenAI embeddings even if Batch API is enabled in config
 zotero-mcp update-db --no-openai-batch
 
+# Use two realtime OpenAI-compatible encoder workers (ChromaDB writes stay sequential)
+zotero-mcp update-db --embedding-concurrency 2
+
 # Build with full-text extraction (slower, more comprehensive)
 zotero-mcp update-db --fulltext
 
@@ -404,6 +407,7 @@ zotero-mcp update --force                  # Force update even if up to date
 zotero-mcp update-db                       # Update semantic search database (fast, metadata-only)
 zotero-mcp update-db --openai-batch        # Submit OpenAI embeddings through Batch API
 zotero-mcp update-db --no-openai-batch     # Force realtime OpenAI embeddings for this run
+zotero-mcp update-db --embedding-concurrency 2 # Run two realtime OpenAI-compatible encoder workers
 zotero-mcp openai-batch-status             # Check latest OpenAI embedding batch status
 zotero-mcp openai-batch-import             # Import completed OpenAI batch embeddings
 zotero-mcp update-db --fulltext             # Update with full-text extraction (comprehensive but slower)
