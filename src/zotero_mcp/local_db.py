@@ -12,6 +12,7 @@ import os
 import platform
 import re
 import sqlite3
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -117,7 +118,7 @@ class ZoteroItem:
     abstract: str | None = None
     creators: str | None = None
     fulltext: str | None = None
-    fulltext_source: str | None = None  # 'pdf' or 'html'
+    fulltext_source: str | None = None
     notes: str | None = None
     extra: str | None = None
     date_added: str | None = None
@@ -154,6 +155,20 @@ class ZoteroItem:
             parts.append(f"Content: {truncated_fulltext}")
 
         return "\n\n".join(parts)
+
+
+@dataclass(frozen=True)
+class _AttachmentCandidate:
+    """Attachment details used to choose the best full-text source."""
+
+    key: str
+    path: str
+    content_type: str | None
+    title: str
+    date_modified: str
+    storage_mod_time: int
+    item_id: int
+    original_index: int
 
 
 class LocalZoteroReader:
@@ -296,6 +311,46 @@ class LocalZoteroReader:
         )
         for row in conn.execute(query, (parent_item_id,)):
             yield row["attachmentKey"], row["path"], row["contentType"]
+
+    def _get_attachment_selection_metadata(
+        self, parent_item_id: int
+    ) -> dict[str, dict[str, Any]]:
+        """Return attachment titles and timestamps without changing the iterator API."""
+        try:
+            rows = self._get_connection().execute(
+                """
+                SELECT att.key AS attachmentKey,
+                       att.itemID AS attachmentItemID,
+                       att.dateModified AS dateModified,
+                       ia.storageModTime AS storageModTime,
+                       idv.value AS title
+                FROM itemAttachments ia
+                JOIN items att ON att.itemID = ia.itemID
+                LEFT JOIN itemData id
+                  ON id.itemID = att.itemID
+                 AND id.fieldID = (
+                     SELECT fieldID FROM fields WHERE fieldName = 'title'
+                 )
+                LEFT JOIN itemDataValues idv
+                  ON idv.valueID = id.valueID
+                WHERE ia.parentItemID = ?
+                """,
+                (parent_item_id,),
+            ).fetchall()
+        except (OSError, sqlite3.Error):
+            # Some test readers and old/minimal snapshots do not expose all
+            # metadata tables. Attachment paths still provide useful labels.
+            return {}
+
+        return {
+            row["attachmentKey"]: {
+                "title": row["title"] or "",
+                "date_modified": row["dateModified"] or "",
+                "storage_mod_time": row["storageModTime"] or 0,
+                "item_id": row["attachmentItemID"] or 0,
+            }
+            for row in rows
+        }
 
     def _resolve_attachment_path(self, attachment_key: str, zotero_path: str) -> Path | None:
         """Resolve a Zotero attachment path to a filesystem path.
@@ -494,6 +549,53 @@ class LocalZoteroReader:
         except Exception:
             return ""
 
+    @staticmethod
+    def _normalize_xml_text(element: ET.Element) -> str:
+        """Collapse XML text nodes into readable prose."""
+        text = re.sub(r"\s+", " ", " ".join(element.itertext())).strip()
+        return re.sub(r"\s+([,.;:!?])", r"\1", text)
+
+    def _extract_grobid_tei(self, file_path: Path) -> str:
+        """Extract only abstract and body text from a GROBID TEI document."""
+        try:
+            root = ET.parse(file_path).getroot()
+        except (ET.ParseError, OSError, ValueError) as exc:
+            logger.debug("Could not parse GROBID TEI %s: %s", file_path, exc)
+            return ""
+
+        def local_name(element: ET.Element) -> str:
+            return element.tag.rsplit("}", 1)[-1].lower()
+
+        if local_name(root) != "tei":
+            return ""
+
+        abstracts: list[str] = []
+        for element in root.iter():
+            is_abstract = local_name(element) == "abstract"
+            is_abstract_div = (
+                local_name(element) == "div"
+                and element.attrib.get("type", "").lower() == "abstract"
+            )
+            if is_abstract or is_abstract_div:
+                text = self._normalize_xml_text(element)
+                if text and text not in abstracts:
+                    abstracts.append(text)
+
+        bodies = [
+            self._normalize_xml_text(element)
+            for element in root.iter()
+            if local_name(element) == "body"
+        ]
+        bodies = [text for text in bodies if text]
+        if not bodies:
+            return ""
+
+        parts = []
+        if abstracts:
+            parts.append("Abstract:\n" + "\n\n".join(abstracts))
+        parts.append("Body:\n" + "\n\n".join(bodies))
+        return "\n\n".join(parts)
+
     def _get_fulltext_meta_for_item(self, item_id: int):
         meta = []
         for key, path, ctype in self._iter_parent_attachments(item_id):
@@ -619,6 +721,10 @@ class LocalZoteroReader:
             wanted_suffixes = {".html", ".htm"}
         elif (ctype or "").startswith("application/epub"):
             wanted_suffixes = {".epub"}
+        elif (ctype or "").lower() in {"application/xml", "text/xml"}:
+            wanted_suffixes = {".xml"}
+        elif self._is_extractable_attachment(Path("attachment"), ctype):
+            wanted_suffixes = set(self._TEXTUAL_SUFFIXES)
         else:
             return None
 
@@ -636,50 +742,165 @@ class LocalZoteroReader:
         """Attempt to extract fulltext and source from the item's best attachment.
 
         Preference order:
-        1. ``.zotero-ft-cache`` (Zotero's own already-indexed text — survives
-           filename drift, no subprocess needed) — source ``"zotero-cache"``.
-        2. PDF extraction — source ``"pdf"``.
-        3. HTML extraction — source ``"html"``.
-        4. Textual attachments (.txt, .vtt, .srt, etc.) — source ``"file"``.
+        1. GROBID TEI XML, restricted to its abstract and body.
+        2. A named fulltext textual attachment.
+        3. A named OCR PDF.
+        4. A named Full-Text PDF.
+        5. Any other PDF.
+        6. Any other extractable attachment.
 
         If the sqlite-recorded filename doesn't resolve on disk, scan the
         attachment's storage folder for a content-type-matching file before
         giving up (#291, #265).
         """
-        # 1. Zotero's own full-text cache — use it whenever present.
-        for key, _path, _ctype in self._iter_parent_attachments(item_id):
-            cached = self._read_zotero_ft_cache(key)
-            if cached:
-                return (cached, "zotero-cache")
+        metadata = self._get_attachment_selection_metadata(item_id)
+        candidates = []
+        for index, (key, path, ctype) in enumerate(
+            self._iter_parent_attachments(item_id)
+        ):
+            details = metadata.get(key, {})
+            candidates.append(
+                _AttachmentCandidate(
+                    key=key,
+                    path=path or "",
+                    content_type=ctype,
+                    title=details.get("title", ""),
+                    date_modified=details.get("date_modified", ""),
+                    storage_mod_time=details.get("storage_mod_time", 0),
+                    item_id=details.get("item_id", 0),
+                    original_index=index,
+                )
+            )
 
-        best_pdf = None
-        best_html = None
-        best_other = None
-        for key, path, ctype in self._iter_parent_attachments(item_id):
-            resolved = self._resolve_attachment_path(key, path or "")
-            if not resolved or not resolved.exists():
-                # Filename drift fallback: scan the storage folder.
-                resolved = self._scan_storage_for_attachment(key, ctype)
-                if not resolved or not resolved.exists():
+        def label(candidate: _AttachmentCandidate) -> str:
+            filename = candidate.path.rsplit("/", 1)[-1]
+            return re.sub(
+                r"[^a-z0-9]+",
+                " ",
+                f"{candidate.title} {filename}".casefold(),
+            ).strip()
+
+        def is_pdf(candidate: _AttachmentCandidate) -> bool:
+            return (
+                (candidate.content_type or "").lower() == "application/pdf"
+                or candidate.path.lower().endswith(".pdf")
+            )
+
+        def is_xml(candidate: _AttachmentCandidate) -> bool:
+            return (
+                (candidate.content_type or "").lower()
+                in {"application/xml", "text/xml"}
+                or candidate.path.lower().endswith(".xml")
+            )
+
+        def is_named(candidate: _AttachmentCandidate, word: str) -> bool:
+            return word in label(candidate).split()
+
+        def is_fulltext(candidate: _AttachmentCandidate) -> bool:
+            words = label(candidate).split()
+            return "fulltext" in words or (
+                "full" in words and "text" in words
+            )
+
+        def recency(candidate: _AttachmentCandidate):
+            return (
+                candidate.date_modified,
+                candidate.storage_mod_time,
+                candidate.item_id,
+                -candidate.original_index,
+            )
+
+        def newest_first(group):
+            return sorted(group, key=recency, reverse=True)
+
+        groups = [
+            (
+                "grobid-tei",
+                [
+                    candidate
+                    for candidate in candidates
+                    if is_xml(candidate)
+                    and (
+                        is_named(candidate, "grobid")
+                        or is_named(candidate, "tei")
+                    )
+                ],
+            ),
+            (
+                "fulltext",
+                [
+                    candidate
+                    for candidate in candidates
+                    if not is_pdf(candidate)
+                    and not is_xml(candidate)
+                    and is_fulltext(candidate)
+                ],
+            ),
+            (
+                "ocr-pdf",
+                [
+                    candidate
+                    for candidate in candidates
+                    if is_pdf(candidate) and is_named(candidate, "ocr")
+                ],
+            ),
+            (
+                "pdf",
+                [
+                    candidate
+                    for candidate in candidates
+                    if is_pdf(candidate) and is_fulltext(candidate)
+                ],
+            ),
+            ("pdf", [candidate for candidate in candidates if is_pdf(candidate)]),
+            ("file", candidates),
+        ]
+
+        attempted = set()
+        for source, group in groups:
+            for candidate in newest_first(group):
+                if candidate.key in attempted:
                     continue
-            if ctype == "application/pdf" and best_pdf is None:
-                best_pdf = resolved
-            elif (ctype or "").startswith("text/html") and best_html is None:
-                best_html = resolved
-            elif best_other is None and self._is_extractable_attachment(resolved, ctype):
-                best_other = resolved
-        # Prefer PDF, then HTML, then any extractable text file.
-        target = best_pdf or best_html or best_other
-        if not target:
-            return None
-        text = self._extract_text_from_file(target)
-        if text == _EXTRACTION_TIMEOUT:
-            return (_EXTRACTION_TIMEOUT, "timeout")
-        if not text:
-            return None
-        # Determine source type
-        source = "pdf" if target.suffix.lower() == ".pdf" else ("html" if target.suffix.lower() in {".html", ".htm"} else "file")
-        return (text, source)
+                attempted.add(candidate.key)
+
+                resolved = self._resolve_attachment_path(
+                    candidate.key, candidate.path
+                )
+                if not resolved or not resolved.exists():
+                    resolved = self._scan_storage_for_attachment(
+                        candidate.key, candidate.content_type
+                    )
+
+                if source == "grobid-tei":
+                    if not resolved or not resolved.exists():
+                        continue
+                    text = self._extract_grobid_tei(resolved)
+                elif is_pdf(candidate):
+                    cached = self._read_zotero_ft_cache(candidate.key)
+                    if cached:
+                        return cached, "zotero-cache"
+                    if not resolved or not resolved.exists():
+                        continue
+                    text = self._extract_text_from_file(resolved)
+                else:
+                    if (
+                        not resolved
+                        or not resolved.exists()
+                        or not self._is_extractable_attachment(
+                            resolved, candidate.content_type
+                        )
+                    ):
+                        continue
+                    text = self._extract_text_from_file(resolved)
+
+                if text == _EXTRACTION_TIMEOUT:
+                    return _EXTRACTION_TIMEOUT, "timeout"
+                if text:
+                    if source == "file" and resolved:
+                        suffix = resolved.suffix.lower()
+                        source = "html" if suffix in {".html", ".htm"} else "file"
+                    return text, source
+        return None
 
     def close(self):
         """Close database connection."""
