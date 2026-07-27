@@ -16,6 +16,20 @@ from pathlib import Path
 # This allows CLI commands like update-db to print "Starting up..." instantly.
 
 
+def _confirm_force_rebuild() -> bool:
+    """Require an explicit interactive confirmation for a full rebuild."""
+    print(
+        "WARNING: --force-rebuild discards and re-embeds the entire semantic "
+        "search index.\nThis can take hours and may incur substantial API costs.",
+        file=sys.stderr,
+    )
+    try:
+        response = input("Continue with the full rebuild? [y/N] ")
+    except EOFError:
+        return False
+    return response.strip().lower() in {"y", "yes"}
+
+
 def obfuscate_sensitive_value(value, keep_chars=4):
     """Obfuscate sensitive values by showing only the first few characters."""
     if not value or not isinstance(value, str):
@@ -525,6 +539,10 @@ def main():
         sys.exit(setup_main(args))
 
     elif args.command == "update-db":
+        if args.force_rebuild and not _confirm_force_rebuild():
+            print("Force rebuild cancelled.")
+            sys.exit(0)
+
         # Setup Zotero environment variables
         setup_zotero_environment()
 

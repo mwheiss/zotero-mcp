@@ -22,6 +22,7 @@ import sys
 
 # Reuse environment setup from the original CLI module
 from zotero_mcp.cli import (
+    _confirm_force_rebuild,
     _print_batch_import,
     _print_batch_status,
     _print_update_stats,
@@ -396,6 +397,14 @@ def cmd_duplicates(args):
 
 def cmd_db(args):
     """Manage the semantic search database."""
+    if (
+        args.subcommand == "update"
+        and args.force_rebuild
+        and not _confirm_force_rebuild()
+    ):
+        print("Force rebuild cancelled.")
+        return
+
     from pathlib import Path
     setup_zotero_environment()
     from zotero_mcp.cli import _save_zotero_db_path_to_config

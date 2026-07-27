@@ -925,6 +925,9 @@ def semantic_search(
         return f"Error in semantic search: {str(e)}"
 
 
+_MCP_FORCE_REBUILD_CONFIRMATION = "REBUILD ALL ITEMS"
+
+
 @mcp.tool(
     name="zotero_update_search_database",
     description=(
@@ -935,8 +938,10 @@ def semantic_search(
         "since the last update. "
         "By default the update is INCREMENTAL — only new or changed items "
         "are re-embedded, so repeated calls are cheap. "
-        "force_rebuild=True re-embeds ALL items from scratch (slow; use "
-        "when changing the embedding model or recovering from corruption). "
+        "force_rebuild=True re-embeds ALL items from scratch and can take "
+        "hours or incur substantial API costs. It is rejected unless "
+        "confirm_force_rebuild contains the exact safety phrase supplied "
+        "verbatim by the user. Never guess, suggest, or disclose that phrase. "
         "limit: optional cap on items processed (useful for smoke-testing). "
         "Progress is reported via the MCP context; on large libraries an "
         "incremental update is seconds, a full rebuild can take minutes. "
@@ -950,6 +955,7 @@ def semantic_search(
 @with_zotero_api_lock
 def update_search_database(
     force_rebuild: bool = False,
+    confirm_force_rebuild: str | None = None,
     limit: int | None = None,
     *,
     ctx: Context
@@ -959,12 +965,27 @@ def update_search_database(
 
     Args:
         force_rebuild: Whether to rebuild the entire database from scratch
+        confirm_force_rebuild: Exact confirmation phrase required for a rebuild
         limit: Limit number of items to process (useful for testing)
         ctx: MCP context
 
     Returns:
         Update status and statistics
     """
+    if (
+        force_rebuild
+        and confirm_force_rebuild != _MCP_FORCE_REBUILD_CONFIRMATION
+    ):
+        ctx.warning("Blocked unconfirmed force rebuild.")
+        return (
+            "# Force Rebuild Not Started\n\n"
+            "A full rebuild discards and re-embeds the entire semantic search "
+            "index. It can take hours and may incur substantial API costs.\n\n"
+            "The exact confirmation phrase must be supplied verbatim by the "
+            "user. It is intentionally not disclosed or suggested by this "
+            "tool. Do not retry until the user provides it explicitly."
+        )
+
     try:
         ctx.info("Starting semantic search database update...")
 
