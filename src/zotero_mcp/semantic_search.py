@@ -16,6 +16,7 @@ import statistics
 import sys
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -113,6 +114,70 @@ def _format_eta(seconds: float | None) -> str:
     if minutes:
         return f"{minutes}m {secs:02d}s"
     return f"{secs}s"
+
+
+def _display_width(text: str) -> int:
+    """Return the number of terminal columns occupied by *text*."""
+    width = 0
+    for char in text:
+        category = unicodedata.category(char)
+        if unicodedata.combining(char) or category in {"Mn", "Me", "Cf", "Cc"}:
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return width
+
+
+def _truncate_display(text: str, max_columns: int) -> str:
+    """Truncate text to a terminal-column budget without splitting wide glyphs."""
+    max_columns = max(0, max_columns)
+    if _display_width(text) <= max_columns:
+        return text
+
+    ellipsis = "..." if max_columns >= 3 else ""
+    budget = max_columns - len(ellipsis)
+    result = []
+    used = 0
+    for char in text:
+        char_width = _display_width(char)
+        if used + char_width > budget:
+            break
+        result.append(char)
+        used += char_width
+    return "".join(result) + ellipsis
+
+
+def _terminal_columns(stream) -> int:
+    """Return terminal columns for a stream, with a conservative fallback."""
+    try:
+        return max(2, os.get_terminal_size(stream.fileno()).columns)
+    except (AttributeError, OSError, ValueError):
+        return 80
+
+
+def _write_progress_line(stream, text: str) -> None:
+    """Clear and repaint one non-wrapping terminal progress line."""
+    max_columns = _terminal_columns(stream) - 1
+    line = _truncate_display(text, max_columns)
+    is_tty = bool(getattr(stream, "isatty", lambda: False)())
+    stream.write("\r")
+    if is_tty:
+        stream.write("\x1b[2K")
+    stream.write(line)
+    if not is_tty:
+        stream.write(" " * max(0, max_columns - _display_width(line)))
+    stream.flush()
+
+
+def _clear_progress_line(stream) -> None:
+    """Erase the current progress line and return the cursor to column zero."""
+    is_tty = bool(getattr(stream, "isatty", lambda: False)())
+    stream.write("\r")
+    if is_tty:
+        stream.write("\x1b[2K")
+    else:
+        stream.write(" " * (_terminal_columns(stream) - 1))
+        stream.write("\r")
+    stream.flush()
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -1024,19 +1089,10 @@ class ZoteroSemanticSearch:
                         elif first_author:
                             citation = f"{first_author} — "
                         display = f"{citation}{title}"
-                        if len(display) > 60:
-                            display = display[:57] + "..."
 
                         # Single-line progress with \r overwrite
                         # MUST fit within terminal width to prevent wrapping
                         try:
-                            try:
-                                term_width = os.get_terminal_size().columns
-                            except (OSError, ValueError):
-                                term_width = 80
-                            # Build the line and truncate to terminal width - 1
-                            # (- 1 to prevent the cursor from wrapping to next line)
-                            max_len = term_width - 1
                             status_parts = []
                             if skipped_existing > 0:
                                 status_parts.append(f"{skipped_existing} up to date")
@@ -1048,15 +1104,8 @@ class ZoteroSemanticSearch:
                                 f"  Processing {item_idx}/{total_local}{status} "
                                 f"| ETA {eta} — "
                             )
-                            # Truncate display to fit remaining space
-                            remaining = max_len - len(prefix) - 3  # -3 for "..."
-                            if remaining > 0 and display and len(display) > remaining:
-                                display = display[:remaining] + "..."
                             line = f"{prefix}{display or 'working...'}"
-                            if len(line) > max_len:
-                                line = line[:max_len]
-                            sys.stderr.write(f"\r{line}{' ' * max(0, max_len - len(line))}")
-                            sys.stderr.flush()
+                            _write_progress_line(sys.stderr, line)
                         except Exception:
                             pass
 
@@ -1181,7 +1230,7 @@ class ZoteroSemanticSearch:
 
                     # Clear progress line and show extraction summary
                     try:
-                        sys.stderr.write(f"\r{' ' * 120}\r")  # Clear progress line
+                        _clear_progress_line(sys.stderr)
                         parts = [f"  Extraction complete: {extracted} items to index"]
                         if skipped_existing > 0:
                             parts.append(f"{skipped_existing} already up to date")
@@ -1988,16 +2037,14 @@ class ZoteroSemanticSearch:
                 nonlocal seen_items
                 seen_items += 1
                 title = item.get("data", {}).get("title", "")
-                if title and len(title) > 60:
-                    title = title[:57] + "..."
                 pct = int(seen_items / total * 100) if total else 0
                 eta = _format_eta(indexing_eta.estimate(seen_items))
                 try:
-                    sys.stderr.write(
-                        f"\r  [{pct:3d}%] {seen_items}/{total} "
-                        f"| ETA {eta} — {title or 'processing...'}"
+                    _write_progress_line(
+                        sys.stderr,
+                        f"  [{pct:3d}%] {seen_items}/{total} "
+                        f"| ETA {eta} — {title or 'processing...'}",
                     )
-                    sys.stderr.flush()
                 except Exception:
                     pass
 
@@ -2209,7 +2256,7 @@ class ZoteroSemanticSearch:
             # Retry any documents that failed during the main run
             if _failed_docs:
                 try:
-                    sys.stderr.write(f"\r{' ' * 120}\r")
+                    _clear_progress_line(sys.stderr)
                     sys.stderr.write(f"\n  Retrying {len(_failed_docs)} failed items...\n")
                 except Exception:
                     pass
@@ -2241,7 +2288,7 @@ class ZoteroSemanticSearch:
 
             # Clear the progress line and show summary
             try:
-                sys.stderr.write(f"\r{' ' * 120}\r")  # Clear line
+                _clear_progress_line(sys.stderr)
                 summary = (
                     f"  Done: {stats['processed_items']} indexed, "
                     f"{stats['skipped_items']} skipped, "

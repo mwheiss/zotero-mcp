@@ -1,8 +1,18 @@
 """Tests for median-based update-db ETA estimation and display formatting."""
 
+import io
+
 import pytest
 
-from zotero_mcp.semantic_search import _CumulativeETA, _format_eta, _MedianETA
+import zotero_mcp.semantic_search as semantic_search
+from zotero_mcp.semantic_search import (
+    _CumulativeETA,
+    _display_width,
+    _format_eta,
+    _MedianETA,
+    _truncate_display,
+    _write_progress_line,
+)
 
 
 class _Clock:
@@ -64,3 +74,47 @@ def test_cumulative_eta_accounts_for_slow_extraction_tail():
 )
 def test_format_eta(seconds, expected):
     assert _format_eta(seconds) == expected
+
+
+def test_display_width_counts_cjk_and_combining_characters():
+    assert _display_width("abc") == 3
+    assert _display_width("二宮") == 4
+    assert _display_width("e\u0301") == 1
+
+
+def test_display_truncation_respects_wide_character_columns():
+    result = _truncate_display("ab二宮cd", 7)
+
+    assert result == "ab二..."
+    assert _display_width(result) == 7
+
+
+class _TTY(io.StringIO):
+    def isatty(self):
+        return True
+
+    def fileno(self):
+        raise OSError
+
+
+def test_tty_progress_clears_whole_line_before_each_repaint(monkeypatch):
+    stream = _TTY()
+    monkeypatch.setattr(semantic_search, "_terminal_columns", lambda _stream: 20)
+
+    _write_progress_line(stream, "long Japanese title 日本語")
+    _write_progress_line(stream, "short")
+
+    repaints = stream.getvalue().split("\r\x1b[2K")
+    assert len(repaints) == 3
+    assert _display_width(repaints[1]) <= 19
+    assert repaints[2] == "short"
+
+
+def test_non_tty_progress_pads_over_stale_tail(monkeypatch):
+    stream = io.StringIO()
+    monkeypatch.setattr(semantic_search, "_terminal_columns", lambda _stream: 12)
+
+    _write_progress_line(stream, "long title")
+    _write_progress_line(stream, "short")
+
+    assert stream.getvalue().endswith("\rshort" + " " * 6)
