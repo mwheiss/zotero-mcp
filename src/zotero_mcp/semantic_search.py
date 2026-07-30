@@ -490,6 +490,38 @@ def best_snippet(query: str, text: str, width: int = 320) -> tuple[str, int]:
     return snippet, best_start
 
 
+def _passages_overlap(candidate: dict[str, Any], selected: dict[str, Any]) -> bool:
+    """Return True when two matched snippets repeat substantially."""
+    candidate_text = " ".join(candidate["passage"].lower().split())
+    selected_text = " ".join(selected["passage"].lower().split())
+    if candidate_text and candidate_text == selected_text:
+        return True
+
+    start = max(candidate["passage_start"], selected["passage_start"])
+    end = min(candidate["passage_end"], selected["passage_end"])
+    overlap = max(0, end - start)
+    shorter = min(
+        candidate["passage_end"] - candidate["passage_start"],
+        selected["passage_end"] - selected["passage_start"],
+    )
+    return shorter > 0 and overlap / shorter >= 0.5
+
+
+def _passage_result(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Build the public supporting-passage representation."""
+    result = {
+        "matched_passage": candidate["passage"],
+        "similarity_score": candidate["similarity"],
+    }
+    meta = candidate["meta"]
+    for key in ("chunk_index", "n_chunks", "char_start", "char_end", "page"):
+        if key in meta:
+            result[key] = meta[key]
+    if "char_start" not in result and candidate["passage_offset"]:
+        result["passage_offset"] = candidate["passage_offset"]
+    return result
+
+
 class CrossEncoderReranker:
     """Optional cross-encoder re-ranker for semantic search results."""
 
@@ -608,6 +640,27 @@ class ZoteroSemanticSearch:
     @property
     def _chunking_enabled(self) -> bool:
         return bool(self._chunking_config.get("enabled", False))
+
+    @property
+    def _index_layout_signature(self) -> str:
+        """Identify the chunk layout that produced the stored vectors."""
+        if not self._chunking_enabled:
+            return "item-v1"
+        return "chunks-v1:{size}:{overlap}:{maximum}".format(
+            size=int(self._chunking_config.get("chunk_size", 1500)),
+            overlap=int(self._chunking_config.get("overlap", 200)),
+            maximum=int(self._chunking_config.get("max_chunks_per_item", 20)),
+        )
+
+    def _index_layout_changed(self, metadata: dict[str, Any]) -> bool:
+        """Return whether an existing item needs migration to this layout."""
+        stored = metadata.get("index_layout_signature")
+        # Old item-level indexes did not carry a signature. Preserve their
+        # historical skip behavior, while an enabled chunk layout migrates old
+        # records once. A stamped chunked index also migrates when disabled.
+        return (self._chunking_enabled or stored is not None) and (
+            stored != self._index_layout_signature
+        )
 
     def _load_reranker_config(self) -> dict[str, Any]:
         """Load reranker configuration from file or use defaults."""
@@ -1144,6 +1197,7 @@ class ZoteroSemanticSearch:
                                     stored_signature is not None
                                     and stored_signature != attachment_signature
                                 )
+                                layout_changed = self._index_layout_changed(existing_metadata)
 
                                 # Skip if extraction previously failed AND neither the item
                                 # nor its attachment set has changed since (handles both a
@@ -1156,7 +1210,11 @@ class ZoteroSemanticSearch:
                                         if stored_signature is not None
                                         else stored_att_keys == att_keys
                                     )
-                                    if not metadata_changed and attachment_unchanged:
+                                    if (
+                                        not metadata_changed
+                                        and attachment_unchanged
+                                        and not layout_changed
+                                    ):
                                         # Nothing changed since the failure — don't retry
                                         should_extract = False
                                         skipped_existing += 1
@@ -1169,12 +1227,22 @@ class ZoteroSemanticSearch:
                                 elif chroma_has_fulltext:
                                     # Successful legacy records have no signature.
                                     # Reindex them once to establish a baseline.
-                                    if metadata_changed or signature_changed or stored_signature is None:
+                                    if (
+                                        metadata_changed
+                                        or signature_changed
+                                        or stored_signature is None
+                                        or layout_changed
+                                    ):
                                         updated_existing += 1
                                     else:
                                         should_extract = False
                                         skipped_existing += 1
-                                elif metadata_changed or signature_changed or local_has_fulltext:
+                                elif (
+                                    metadata_changed
+                                    or signature_changed
+                                    or local_has_fulltext
+                                    or layout_changed
+                                ):
                                     # Metadata changed, attachment content changed, or
                                     # a metadata-only item gained extractable content.
                                     updated_existing += 1
@@ -1677,6 +1745,7 @@ class ZoteroSemanticSearch:
                 else:
                     doc_text = structured_text
                 metadata = self._create_metadata(item)
+                metadata["index_layout_signature"] = self._index_layout_signature
 
                 if not doc_text.strip():
                     stats["skipped"] += 1
@@ -2360,6 +2429,7 @@ class ZoteroSemanticSearch:
                 else:
                     doc_text = structured_text
                 metadata = self._create_metadata(item)
+                metadata["index_layout_signature"] = self._index_layout_signature
 
                 if not doc_text.strip():
                     stats["skipped"] += 1
@@ -2699,8 +2769,23 @@ class ZoteroSemanticSearch:
                 multiplier = self._reranker_config.get("candidate_multiplier", 3)
                 fetch_limit = max(fetch_limit, limit * multiplier)
 
-            # Perform semantic search
+            # Perform semantic search. If several strong chunks belong to the
+            # same papers, widen the candidate window until it contains enough
+            # distinct parent items or reaches a bounded ceiling.
             results = self.chroma_client.search(query_texts=[query], n_results=fetch_limit, where=filters)
+            if self._chunking_enabled:
+                max_fetch = max(fetch_limit, limit * 20)
+                while fetch_limit < max_fetch:
+                    result_ids = (results.get("ids") or [[]])[0]
+                    distinct_items = {raw_id.split("#", 1)[0] for raw_id in result_ids}
+                    if len(distinct_items) >= limit or len(result_ids) < fetch_limit:
+                        break
+                    fetch_limit = min(fetch_limit * 2, max_fetch)
+                    results = self.chroma_client.search(
+                        query_texts=[query],
+                        n_results=fetch_limit,
+                        where=filters,
+                    )
 
             # Re-rank results with cross-encoder if enabled. With chunking we
             # rerank ALL candidates (grouping to `limit` items happens in
@@ -2715,7 +2800,12 @@ class ZoteroSemanticSearch:
 
             # Enrich results with full Zotero item data, grouping passages back
             # to their parent items and capping at `limit` distinct papers.
-            enriched_results = self._enrich_search_results(results, query, limit)
+            enriched_results = self._enrich_search_results(
+                results,
+                query,
+                limit,
+                preserve_input_order=reranker is not None,
+            )
 
             return {
                 "query": query,
@@ -2737,17 +2827,19 @@ class ZoteroSemanticSearch:
             }
 
     def _enrich_search_results(
-        self, chroma_results: dict[str, Any], query: str, limit: int | None = None
+        self,
+        chroma_results: dict[str, Any],
+        query: str,
+        limit: int | None = None,
+        preserve_input_order: bool = False,
     ) -> list[dict[str, Any]]:
         """Enrich ChromaDB results with full Zotero item data.
 
         Chunk-aware: when the collection is indexed as passages, ids look like
-        ``<item_key>#<n>``. Results are grouped back to their parent item — the
-        first (best-ranked) passage per item wins — and capped at ``limit``
-        distinct items. For every hit a grounded ``matched_passage`` quote and,
-        when available, the passage's character offset and page are attached so
-        callers can cite precisely. Item-level collections (ids without ``#``)
-        flow through unchanged.
+        ``<item_key>#<n>``. Results are grouped back to their parent item. The
+        first (best-ranked) passage supplies the primary result, while up to two
+        independent supporting passages can add a bounded relevance bonus.
+        Item-level collections (ids without ``#``) flow through unchanged.
         """
         enriched: list[dict[str, Any]] = []
 
@@ -2759,34 +2851,79 @@ class ZoteroSemanticSearch:
         documents = chroma_results.get("documents", [[]])[0]
         metadatas = chroma_results.get("metadatas", [[]])[0]
 
-        seen_items: set[str] = set()
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for i, raw_id in enumerate(ids):
             item_key = raw_id.split("#", 1)[0]
-            if item_key in seen_items:
-                continue
-            seen_items.add(item_key)
-
             distance = distances[i] if i < len(distances) else None
             document = documents[i] if i < len(documents) else ""
             meta = metadatas[i] if i < len(metadatas) else {}
-
             passage, passage_offset = best_snippet(query, document)
+            similarity = (1 - distance) if distance is not None else 0
+            meta = meta if isinstance(meta, dict) else {}
+            global_start = (
+                int(meta["char_start"]) + passage_offset
+                if isinstance(meta.get("char_start"), int)
+                else passage_offset
+            )
+            grouped.setdefault(item_key, []).append(
+                {
+                    "raw_id": raw_id,
+                    "document": document,
+                    "meta": meta,
+                    "passage": passage,
+                    "passage_offset": passage_offset,
+                    "passage_start": global_start,
+                    "passage_end": global_start + len(passage),
+                    "similarity": similarity,
+                }
+            )
+
+        for item_key, candidates in grouped.items():
+            best = candidates[0]
+            best_score = best["similarity"]
+            selected = [best]
+            is_chunked = "#" in best["raw_id"] or "chunk_index" in best["meta"]
+
+            if is_chunked and best_score > 0:
+                for candidate in candidates[1:]:
+                    if len(selected) >= 3:
+                        break
+                    if candidate["similarity"] < max(0, best_score - 0.15):
+                        continue
+                    if any(
+                        _passages_overlap(candidate, chosen)
+                        for chosen in selected
+                    ):
+                        continue
+                    selected.append(candidate)
+
+            support_weights = (0.10, 0.05)
+            support_bonus = sum(
+                weight * min(1.0, max(0.0, candidate["similarity"]) / best_score)
+                for weight, candidate in zip(support_weights, selected[1:])
+            ) if best_score > 0 else 0.0
+            aggregate_score = min(1.0, best_score * (1.0 + min(0.15, support_bonus)))
 
             enriched_result: dict[str, Any] = {
                 "item_key": item_key,
-                "similarity_score": (1 - distance) if distance is not None else 0,
-                "matched_text": document,
-                "matched_passage": passage,
-                "metadata": meta if isinstance(meta, dict) else {},
+                "similarity_score": aggregate_score,
+                "matched_text": best["document"],
+                "matched_passage": best["passage"],
+                "metadata": best["meta"],
                 "query": query,
             }
+            if is_chunked:
+                enriched_result["best_chunk_similarity_score"] = best_score
+                enriched_result["supporting_chunk_count"] = len(selected) - 1
+                enriched_result["matched_passages"] = [
+                    _passage_result(candidate) for candidate in selected
+                ]
             # Passage provenance — present only on a chunk-indexed collection.
-            if isinstance(meta, dict):
-                for mk in ("chunk_index", "n_chunks", "char_start", "char_end", "page"):
-                    if mk in meta:
-                        enriched_result[mk] = meta[mk]
-            if "char_start" not in enriched_result and passage_offset:
-                enriched_result["passage_offset"] = passage_offset
+            for mk in ("chunk_index", "n_chunks", "char_start", "char_end", "page"):
+                if mk in best["meta"]:
+                    enriched_result[mk] = best["meta"][mk]
+            if "char_start" not in enriched_result and best["passage_offset"]:
+                enriched_result["passage_offset"] = best["passage_offset"]
 
             try:
                 enriched_result["zotero_item"] = self.zotero_client.item(item_key)
@@ -2795,8 +2932,11 @@ class ZoteroSemanticSearch:
                 enriched_result["error"] = f"Could not fetch full item data: {e}"
 
             enriched.append(enriched_result)
-            if limit and len(enriched) >= limit:
-                break
+
+        if not preserve_input_order:
+            enriched.sort(key=lambda result: result["similarity_score"], reverse=True)
+        if limit:
+            enriched = enriched[:limit]
 
         return enriched
 

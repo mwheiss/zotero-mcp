@@ -185,6 +185,7 @@ def test_chunking_emits_multiple_passage_ids(monkeypatch):
     assert meta0["chunk_index"] == 0
     assert meta0["n_chunks"] == len(s.chroma_client.upserted_ids)
     assert "char_start" in meta0 and "char_end" in meta0
+    assert meta0["index_layout_signature"] == "chunks-v1:120:20:10"
 
 
 def test_chunking_added_vs_updated_is_item_granular(monkeypatch):
@@ -214,6 +215,19 @@ def test_chunking_config_loaded_from_file(monkeypatch, tmp_path):
     s = semantic_search.ZoteroSemanticSearch(config_path=str(cfg))
     assert s._chunking_enabled is True
     assert s._chunking_config["chunk_size"] == 256
+
+
+def test_changed_chunk_layout_requires_incremental_migration(monkeypatch):
+    s = _chunking_search(monkeypatch)
+    assert s._index_layout_changed({}) is True
+    assert (
+        s._index_layout_changed({"index_layout_signature": "chunks-v1:120:20:10"})
+        is False
+    )
+    assert (
+        s._index_layout_changed({"index_layout_signature": "chunks-v1:6000:750:96"})
+        is True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +280,71 @@ def test_enrich_groups_chunks_back_to_items(monkeypatch):
     assert best["char_start"] == 900
     assert best["matched_passage"]
     assert best["zotero_item"]["data"]["title"] == "Title PAP1"
+    assert best["best_chunk_similarity_score"] == pytest.approx(0.9)
+    assert best["supporting_chunk_count"] == 1
+    assert len(best["matched_passages"]) == 2
+    assert best["similarity_score"] > best["best_chunk_similarity_score"]
+
+
+def test_enrich_rejects_overlapping_support_passages(monkeypatch):
+    s = _chunking_search(monkeypatch)
+    s.zotero_client = _ZotItemStub()
+    repeated = "mindfulness relapse " * 30
+    chroma_results = {
+        "ids": [["PAP1#0", "PAP1#1", "PAP1#4"]],
+        "distances": [[0.10, 0.11, 0.12]],
+        "documents": [[repeated, repeated, "independent evidence about relapse prevention"]],
+        "metadatas": [
+            [
+                {"parent_item_key": "PAP1", "chunk_index": 0, "char_start": 0},
+                {"parent_item_key": "PAP1", "chunk_index": 1, "char_start": 20},
+                {"parent_item_key": "PAP1", "chunk_index": 4, "char_start": 1000},
+            ]
+        ],
+    }
+
+    [enriched] = s._enrich_search_results(chroma_results, "mindfulness relapse")
+
+    assert enriched["supporting_chunk_count"] == 1
+    assert [p["chunk_index"] for p in enriched["matched_passages"]] == [0, 4]
+
+
+def test_search_adaptively_fetches_until_it_has_distinct_papers(monkeypatch):
+    class AdaptiveChroma(ChunkingFakeChroma):
+        def __init__(self):
+            super().__init__()
+            self.fetches = []
+
+        def search(self, query_texts, n_results, where=None):
+            self.fetches.append(n_results)
+            count = n_results
+            if count <= 12:
+                ids = [f"A#{i}" for i in range(count)]
+            else:
+                ids = [f"A#{i}" for i in range(12)]
+                ids.extend(f"P{i}#0" for i in range(1, count - 11))
+            return {
+                "ids": [ids],
+                "distances": [[0.1 + i / 1000 for i in range(len(ids))]],
+                "documents": [[f"passage {i}" for i in range(len(ids))]],
+                "metadatas": [[{"parent_item_key": raw.split("#")[0]} for raw in ids]],
+            }
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: _ZotItemStub())
+    s = semantic_search.ZoteroSemanticSearch(chroma_client=AdaptiveChroma())
+    s._chunking_config = {
+        "enabled": True,
+        "chunk_size": 6000,
+        "overlap": 750,
+        "max_chunks_per_item": 96,
+    }
+
+    result = s.search("query", limit=3)
+
+    assert s.chroma_client.fetches == [12, 24]
+    assert len(result["results"]) == 3
+
+
 
 
 def test_enrich_caps_at_limit(monkeypatch):

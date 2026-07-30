@@ -903,6 +903,13 @@ def semantic_search(
                     extra["Location"] = ", ".join(loc_bits)
                 if snippet:
                     extra["Matched Passage"] = snippet
+                supporting = result.get("matched_passages", [])[1:]
+                if supporting:
+                    extra["Supporting Passages"] = "\n\n".join(
+                        passage.get("matched_passage", "")[:400]
+                        for passage in supporting
+                        if passage.get("matched_passage")
+                    )
                 # Override key from result since it may differ from item["key"]
                 zotero_item.setdefault("key", result.get("item_key", ""))
                 output.extend(_utils.format_item_result(zotero_item, index=i, extra_fields=extra))
