@@ -1,4 +1,4 @@
-"""Tests for semantic full-text attachment selection and GROBID TEI parsing."""
+"""Tests for BetterIssa and legacy semantic full-text attachment selection."""
 
 from pathlib import Path
 
@@ -70,6 +70,25 @@ def _attachment(key: str, filename: str, content_type: str):
 @pytest.mark.parametrize(
     ("title", "path", "content_type", "expected"),
     [
+        ("BetterIssa indexing text", "storage:BetterIssa-indexing.txt", "text/plain", True),
+        (
+            "BetterIssa semantic document",
+            "storage:BetterIssa-semantic-document.json",
+            "application/json",
+            True,
+        ),
+        (
+            "BetterIssa Advanced OCR Markdown",
+            "storage:BetterIssa-Advanced-OCR.md",
+            "text/markdown",
+            True,
+        ),
+        (
+            "BetterIssa Reading View",
+            "storage:BetterIssa-Reading-View.html",
+            "text/html",
+            True,
+        ),
         ("BetterIssa GROBID TEI", "storage:output.xml", "application/xml", True),
         ("", "storage:BetterIssa-fulltext.txt", "text/plain", True),
         ("BetterIssa OCR PDF", "storage:paper.pdf", "application/pdf", True),
@@ -102,6 +121,154 @@ def test_grobid_tei_extracts_only_abstract_and_body(tmp_path):
     assert "Header author" not in text
     assert "Front matter" not in text
     assert "Bibliography" not in text
+
+
+def test_betterissa_indexing_text_wins_over_every_other_artifact(tmp_path):
+    files = {
+        "indexing": (
+            "BetterIssa-indexing.txt",
+            "text/plain",
+            "deliberately filtered indexing text",
+        ),
+        "semantic": (
+            "BetterIssa-semantic-document.json",
+            "application/json",
+            '{"ok": true, "status": "complete", "structured": {"plain_text": "semantic text"}}',
+        ),
+        "ocr": (
+            "BetterIssa-Advanced-OCR.md",
+            "text/markdown",
+            "advanced OCR text",
+        ),
+        "reading": (
+            "BetterIssa-Reading-View.html",
+            "text/html",
+            "<html><body>reading view text</body></html>",
+        ),
+        "pdf": ("source-document.bin", "application/pdf", "direct PDF text"),
+    }
+    attachments = []
+    paths = {}
+    metadata = {}
+    for key, (filename, content_type, content) in files.items():
+        path = tmp_path / filename
+        path.write_text(content)
+        paths[key] = path
+        attachments.append(_attachment(key, filename, content_type))
+        metadata[key] = {
+            "title": {
+                "indexing": "BetterIssa indexing text",
+                "semantic": "BetterIssa semantic document",
+                "ocr": "BetterIssa Advanced OCR Markdown",
+                "reading": "BetterIssa Reading View",
+                "pdf": "Original source",
+            }[key],
+        }
+    reader = _Reader(
+        attachments,
+        paths,
+        metadata,
+        caches={"pdf": "Zotero PDF cache"},
+    )
+
+    assert reader._extract_fulltext_for_item(1) == (
+        "deliberately filtered indexing text",
+        "betterissa-indexing",
+    )
+
+
+def test_betterissa_fixed_artifact_fallback_order(tmp_path):
+    files = {
+        "semantic": (
+            "BetterIssa-semantic-document.json",
+            "application/json",
+            '{"ok": true, "status": "complete", "structured": {"plain_text": "semantic text"}}',
+            "BetterIssa semantic document",
+        ),
+        "ocr": (
+            "BetterIssa-Advanced-OCR.md",
+            "text/markdown",
+            "advanced OCR text",
+            "BetterIssa Advanced OCR Markdown",
+        ),
+        "reading": (
+            "BetterIssa-Reading-View.html",
+            "text/html",
+            "<html><body>reading view text</body></html>",
+            "BetterIssa Reading View",
+        ),
+        "pdf": (
+            "opaque-name.bin",
+            "application/pdf",
+            "direct PDF text",
+            "Scanned source",
+        ),
+    }
+    expected = [
+        ({"semantic", "ocr", "reading", "pdf"}, "semantic text", "betterissa-semantic"),
+        ({"ocr", "reading", "pdf"}, "advanced OCR text", "betterissa-ocr"),
+        ({"reading", "pdf"}, "reading view text", "betterissa-reading-view"),
+        ({"pdf"}, "Zotero PDF cache", "zotero-cache"),
+    ]
+    for included, expected_text, expected_source in expected:
+        attachments = []
+        paths = {}
+        metadata = {}
+        for key in included:
+            filename, content_type, content, title = files[key]
+            path = tmp_path / f"{key}-{filename}"
+            path.write_text(content)
+            paths[key] = path
+            attachments.append(_attachment(key, filename, content_type))
+            metadata[key] = {"title": title}
+        reader = _Reader(
+            attachments,
+            paths,
+            metadata,
+            caches={"pdf": "Zotero PDF cache"},
+        )
+
+        text, source = reader._extract_fulltext_for_item(1)
+
+        assert expected_text in text
+        assert source == expected_source
+
+
+def test_invalid_betterissa_semantic_document_falls_back(tmp_path):
+    semantic = tmp_path / "BetterIssa-semantic-document.json"
+    semantic.write_text('{"ok": false, "structured": {"plain_text": "must not index"}}')
+    ocr = tmp_path / "BetterIssa-Advanced-OCR.md"
+    ocr.write_text("advanced OCR fallback")
+    attachments = [
+        _attachment("semantic", semantic.name, "application/json"),
+        _attachment("ocr", ocr.name, "text/markdown"),
+    ]
+    metadata = {
+        "semantic": {"title": "BetterIssa semantic document"},
+        "ocr": {"title": "BetterIssa Advanced OCR Markdown"},
+    }
+    reader = _Reader(
+        attachments,
+        {"semantic": semantic, "ocr": ocr},
+        metadata,
+    )
+
+    assert reader._extract_fulltext_for_item(1) == (
+        "advanced OCR fallback",
+        "betterissa-ocr",
+    )
+
+
+def test_betterissa_references_are_not_treated_as_fulltext(tmp_path):
+    references = tmp_path / "BetterIssa-references.json"
+    references.write_text('[{"label": "[1]", "raw": "A cited paper"}]')
+    reader = _Reader(
+        [_attachment("references", references.name, "application/json")],
+        {"references": references},
+        {"references": {"title": "BetterIssa references"}},
+    )
+
+    assert reader._extract_fulltext_for_item(1) is None
 
 
 @pytest.mark.parametrize(

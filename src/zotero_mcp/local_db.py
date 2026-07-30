@@ -26,7 +26,7 @@ _EXTRACTION_TIMEOUT = "__EXTRACTION_TIMEOUT__"
 
 # Increment when named attachment precedence changes. It is included only in
 # signatures for items whose attachments use that precedence policy.
-_ATTACHMENT_SELECTION_VERSION = 1
+_ATTACHMENT_SELECTION_VERSION = 2
 
 
 def _extract_pdf_worker(file_path: str, maxpages: int, result_queue):
@@ -376,8 +376,18 @@ class LocalZoteroReader:
         is_fulltext = "fulltext" in words or (
             "full" in words and "text" in words
         )
+        is_betterissa = "betterissa" in words
         return (
-            (is_xml and ("grobid" in words or "tei" in words))
+            (
+                is_betterissa
+                and (
+                    "indexing" in words
+                    or ("semantic" in words and "document" in words)
+                    or ("advanced" in words and "ocr" in words)
+                    or ("reading" in words and "view" in words)
+                )
+            )
+            or (is_xml and ("grobid" in words or "tei" in words))
             or (not is_pdf and not is_xml and is_fulltext)
             or (is_pdf and ("ocr" in words or is_fulltext))
         )
@@ -626,6 +636,54 @@ class LocalZoteroReader:
         parts.append("Body:\n" + "\n\n".join(bodies))
         return "\n\n".join(parts)
 
+    def _extract_betterissa_semantic_document(self, file_path: Path) -> str:
+        """Extract the clean text payload from a BetterIssa semantic document."""
+        try:
+            payload = json.loads(file_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        if payload.get("ok") is False:
+            return ""
+        if payload.get("status") not in (None, "complete"):
+            return ""
+
+        structured = payload.get("structured")
+        if isinstance(structured, dict):
+            plain_text = structured.get("plain_text")
+            if isinstance(plain_text, str) and plain_text.strip():
+                return plain_text
+
+        # Compatibility fallback for semantic documents that omit the
+        # denormalized ``structured.plain_text`` field.
+        document = payload.get("document")
+        if not isinstance(document, dict):
+            return ""
+        parts: list[str] = []
+        for field in ("title", "abstract"):
+            value = document.get(field)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+        sections = document.get("sections")
+        if isinstance(sections, list):
+            for section in sections:
+                if not isinstance(section, dict):
+                    continue
+                heading = section.get("heading")
+                if isinstance(heading, str) and heading.strip():
+                    parts.append(heading.strip())
+                chunks = section.get("chunks")
+                if not isinstance(chunks, list):
+                    continue
+                for chunk in chunks:
+                    if not isinstance(chunk, dict):
+                        continue
+                    text = chunk.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+        return "\n\n".join(parts)
+
     def _get_fulltext_meta_for_item(self, item_id: int):
         meta = []
         for key, path, ctype in self._iter_parent_attachments(item_id):
@@ -789,12 +847,13 @@ class LocalZoteroReader:
         """Attempt to extract fulltext and source from the item's best attachment.
 
         Preference order:
-        1. GROBID TEI XML, restricted to its abstract and body.
-        2. A named fulltext textual attachment.
-        3. A named OCR PDF.
-        4. A named Full-Text PDF.
-        5. Any other PDF.
-        6. Any other extractable attachment.
+        1. BetterIssa's deliberately filtered indexing text.
+        2. BetterIssa semantic-document clean text.
+        3. BetterIssa Advanced OCR Markdown.
+        4. BetterIssa Reading View.
+        5. Legacy GROBID / named fulltext sources.
+        6. Any PDF, regardless of its filename or Zotero title.
+        7. Any other extractable attachment.
 
         If the sqlite-recorded filename doesn't resolve on disk, scan the
         attachment's storage folder for a content-type-matching file before
@@ -840,14 +899,61 @@ class LocalZoteroReader:
                 or candidate.path.lower().endswith(".xml")
             )
 
+        def is_json(candidate: _AttachmentCandidate) -> bool:
+            return (
+                (candidate.content_type or "").lower() == "application/json"
+                or candidate.path.lower().endswith(".json")
+            )
+
+        def is_html(candidate: _AttachmentCandidate) -> bool:
+            return (
+                (candidate.content_type or "").lower().startswith("text/html")
+                or candidate.path.lower().endswith((".html", ".htm"))
+            )
+
         def is_named(candidate: _AttachmentCandidate, word: str) -> bool:
             return word in label(candidate).split()
+
+        def has_words(candidate: _AttachmentCandidate, *words: str) -> bool:
+            candidate_words = set(label(candidate).split())
+            return all(word in candidate_words for word in words)
 
         def is_fulltext(candidate: _AttachmentCandidate) -> bool:
             words = label(candidate).split()
             return "fulltext" in words or (
                 "full" in words and "text" in words
             )
+
+        def is_betterissa_indexing(candidate: _AttachmentCandidate) -> bool:
+            return (
+                not is_pdf(candidate)
+                and not is_json(candidate)
+                and not is_html(candidate)
+                and has_words(candidate, "betterissa", "indexing")
+            )
+
+        def is_betterissa_semantic(candidate: _AttachmentCandidate) -> bool:
+            return (
+                is_json(candidate)
+                and has_words(candidate, "betterissa", "semantic", "document")
+            )
+
+        def is_betterissa_ocr(candidate: _AttachmentCandidate) -> bool:
+            return (
+                not is_pdf(candidate)
+                and not is_json(candidate)
+                and not is_html(candidate)
+                and has_words(candidate, "betterissa", "advanced", "ocr")
+            )
+
+        def is_betterissa_reading_view(candidate: _AttachmentCandidate) -> bool:
+            return (
+                is_html(candidate)
+                and has_words(candidate, "betterissa", "reading", "view")
+            )
+
+        def is_betterissa_auxiliary(candidate: _AttachmentCandidate) -> bool:
+            return has_words(candidate, "betterissa", "references")
 
         def recency(candidate: _AttachmentCandidate):
             return (
@@ -861,6 +967,38 @@ class LocalZoteroReader:
             return sorted(group, key=recency, reverse=True)
 
         groups = [
+            (
+                "betterissa-indexing",
+                [
+                    candidate
+                    for candidate in candidates
+                    if is_betterissa_indexing(candidate)
+                ],
+            ),
+            (
+                "betterissa-semantic",
+                [
+                    candidate
+                    for candidate in candidates
+                    if is_betterissa_semantic(candidate)
+                ],
+            ),
+            (
+                "betterissa-ocr",
+                [
+                    candidate
+                    for candidate in candidates
+                    if is_betterissa_ocr(candidate)
+                ],
+            ),
+            (
+                "betterissa-reading-view",
+                [
+                    candidate
+                    for candidate in candidates
+                    if is_betterissa_reading_view(candidate)
+                ],
+            ),
             (
                 "grobid-tei",
                 [
@@ -900,7 +1038,14 @@ class LocalZoteroReader:
                 ],
             ),
             ("pdf", [candidate for candidate in candidates if is_pdf(candidate)]),
-            ("file", candidates),
+            (
+                "file",
+                [
+                    candidate
+                    for candidate in candidates
+                    if not is_betterissa_auxiliary(candidate)
+                ],
+            ),
         ]
 
         attempted = set()
@@ -922,6 +1067,10 @@ class LocalZoteroReader:
                     if not resolved or not resolved.exists():
                         continue
                     text = self._extract_grobid_tei(resolved)
+                elif source == "betterissa-semantic":
+                    if not resolved or not resolved.exists():
+                        continue
+                    text = self._extract_betterissa_semantic_document(resolved)
                 elif is_pdf(candidate):
                     cached = self._read_zotero_ft_cache(candidate.key)
                     if cached:
