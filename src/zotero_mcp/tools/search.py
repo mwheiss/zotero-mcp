@@ -47,7 +47,7 @@ def _maybe_fire_presearch_sync(search) -> None:
 
     def _run():
         try:
-            search.update_database(extract_fulltext=_utils.is_local_mode())
+            search.update_database()
         except Exception as e:
             _search_logger.debug(f"Background pre-search sync failed: {e}")
 
@@ -949,6 +949,8 @@ _MCP_FORCE_REBUILD_CONFIRMATION = "REBUILD ALL ITEMS"
         "hours or incur substantial API costs. It is rejected unless "
         "confirm_force_rebuild contains the exact safety phrase supplied "
         "verbatim by the user. Never guess, suggest, or disclose that phrase. "
+        "fulltext_source selects 'api' for Zotero's cached fulltext, 'local' "
+        "for local SQLite/artifact extraction, or 'none' for metadata only. "
         "limit: optional cap on items processed (useful for smoke-testing). "
         "Progress is reported via the MCP context; on large libraries an "
         "incremental update is seconds, a full rebuild can take minutes. "
@@ -963,6 +965,7 @@ _MCP_FORCE_REBUILD_CONFIRMATION = "REBUILD ALL ITEMS"
 def update_search_database(
     force_rebuild: bool = False,
     confirm_force_rebuild: str | None = None,
+    fulltext_source: Literal["api", "local", "none"] = "api",
     limit: int | None = None,
     *,
     ctx: Context
@@ -973,6 +976,7 @@ def update_search_database(
     Args:
         force_rebuild: Whether to rebuild the entire database from scratch
         confirm_force_rebuild: Exact confirmation phrase required for a rebuild
+        fulltext_source: Full-text source: API cache, local artifacts, or none
         limit: Limit number of items to process (useful for testing)
         ctx: MCP context
 
@@ -1012,11 +1016,10 @@ def update_search_database(
         # Create semantic search instance
         search = create_semantic_search(str(config_path))
 
-        # Use fulltext extraction when in local mode (has access to PDFs)
         stats = search.update_database(
             force_full_rebuild=force_rebuild,
             limit=limit,
-            extract_fulltext=_utils.is_local_mode()
+            fulltext_source=fulltext_source,
         )
 
         # Format results
@@ -1025,6 +1028,9 @@ def update_search_database(
         if stats.get("error"):
             output.append(f"**Error:** {stats['error']}")
         else:
+            output.append(
+                f"**Full-text source:** {stats.get('fulltext_source', fulltext_source)}"
+            )
             output.append(f"**Total items:** {stats.get('total_items', 0)}")
             output.append(f"**Processed:** {stats.get('processed_items', 0)}")
             output.append(f"**Added:** {stats.get('added_items', 0)}")

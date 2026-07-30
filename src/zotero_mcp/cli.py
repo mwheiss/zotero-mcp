@@ -192,6 +192,8 @@ def _print_update_stats(stats: dict) -> None:
     label = "OpenAI batch submission" if is_batch else "Database update"
     outcome = "failed" if stats.get("error") else "completed"
     print(f"\n{label} {outcome}:")
+    if stats.get("fulltext_source"):
+        print(f"- Full-text source: {stats['fulltext_source']}")
     print(f"- Total items: {stats.get('total_items', 0)}")
     print(f"- Processed: {stats.get('processed_items', 0)}")
     if stats.get("batch_submitted"):
@@ -347,8 +349,16 @@ def main():
                                  help="Force complete rebuild of the database")
     update_db_parser.add_argument("--limit", type=int,
                                  help="Limit number of items to process (for testing)")
-    update_db_parser.add_argument("--fulltext", action="store_true",
-                                 help="Extract fulltext content from local Zotero database (slower but more comprehensive)")
+    update_db_parser.add_argument(
+        "--fulltext",
+        choices=("api", "local", "none"),
+        default="api",
+        metavar="{api,local,none}",
+        help=(
+            "Full-text source: Zotero API cache, local SQLite/artifacts, "
+            "or metadata only (default: api)"
+        ),
+    )
     update_db_parser.add_argument("--config-path",
                                  help="Path to semantic search configuration file")
     update_db_parser.add_argument("--db-path",
@@ -568,21 +578,25 @@ def main():
                 sys.exit(1)
 
             print("Starting database update...")
-            if args.fulltext:
+            if args.fulltext == "local":
                 from zotero_mcp.utils import is_local_mode
                 if not is_local_mode():
                     print(
-                        "Error: --fulltext requires local mode but ZOTERO_LOCAL is not enabled.\n"
+                        "Error: --fulltext local requires ZOTERO_LOCAL=true.\n"
                         "Full-text indexing needs access to Zotero's local database.\n"
                         "Set ZOTERO_LOCAL=true or run 'zotero-mcp setup' to enable local mode.",
                         file=sys.stderr,
                     )
                     sys.exit(1)
                 print("Extracting full-text content from local Zotero database...")
+            elif args.fulltext == "api":
+                print("Fetching cached full-text content through the Zotero API...")
+            else:
+                print("Indexing Zotero metadata only (full text disabled)...")
             stats = search.update_database(
                 force_full_rebuild=args.force_rebuild,
                 limit=args.limit,
-                extract_fulltext=args.fulltext,
+                fulltext_source=args.fulltext,
                 use_openai_batch=args.openai_batch,
                 embedding_concurrency=args.embedding_concurrency,
             )

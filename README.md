@@ -206,10 +206,10 @@ zotero-mcp update-db --no-openai-batch
 zotero-mcp update-db --embedding-concurrency 2
 
 # Build with full-text extraction (slower, more comprehensive)
-zotero-mcp update-db --fulltext
+zotero-mcp update-db --fulltext local
 
 # Use your custom zotero.sqlite path
-zotero-mcp update-db --fulltext --db-path "/Your_custom_path/zotero.sqlite"
+zotero-mcp update-db --fulltext local --db-path "/Your_custom_path/zotero.sqlite"
 
 # If you have embedding conflicts or changed models, force a rebuild
 zotero-mcp update-db --force-rebuild
@@ -410,10 +410,12 @@ zotero-mcp update-db --no-openai-batch     # Force realtime OpenAI embeddings fo
 zotero-mcp update-db --embedding-concurrency 2 # Run two realtime OpenAI-compatible encoder workers
 zotero-mcp openai-batch-status             # Check latest OpenAI embedding batch status
 zotero-mcp openai-batch-import             # Import completed OpenAI batch embeddings
-zotero-mcp update-db --fulltext             # Update with full-text extraction (comprehensive but slower)
+zotero-mcp update-db --fulltext api         # Use cached full text from the active Zotero API (default)
+zotero-mcp update-db --fulltext local       # Use local SQLite and preferred artifacts
+zotero-mcp update-db --fulltext none        # Index metadata only
 zotero-mcp update-db --force-rebuild       # Force complete database rebuild
-zotero-mcp update-db --fulltext --force-rebuild  # Rebuild with full-text extraction
-zotero-mcp update-db --fulltext --db-path "your_path_to/zotero.sqlite" # Customize your zotero database path
+zotero-mcp update-db --fulltext local --force-rebuild  # Rebuild from local artifacts
+zotero-mcp update-db --fulltext local --db-path "your_path/to/zotero.sqlite" # Customize your Zotero database path
 zotero-mcp db-status                       # Show database status and info
 
 # General
@@ -486,7 +488,7 @@ zotero-cli tags list
 
 # Semantic search database
 zotero-cli db update
-zotero-cli db update --fulltext --force-rebuild
+zotero-cli db update --fulltext local --force-rebuild
 zotero-cli db status
 
 # Library and duplicates
@@ -626,9 +628,9 @@ A 45-point live integration test plan is included at `docs/integration-test-plan
 ### Semantic Search Issues
 - **"Missing required environment variables" when running update-db**: Run `zotero-mcp setup` to configure your environment, or the CLI will automatically load settings from your MCP client config (e.g., Claude Desktop)
 - **ChromaDB / stale embedding model errors**: If you changed embedding models and see 404 errors (e.g., `text-embedding-004 is not found`), run `zotero-mcp update-db --force-rebuild` to recreate the collection with your current model. If that doesn't work, delete `~/.config/zotero-mcp/chroma_db/` and rebuild.
-- **Database update takes long**: By default, `update-db` is fast (metadata-only). For comprehensive indexing with full-text, use `--fulltext` flag. Use `--limit` parameter for testing: `zotero-mcp update-db --limit 100`
+- **Database update takes long**: `update-db` uses cached Zotero API full text by default. Select metadata-only indexing with `--fulltext none`, or use `--limit` for testing: `zotero-mcp update-db --limit 100`
 - **Semantic search returns no results**: Ensure the database is initialized with `zotero-mcp update-db` and check status with `zotero-mcp db-status`
-- **Limited search quality**: For better semantic search results, use `zotero-mcp update-db --fulltext` to index full-text content (requires local Zotero setup)
+- **Limited search quality**: Use `zotero-mcp update-db --fulltext local` to index preferred local artifacts, or `--fulltext api` for Zotero's cached full text.
 - **OpenAI/Gemini API errors**: Verify your API keys are correctly set and have sufficient credits/quota
 
 ### Update Issues

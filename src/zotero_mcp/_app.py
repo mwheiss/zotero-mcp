@@ -10,8 +10,6 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-from zotero_mcp.utils import is_local_mode
-
 # Configure logging from environment variable
 # Set ZOTERO_MCP_LOG_LEVEL=DEBUG in Claude Desktop config to enable debug logs
 _log_level = os.environ.get("ZOTERO_MCP_LOG_LEVEL", "WARNING").upper()
@@ -47,7 +45,7 @@ def _sync_semantic_update() -> None:
         return
 
     sys.stderr.write("Auto-updating semantic search database...\n")
-    stats = search.update_database(extract_fulltext=is_local_mode())
+    stats = search.update_database()
     sys.stderr.write(
         f"Database update completed: {stats.get('processed_items', 0)} items processed\n"
     )

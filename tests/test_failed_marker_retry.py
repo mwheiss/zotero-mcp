@@ -129,7 +129,7 @@ def _run_scan(
     )
 
     items = search._get_items_from_source(
-        extract_fulltext=True, chroma_client=chroma, force_rebuild=False
+        fulltext_source="local", chroma_client=chroma, force_rebuild=False
     )
     return items, reader
 
