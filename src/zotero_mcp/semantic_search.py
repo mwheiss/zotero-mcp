@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 _CONTENT_CONTRACT_SIGNATURE = "lean-paper-content-v1"
 _SELF_CONTAINED_FULLTEXT_SOURCES = {"betterissa-indexing"}
+DEFAULT_MAX_CHUNKS_PER_ITEM = 768
 
 
 @dataclass
@@ -405,7 +406,7 @@ def split_into_passages(
     text: str,
     chunk_size: int = 1500,
     overlap: int = 200,
-    max_chunks: int = 20,
+    max_chunks: int = DEFAULT_MAX_CHUNKS_PER_ITEM,
 ) -> list[tuple[str, int, int]]:
     """Split *text* into overlapping passages on natural boundaries.
 
@@ -642,7 +643,7 @@ class ZoteroSemanticSearch:
             "enabled": False,
             "chunk_size": 1500,
             "overlap": 200,
-            "max_chunks_per_item": 20,
+            "max_chunks_per_item": DEFAULT_MAX_CHUNKS_PER_ITEM,
         }
         if self.config_path and os.path.exists(self.config_path):
             try:
@@ -665,7 +666,11 @@ class ZoteroSemanticSearch:
         return "chunks-v1:{size}:{overlap}:{maximum}".format(
             size=int(self._chunking_config.get("chunk_size", 1500)),
             overlap=int(self._chunking_config.get("overlap", 200)),
-            maximum=int(self._chunking_config.get("max_chunks_per_item", 20)),
+            maximum=int(
+                self._chunking_config.get(
+                    "max_chunks_per_item", DEFAULT_MAX_CHUNKS_PER_ITEM
+                )
+            ),
         )
 
     def _index_layout_changed(self, metadata: dict[str, Any]) -> bool:
@@ -2408,7 +2413,11 @@ class ZoteroSemanticSearch:
         chunking = self._chunking_enabled
         chunk_size = int(self._chunking_config.get("chunk_size", 1500))
         overlap = int(self._chunking_config.get("overlap", 200))
-        max_chunks = int(self._chunking_config.get("max_chunks_per_item", 20))
+        max_chunks = int(
+            self._chunking_config.get(
+                "max_chunks_per_item", DEFAULT_MAX_CHUNKS_PER_ITEM
+            )
+        )
 
         documents: list[str] = []
         metadatas: list[dict[str, Any]] = []

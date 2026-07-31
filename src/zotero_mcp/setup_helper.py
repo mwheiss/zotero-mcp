@@ -382,8 +382,8 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
     #   reranker: local cross-encoder re-rank of candidates for higher
     #             precision (needs sentence-transformers; adds a model load).
     #   chunking: index each item as overlapping passages so search returns
-    #             grounded quotes and long PDFs stay searchable. Enabling it
-    #             requires a one-time `update-db --force-rebuild`.
+    #             grounded quotes and long PDFs stay searchable. Changing its
+    #             layout causes a one-time reindex on the next update.
     if existing_semantic_config and existing_semantic_config.get("reranker"):
         config["reranker"] = existing_semantic_config["reranker"]
     else:
@@ -399,7 +399,7 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
             "enabled": False,
             "chunk_size": 1500,
             "overlap": 200,
-            "max_chunks_per_item": 20,
+            "max_chunks_per_item": 768,
         })
     if zotero_db_path:
         config["zotero_db_path"] = zotero_db_path

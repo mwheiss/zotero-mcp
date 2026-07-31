@@ -132,6 +132,7 @@ def test_setup_openai_new_config_defaults_to_batch(monkeypatch):
 
     assert config["embedding_model"] == "openai"
     assert config["openai_batch"] == {"enabled": True}
+    assert config["chunking"]["max_chunks_per_item"] == 768
 
 
 class FakeChromaClient:

@@ -61,6 +61,14 @@ def test_split_respects_max_chunks():
     assert len(out) == 7
 
 
+def test_default_chunk_cap_covers_very_large_document():
+    body = "word " * 525_000
+    out = split_into_passages(body, chunk_size=6000, overlap=750)
+
+    assert 96 < len(out) < semantic_search.DEFAULT_MAX_CHUNKS_PER_ITEM
+    assert out[-1][2] == len(body.strip())
+
+
 def test_split_overlap_larger_than_chunk_is_tolerated():
     body = "x" * 1000
     out = split_into_passages(body, chunk_size=100, overlap=500, max_chunks=20)
@@ -297,6 +305,10 @@ def test_chunking_config_loaded_from_file(monkeypatch, tmp_path):
     s = semantic_search.ZoteroSemanticSearch(config_path=str(cfg))
     assert s._chunking_enabled is True
     assert s._chunking_config["chunk_size"] == 256
+    assert (
+        s._chunking_config["max_chunks_per_item"]
+        == semantic_search.DEFAULT_MAX_CHUNKS_PER_ITEM
+    )
 
 
 def test_changed_chunk_layout_requires_incremental_migration(monkeypatch):
