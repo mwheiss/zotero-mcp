@@ -98,9 +98,10 @@ def test_process_item_batch_defers_failures_when_failed_docs_provided(monkeypatc
 
     # All 3 items prepared successfully (text built, truncated, queued)
     assert stats["processed"] == 3
-    # All 3 items deferred to the retry list when the upsert raised
-    assert len(failed_docs) == 3
-    assert {doc_id for _, _, doc_id in failed_docs} == {"ITEM000", "ITEM001", "ITEM002"}
+    # The complete prepared batch is retained so retry can reconcile stale ids
+    # only after every replacement record has been written successfully.
+    assert len(failed_docs) == 1
+    assert set(failed_docs[0].ids) == {"ITEM000", "ITEM001", "ITEM002"}
     # Errors bumped by the deferred count so the totals stay accurate
     assert stats["errors"] == 3
     # No items classified as added/updated because the batch never reached

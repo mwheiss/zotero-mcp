@@ -1676,11 +1676,15 @@ class ZoteroSemanticSearch:
         if not to_delete_keys:
             return 0
 
-        if self._chunking_enabled and hasattr(self.chroma_client, "delete_item_chunks"):
-            for key in to_delete_keys:
+        for key in to_delete_keys:
+            if hasattr(self.chroma_client, "delete_item_records"):
+                self.chroma_client.delete_item_records(key)
+            elif self._chunking_enabled and hasattr(
+                self.chroma_client, "delete_item_chunks"
+            ):
                 self.chroma_client.delete_item_chunks(key)
-        else:
-            self.chroma_client.delete_documents(to_delete_keys)
+            else:
+                self.chroma_client.delete_documents([key])
         return len(to_delete_keys)
 
     def _prepare_index_records(self, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -2090,7 +2094,7 @@ class ZoteroSemanticSearch:
                 total,
                 parallelism=embedding_concurrency,
             )
-            _failed_docs = []  # Collect failures for end-of-run retry
+            _failed_docs: list[_PreparedIndexBatch] = []
             failed_concurrent_batches: list[_PreparedIndexBatch] = []
 
             def report_item_progress(item: dict[str, Any]) -> None:
@@ -2317,7 +2321,8 @@ class ZoteroSemanticSearch:
             if _failed_docs:
                 try:
                     _clear_progress_line(sys.stderr)
-                    sys.stderr.write(f"\n  Retrying {len(_failed_docs)} failed items...\n")
+                    retry_items = sum(batch.stats["processed"] for batch in _failed_docs)
+                    sys.stderr.write(f"\n  Retrying {retry_items} failed items...\n")
                 except Exception:
                     pass
 
@@ -2327,19 +2332,20 @@ class ZoteroSemanticSearch:
 
                 retry_ok = 0
                 retry_fail = 0
-                for doc, meta, doc_id in _failed_docs:
+                for prepared in _failed_docs:
                     try:
-                        self.chroma_client.upsert_documents([doc], [meta], [doc_id])
-                        retry_ok += 1
-                        stats["errors"] -= 1  # Remove from error count
-                        # Don't classify as added vs updated — when the
-                        # original batch failed, the add/update lookup never
-                        # ran, so we don't know which category it belongs in.
-                        # Track recovered items in their own bucket.
-                        stats["recovered_items"] += 1
+                        self._commit_prepared_batch(
+                            prepared,
+                            force_rebuild=force_full_rebuild,
+                        )
+                        recovered = prepared.stats["processed"]
+                        retry_ok += recovered
+                        stats["errors"] -= recovered
+                        stats["recovered_items"] += recovered
                     except Exception as e2:
-                        retry_fail += 1
-                        logger.error(f"Retry failed for {doc_id}: {e2}")
+                        retry_fail += prepared.stats["processed"]
+                        first_id = prepared.ids[0] if prepared.ids else "unknown"
+                        logger.error(f"Retry failed for {first_id}: {e2}")
 
                 try:
                     sys.stderr.write(f"  Retry: {retry_ok} recovered, {retry_fail} still failed\n")
@@ -2578,29 +2584,24 @@ class ZoteroSemanticSearch:
                 f"{len(embeddings)} vectors for {len(documents)} documents"
             )
 
-        # Which items already existed (drives added-vs-updated). When
-        # chunking, also clear an item's stale passages before re-adding so
-        # a shrinking document never leaves orphaned chunks behind.
+        # Probe both layouts so migrations are classified as updates. Existing
+        # records remain searchable until the replacement upsert succeeds.
         existing_item_keys: set[str] = set()
         if not force_rebuild:
-            if self._chunking_enabled:
-                probe_ids = [f"{k}#0" for k in item_keys_order]
-                existing_chunk0 = self.chroma_client.get_existing_ids(probe_ids)
-                existing_item_keys = {
-                    cid.split("#", 1)[0] for cid in existing_chunk0
-                }
-                if hasattr(self.chroma_client, "delete_item_chunks"):
-                    for key in dict.fromkeys(item_keys_order):
-                        try:
-                            self.chroma_client.delete_item_chunks(key)
-                        except Exception as e:
-                            logger.debug(
-                                "delete_item_chunks(%s) failed: %s",
-                                key,
-                                e,
-                            )
-            else:
-                existing_item_keys = self.chroma_client.get_existing_ids(ids)
+            unique_keys = list(dict.fromkeys(item_keys_order))
+            probe_ids = unique_keys + [f"{key}#0" for key in unique_keys]
+            existing_records = self.chroma_client.get_existing_ids(probe_ids)
+            existing_item_keys = {
+                record_id.split("#", 1)[0] for record_id in existing_records
+            }
+
+        expected_ids_by_item: dict[str, set[str]] = {
+            key: set() for key in item_keys_order
+        }
+        for doc_id in ids:
+            expected_ids_by_item.setdefault(doc_id.split("#", 1)[0], set()).add(
+                doc_id
+            )
 
         try:
             if embeddings is None:
@@ -2612,6 +2613,11 @@ class ZoteroSemanticSearch:
                     ids,
                     embeddings,
                 )
+            if not force_rebuild and hasattr(
+                self.chroma_client, "reconcile_item_records"
+            ):
+                for key, expected_ids in expected_ids_by_item.items():
+                    self.chroma_client.reconcile_item_records(key, expected_ids)
             for key in item_keys_order:
                 if key in existing_item_keys:
                     stats["updated"] += 1
@@ -2624,9 +2630,8 @@ class ZoteroSemanticSearch:
             # and retrying after all batches are done is more effective.
             logger.warning(f"Batch upsert failed ({e}), saving for retry")
             if _failed_docs is not None:
-                for j in range(len(documents)):
-                    _failed_docs.append((documents[j], metadatas[j], ids[j]))
-                stats["errors"] += len(documents)
+                _failed_docs.append(prepared)
+                stats["errors"] += stats["processed"]
             else:
                 raise
 
@@ -3042,7 +3047,10 @@ class ZoteroSemanticSearch:
     def delete_item(self, item_key: str) -> bool:
         """Delete an item from the semantic search database."""
         try:
-            self.chroma_client.delete_documents([item_key])
+            if hasattr(self.chroma_client, "delete_item_records"):
+                self.chroma_client.delete_item_records(item_key)
+            else:
+                self.chroma_client.delete_documents([item_key])
             return True
         except Exception as e:
             logger.error(f"Error deleting item {item_key}: {e}")

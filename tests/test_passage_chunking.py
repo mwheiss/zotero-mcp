@@ -133,6 +133,8 @@ class ChunkingFakeChroma:
         self.upserted_docs = []
         self.upserted_metas = []
         self.deleted_parents = []
+        self.reconciled = []
+        self.events = []
         self.embedding_max_tokens = 8000
         self._existing = set(existing or [])
 
@@ -143,9 +145,14 @@ class ChunkingFakeChroma:
         self.deleted_parents.append(item_key)
 
     def upsert_documents(self, documents, metadatas, ids):
+        self.events.append("upsert")
         self.upserted_docs.extend(documents)
         self.upserted_metas.extend(metadatas)
         self.upserted_ids.extend(ids)
+
+    def reconcile_item_records(self, item_key, expected_ids):
+        self.events.append("reconcile")
+        self.reconciled.append((item_key, set(expected_ids)))
 
     def truncate_text(self, text, max_tokens=None):
         return text
@@ -284,8 +291,31 @@ def test_chunking_added_vs_updated_is_item_granular(monkeypatch):
     stats = s._process_item_batch([_long_item("ITEM0001")], force_rebuild=False)
     assert stats["updated"] == 1
     assert stats["added"] == 0
-    # Stale chunks for the re-indexed item were cleared first.
-    assert "ITEM0001" in s.chroma_client.deleted_parents
+    assert s.chroma_client.events == ["upsert", "reconcile"]
+    assert s.chroma_client.reconciled[0][0] == "ITEM0001"
+    assert all(
+        doc_id.startswith("ITEM0001#")
+        for doc_id in s.chroma_client.reconciled[0][1]
+    )
+
+
+def test_chunk_layout_migrations_probe_and_reconcile_both_layouts(monkeypatch):
+    chunked = _chunking_search(monkeypatch, existing={"ITEM0001"})
+    chunk_stats = chunked._process_item_batch([_long_item()], force_rebuild=False)
+    assert chunk_stats["updated"] == 1
+    assert chunked.chroma_client.reconciled[0][0] == "ITEM0001"
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    item_level_client = ChunkingFakeChroma(existing={"ITEM0001#0"})
+    item_level = semantic_search.ZoteroSemanticSearch(
+        chroma_client=item_level_client
+    )
+    item_stats = item_level._process_item_batch(
+        [_long_item()],
+        force_rebuild=False,
+    )
+    assert item_stats["updated"] == 1
+    assert item_level_client.reconciled == [("ITEM0001", {"ITEM0001"})]
 
 
 def test_default_path_still_item_level(monkeypatch):
@@ -301,7 +331,11 @@ def test_chunking_config_loaded_from_file(monkeypatch, tmp_path):
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"semantic_search": {"chunking": {"enabled": True, "chunk_size": 256}}}))
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
-    monkeypatch.setattr(semantic_search, "create_chroma_client", lambda _p: ChunkingFakeChroma())
+    monkeypatch.setattr(
+        semantic_search,
+        "create_chroma_client",
+        lambda _p, **kwargs: ChunkingFakeChroma(),
+    )
     s = semantic_search.ZoteroSemanticSearch(config_path=str(cfg))
     assert s._chunking_enabled is True
     assert s._chunking_config["chunk_size"] == 256

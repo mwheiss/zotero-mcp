@@ -94,3 +94,57 @@ def test_reset_stamps_embedding_identity(monkeypatch):
     assert created["metadata"]["zotero_mcp_embedding_identity"] == (
         "Qwen3-Embedding-8B-Q8_0"
     )
+
+
+class _RecordCollection:
+    def __init__(self, ids):
+        self.ids = set(ids)
+        self.deleted = []
+
+    def get(self, ids=None, where=None, include=None):
+        if where is not None:
+            parent = where["parent_item_key"]
+            found = sorted(
+                doc_id for doc_id in self.ids if doc_id.startswith(f"{parent}#")
+            )
+        else:
+            found = sorted(self.ids & set(ids or []))
+        return {"ids": found}
+
+    def delete(self, ids=None, where=None):
+        if where is not None:
+            parent = where["parent_item_key"]
+            ids = [doc_id for doc_id in self.ids if doc_id.startswith(f"{parent}#")]
+        removed = set(ids or [])
+        self.deleted.append(removed)
+        self.ids.difference_update(removed)
+
+
+def test_reconcile_removes_stale_chunks_and_opposite_layout():
+    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
+    client.collection = _RecordCollection({"ITEM", "ITEM#0", "ITEM#1", "ITEM#2"})
+
+    client.reconcile_item_records("ITEM", {"ITEM#0", "ITEM#1"})
+
+    assert client.collection.ids == {"ITEM#0", "ITEM#1"}
+
+
+def test_delete_item_records_removes_bare_and_chunked_ids():
+    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
+    client.collection = _RecordCollection({"ITEM", "ITEM#0", "ITEM#1", "OTHER#0"})
+
+    client.delete_item_records("ITEM")
+
+    assert client.collection.ids == {"OTHER#0"}
+
+
+def test_collection_id_read_errors_are_not_treated_as_empty():
+    class FailingCollection:
+        def get(self, **kwargs):
+            raise OSError("database unavailable")
+
+    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
+    client.collection = FailingCollection()
+
+    with pytest.raises(OSError, match="database unavailable"):
+        client.get_all_ids()

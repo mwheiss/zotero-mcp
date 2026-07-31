@@ -803,7 +803,41 @@ class ChromaClient:
         try:
             self.collection.delete(where={"parent_item_key": item_key})
         except Exception as e:
-            logger.debug(f"delete_item_chunks({item_key}) failed: {e}")
+            logger.error("Error deleting chunks for %s: %s", item_key, e)
+            raise
+
+    def get_item_chunk_ids(self, item_key: str) -> set[str]:
+        """Return every passage id belonging to one parent item."""
+        try:
+            result = self.collection.get(
+                where={"parent_item_key": item_key},
+                include=[],
+            )
+            return set(result.get("ids", []))
+        except Exception as e:
+            logger.error("Error listing chunks for %s: %s", item_key, e)
+            raise
+
+    def reconcile_item_records(
+        self,
+        item_key: str,
+        expected_ids: set[str],
+    ) -> None:
+        """Remove obsolete representations after a successful item upsert."""
+        chunk_ids = self.get_item_chunk_ids(item_key)
+        stale_ids = chunk_ids - expected_ids
+        bare_ids = self.get_existing_ids([item_key])
+        if item_key not in expected_ids:
+            stale_ids.update(bare_ids)
+        if stale_ids:
+            self.delete_documents(sorted(stale_ids))
+
+    def delete_item_records(self, item_key: str) -> None:
+        """Delete both bare and chunked representations of an item."""
+        ids = self.get_item_chunk_ids(item_key)
+        ids.update(self.get_existing_ids([item_key]))
+        if ids:
+            self.delete_documents(sorted(ids))
 
     def get_collection_info(self) -> dict[str, Any]:
         """Get information about the collection."""
@@ -879,8 +913,9 @@ class ChromaClient:
         try:
             result = self.collection.get(ids=ids, include=[])
             return set(result.get("ids", []))
-        except Exception:
-            return set()
+        except Exception as e:
+            logger.error("Error checking collection ids: %s", e)
+            raise
 
     def get_all_ids(self) -> set[str]:
         """Return every id currently stored in the collection.
@@ -893,7 +928,7 @@ class ChromaClient:
             return set(result.get("ids", []))
         except Exception as e:
             logger.error(f"Error listing collection ids: {e}")
-            return set()
+            raise
 
 
 def create_chroma_client(
