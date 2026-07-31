@@ -1,4 +1,4 @@
-"""Tests for local, API, and metadata-only full-text source selection."""
+"""Tests for opt-in local full-text selection."""
 
 import sys
 from types import SimpleNamespace
@@ -35,7 +35,7 @@ def test_get_items_from_source_aborts_when_fulltext_without_local_mode(monkeypat
     search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
 
     with pytest.raises(RuntimeError, match="ZOTERO_LOCAL"):
-        search._get_items_from_source(fulltext_source="local")
+        search._get_items_from_source(fulltext=True)
 
 
 def test_get_items_from_source_proceeds_when_fulltext_with_local_mode(monkeypatch):
@@ -48,7 +48,7 @@ def test_get_items_from_source_proceeds_when_fulltext_with_local_mode(monkeypatc
     monkeypatch.setattr(search, "_get_items_from_local_db", lambda *a, **kw: [])
 
     # Should not raise
-    result = search._get_items_from_source(fulltext_source="local")
+    result = search._get_items_from_source(fulltext=True)
     assert result == []
 
 
@@ -57,37 +57,23 @@ def test_get_items_from_source_metadata_only_uses_api_items(monkeypatch):
     monkeypatch.setattr(semantic_search, "is_local_mode", lambda: False)
 
     search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
-    captured = {}
+    captured = []
     monkeypatch.setattr(
         search,
         "_get_items_from_api",
-        lambda *a, **kw: captured.update(kw) or [],
+        lambda *a, **kw: captured.append((a, kw)) or [],
     )
-    result = search._get_items_from_source(fulltext_source="none")
+    result = search._get_items_from_source(fulltext=False)
     assert result == []
-    assert captured["include_fulltext"] is False
+    assert captured == [((None,), {})]
 
 
-def test_get_items_from_source_api_requests_cached_fulltext(monkeypatch):
-    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
-    search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
-    captured = {}
-    monkeypatch.setattr(
-        search,
-        "_get_items_from_api",
-        lambda *a, **kw: captured.update(kw) or [],
-    )
-
-    assert search._get_items_from_source(fulltext_source="api") == []
-    assert captured["include_fulltext"] is True
-
-
-def test_get_items_from_source_rejects_unknown_mode(monkeypatch):
+def test_get_items_from_source_rejects_non_boolean_mode(monkeypatch):
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
     search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
 
-    with pytest.raises(ValueError, match="api, local, none"):
-        search._get_items_from_source(fulltext_source="surprise")
+    with pytest.raises(ValueError, match="true or false"):
+        search._get_items_from_source(fulltext="local")
 
 
 def test_local_fulltext_overlays_complete_api_metadata(monkeypatch):

@@ -192,7 +192,7 @@ def submit_embedding_batches(
     config_path: str | None = None,
     force_full_rebuild: bool = False,
     target_sync_version: int | None = None,
-    fulltext_source: str | None = None,
+    fulltext: bool | None = None,
     content_signature: str | None = None,
     client: Any | None = None,
 ) -> dict[str, Any]:
@@ -216,7 +216,7 @@ def submit_embedding_batches(
         "model": model_name,
         "force_full_rebuild": bool(force_full_rebuild),
         "target_sync_version": target_sync_version,
-        "fulltext_source": fulltext_source,
+        "fulltext": fulltext,
         "content_signature": content_signature,
         "manifest_path": str(run_dir / "manifest.json"),
         "batches": [],

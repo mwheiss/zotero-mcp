@@ -949,8 +949,8 @@ _MCP_FORCE_REBUILD_CONFIRMATION = "REBUILD ALL ITEMS"
         "hours or incur substantial API costs. It is rejected unless "
         "confirm_force_rebuild contains the exact safety phrase supplied "
         "verbatim by the user. Never guess, suggest, or disclose that phrase. "
-        "fulltext_source selects 'api' for Zotero's cached fulltext, 'local' "
-        "for local SQLite/artifact extraction, or 'none' for metadata only. "
+        "fulltext=True selects one local BetterIssa/PDF attachment per item. "
+        "The default fulltext=False indexes title and abstract only. "
         "limit: optional cap on items processed (useful for smoke-testing). "
         "Progress is reported via the MCP context; on large libraries an "
         "incremental update is seconds, a full rebuild can take minutes. "
@@ -965,7 +965,7 @@ _MCP_FORCE_REBUILD_CONFIRMATION = "REBUILD ALL ITEMS"
 def update_search_database(
     force_rebuild: bool = False,
     confirm_force_rebuild: str | None = None,
-    fulltext_source: Literal["api", "local", "none"] = "api",
+    fulltext: bool = False,
     limit: int | None = None,
     *,
     ctx: Context
@@ -976,7 +976,7 @@ def update_search_database(
     Args:
         force_rebuild: Whether to rebuild the entire database from scratch
         confirm_force_rebuild: Exact confirmation phrase required for a rebuild
-        fulltext_source: Full-text source: API cache, local artifacts, or none
+        fulltext: Whether to index one locally selected full-text attachment
         limit: Limit number of items to process (useful for testing)
         ctx: MCP context
 
@@ -995,6 +995,13 @@ def update_search_database(
             "The exact confirmation phrase must be supplied verbatim by the "
             "user. It is intentionally not disclosed or suggested by this "
             "tool. Do not retry until the user provides it explicitly."
+        )
+
+    if fulltext and not _utils.is_local_mode():
+        return (
+            "# Database Update Not Started\n\n"
+            "Full-text indexing requires local Zotero mode because attachments "
+            "are selected from the local database and filesystem."
         )
 
     try:
@@ -1019,7 +1026,7 @@ def update_search_database(
         stats = search.update_database(
             force_full_rebuild=force_rebuild,
             limit=limit,
-            fulltext_source=fulltext_source,
+            fulltext=fulltext,
         )
 
         # Format results
@@ -1029,7 +1036,7 @@ def update_search_database(
             output.append(f"**Error:** {stats['error']}")
         else:
             output.append(
-                f"**Full-text source:** {stats.get('fulltext_source', fulltext_source)}"
+                f"**Full text:** {'local attachments' if stats.get('fulltext', fulltext) else 'disabled'}"
             )
             output.append(f"**Total items:** {stats.get('total_items', 0)}")
             output.append(f"**Processed:** {stats.get('processed_items', 0)}")

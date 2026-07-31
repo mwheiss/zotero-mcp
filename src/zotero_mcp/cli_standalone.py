@@ -424,16 +424,16 @@ def cmd_db(args):
         if getattr(args, "openai_batch", None) is True and search.chroma_client.embedding_model != "openai":
             print("Error: --openai-batch requires ZOTERO_EMBEDDING_MODEL=openai", file=sys.stderr)
             sys.exit(1)
-        fulltext_source = getattr(args, "fulltext", "api")
-        if fulltext_source == "local":
+        fulltext = getattr(args, "fulltext", False)
+        if fulltext:
             from zotero_mcp.utils import is_local_mode
             if not is_local_mode():
-                print("Error: --fulltext local requires ZOTERO_LOCAL=true.", file=sys.stderr)
+                print("Error: --fulltext requires ZOTERO_LOCAL=true.", file=sys.stderr)
                 sys.exit(1)
         stats = search.update_database(
             force_full_rebuild=args.force_rebuild,
             limit=args.limit,
-            fulltext_source=fulltext_source,
+            fulltext=fulltext,
             use_openai_batch=getattr(args, "openai_batch", None),
         )
         _print_update_stats(stats)
@@ -803,9 +803,7 @@ def build_parser() -> argparse.ArgumentParser:
     dbu.add_argument("--limit", type=int)
     dbu.add_argument(
         "--fulltext",
-        choices=("api", "local", "none"),
-        default="api",
-        metavar="{api,local,none}",
+        action="store_true",
     )
     dbu.add_argument("--config-path")
     dbu.add_argument("--db-path")

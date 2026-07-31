@@ -31,20 +31,7 @@ def test_update_db_help_mentions_embedding_concurrency(monkeypatch, capsys):
     assert "--embedding-concurrency N" in capsys.readouterr().out
 
 
-def test_update_db_fulltext_requires_source_value(monkeypatch, capsys):
-    monkeypatch.setattr(
-        "sys.argv",
-        ["zotero-mcp", "update-db", "--fulltext"],
-    )
-
-    with pytest.raises(SystemExit) as exc:
-        main()
-
-    assert exc.value.code == 2
-    assert "expected one argument" in capsys.readouterr().err
-
-
-def test_update_db_help_documents_fulltext_sources(monkeypatch, capsys):
+def test_update_db_help_documents_fulltext_switch(monkeypatch, capsys):
     monkeypatch.setattr(
         "sys.argv",
         ["zotero-mcp", "help", "update-db"],
@@ -55,8 +42,9 @@ def test_update_db_help_documents_fulltext_sources(monkeypatch, capsys):
 
     assert exc.value.code == 0
     output = capsys.readouterr().out
-    assert "--fulltext {api,local,none}" in output
-    assert "default: api" in output
+    assert "--fulltext" in output
+    assert "{api,local,none}" not in output
+    assert "title and abstract only" in output
 
 
 def test_zotero_mcp_help_update_db_shows_batch_flags(capsys):

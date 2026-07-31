@@ -370,12 +370,12 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
 
     config["update_config"] = update_config
     config["extraction"] = {"pdf_max_pages": pdf_max_pages}
-    # Use the active Zotero API client's cached fulltext by default. Users can
-    # explicitly select local artifact extraction or metadata-only indexing.
-    config["fulltext_source"] = (
-        existing_semantic_config.get("fulltext_source", "api")
+    # Full text is opt-in. Metadata always comes from the Zotero API; when
+    # enabled, the body comes from one locally selected attachment.
+    config["fulltext"] = (
+        existing_semantic_config.get("fulltext", False)
         if existing_semantic_config
-        else "api"
+        else False
     )
     # Discoverable defaults for the two retrieval-quality knobs (both off so
     # the base experience is unchanged). Preserve any existing user values.

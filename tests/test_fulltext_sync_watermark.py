@@ -1,4 +1,4 @@
-"""Tests for issue #292: `update-db --fulltext local` must not advance the sync
+"""Tests for issue #292: `update-db --fulltext` must not advance the sync
 watermark past items the local sqlite snapshot never saw.
 
 The local-extraction path reads zotero.sqlite with `immutable=1`, which
@@ -202,7 +202,7 @@ def test_update_database_holds_watermark_when_snapshot_stale(
     )
     monkeypatch.setattr(s, "_get_items_from_source", lambda **kw: [])
 
-    s.update_database(fulltext_source="local")
+    s.update_database(fulltext=True)
 
     saved = json.loads(config.read_text())
     assert saved["semantic_search"]["last_sync_version"] == 10
@@ -223,7 +223,7 @@ def test_update_database_promotes_watermark_when_snapshot_complete(
     )
     monkeypatch.setattr(s, "_get_items_from_source", lambda **kw: [])
 
-    s.update_database(fulltext_source="local")
+    s.update_database(fulltext=True)
 
     saved = json.loads(config.read_text())
     assert saved["semantic_search"]["last_sync_version"] == 12
@@ -251,7 +251,7 @@ def test_local_fulltext_update_prunes_items_missing_from_complete_snapshot(
 
     monkeypatch.setattr(s, "_get_items_from_source", scan)
 
-    stats = s.update_database(fulltext_source="local")
+    stats = s.update_database(fulltext=True)
 
     assert chroma.deleted == ["DELETE_ME"]
     assert stats["deleted_items"] == 1
@@ -281,7 +281,7 @@ def test_local_fulltext_update_does_not_prune_stale_snapshot(
 
     monkeypatch.setattr(s, "_get_items_from_source", scan)
 
-    stats = s.update_database(fulltext_source="local")
+    stats = s.update_database(fulltext=True)
 
     assert chroma.deleted == []
     assert stats["deleted_items"] == 0

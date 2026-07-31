@@ -158,7 +158,7 @@ def test_mcp_force_rebuild_accepts_exact_confirmation(monkeypatch):
     )
 
     assert captured["force_full_rebuild"] is True
-    assert captured["fulltext_source"] == "api"
+    assert captured["fulltext"] is False
     assert "# Database Update Results" in result
 
 
@@ -180,5 +180,5 @@ def test_mcp_incremental_update_needs_no_confirmation(monkeypatch):
     result = search_tools.update_search_database(ctx=_Context())
 
     assert captured["force_full_rebuild"] is False
-    assert captured["fulltext_source"] == "api"
+    assert captured["fulltext"] is False
     assert "# Database Update Results" in result

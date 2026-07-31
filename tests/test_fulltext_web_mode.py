@@ -1,10 +1,4 @@
-"""Tests for web-API fulltext ingest and since-based incremental sync.
-
-These tests cover the web-API branch introduced by the PR that adds fulltext
-fetching via pyzotero's `fulltext_item` endpoint and version-based incremental
-updates for users who don't have `ZOTERO_LOCAL=true` set (e.g. Claude Code on
-a headless Linux server talking to Zotero cloud).
-"""
+"""Tests for API metadata ingest and since-based incremental sync."""
 
 import json
 import sys
@@ -164,103 +158,17 @@ def _build_search(monkeypatch, zot: FakeZoteroClient, chroma: FakeChromaClient,
     )
 
 
-# --------- Unit tests: fulltext fetch helper ----------
-
-def test_fetch_fulltext_via_api_parent_hit(monkeypatch):
-    zot = FakeZoteroClient()
-    zot.load_scenario([_paper("AAA")], fulltext={"AAA": {"content": "Body text.", "indexedChars": 10, "totalChars": 10}})
-    search = _build_search(monkeypatch, zot, FakeChromaClient())
-    text, source = search._fetch_fulltext_via_api("AAA")
-    assert text == "Body text."
-    assert source == "api:parent"
-
-
-def test_fetch_fulltext_via_api_attachment_fallback(monkeypatch):
-    """When parent has no fulltext (404), walk children and try PDF attachments."""
-    parent = _paper("PAR", title="Paper")
-    child = {
-        "key": "CHILD1",
-        "version": 1,
-        "data": {"key": "CHILD1", "itemType": "attachment", "contentType": "application/pdf"},
-    }
-    zot = FakeZoteroClient()
-    zot.load_scenario(
-        [parent],
-        # parent lookup will fail (key not in fulltext_by_key -> raise)
-        fulltext={"CHILD1": {"content": "Attachment body."}},
-        children={"PAR": [child]},
-    )
-    search = _build_search(monkeypatch, zot, FakeChromaClient())
-    text, source = search._fetch_fulltext_via_api("PAR")
-    assert text == "Attachment body."
-    assert source == "api:attachment:CHILD1"
-    # Verify we actually tried the parent first, then walked children
-    call_names = [c[0] for c in zot.calls]
-    assert "fulltext_item" in call_names and "children" in call_names
-
-
-def test_fetch_fulltext_via_api_returns_empty_when_nothing_available(monkeypatch):
-    zot = FakeZoteroClient()
-    zot.load_scenario([_paper("X")])
-    # No fulltext, no children — every lookup fails
-    search = _build_search(monkeypatch, zot, FakeChromaClient())
-    text, source = search._fetch_fulltext_via_api("X")
-    assert text == ""
-    assert source == ""
-
-
-def test_fetch_fulltext_skips_non_pdf_children(monkeypatch):
-    parent = _paper("PAR")
-    child_pdf = {"key": "PDF", "version": 1,
-                 "data": {"key": "PDF", "itemType": "attachment", "contentType": "application/pdf"}}
-    child_html = {"key": "HTM", "version": 1,
-                  "data": {"key": "HTM", "itemType": "attachment", "contentType": "text/html"}}
-    zot = FakeZoteroClient()
-    zot.load_scenario(
-        [parent],
-        fulltext={"PDF": {"content": "PDF text."}, "HTM": {"content": "HTML text."}},
-        children={"PAR": [child_html, child_pdf]},  # HTML listed first
-    )
-    search = _build_search(monkeypatch, zot, FakeChromaClient())
-    text, source = search._fetch_fulltext_via_api("PAR")
-    # Should skip the HTML attachment and return the PDF's content
-    assert text == "PDF text."
-    assert source == "api:attachment:PDF"
-
-
 # --------- Integration tests: _get_items_from_api ----------
 
-def test_get_items_from_api_without_fulltext_leaves_data_untouched(monkeypatch):
+def test_get_items_from_api_never_fetches_cached_fulltext(monkeypatch):
     zot = FakeZoteroClient()
     zot.load_scenario([_paper("A"), _paper("B")], fulltext={"A": {"content": "Abody"}, "B": {"content": "Bbody"}})
     search = _build_search(monkeypatch, zot, FakeChromaClient())
-    items = search._get_items_from_api(include_fulltext=False)
+    items = search._get_items_from_api()
     assert len(items) == 2
     for it in items:
         assert "fulltext" not in it["data"]
-
-
-def test_get_items_from_api_with_fulltext_populates_data(monkeypatch):
-    zot = FakeZoteroClient()
-    zot.load_scenario(
-        [_paper("A"), _paper("B")],
-        fulltext={"A": {"content": "Abody"}, "B": {"content": "Bbody"}},
-    )
-    search = _build_search(monkeypatch, zot, FakeChromaClient())
-    items = search._get_items_from_api(include_fulltext=True)
-    by_key = {it["key"]: it for it in items}
-    assert by_key["A"]["data"]["fulltext"] == "Abody"
-    assert by_key["A"]["data"]["fulltextSource"] == "api:parent"
-    assert by_key["B"]["data"]["fulltext"] == "Bbody"
-
-
-def test_get_items_from_api_with_fulltext_marks_misses_as_attempted(monkeypatch):
-    zot = FakeZoteroClient()
-    zot.load_scenario([_paper("A")], fulltext={})  # no fulltext for A
-    search = _build_search(monkeypatch, zot, FakeChromaClient())
-    items = search._get_items_from_api(include_fulltext=True)
-    assert items[0]["data"].get("fulltext", "") == ""
-    assert items[0]["data"]["fulltext_attempted"] is True
+    assert not any(c[0] == "fulltext_item" for c in zot.calls)
 
 
 def test_get_items_from_api_excludes_all_child_artifact_types(monkeypatch):
@@ -275,7 +183,7 @@ def test_get_items_from_api_excludes_all_child_artifact_types(monkeypatch):
     )
     search = _build_search(monkeypatch, zot, FakeChromaClient())
 
-    items = search._get_items_from_api(include_fulltext=False)
+    items = search._get_items_from_api()
 
     assert [item["key"] for item in items] == ["P1"]
 
@@ -291,7 +199,7 @@ def test_get_changed_items_from_api_returns_only_changed_keys(monkeypatch):
     # Mark OLD as unchanged since v3, NEW as changed at v5
     zot.versions_state = {"OLD": 3, "NEW": 5}
     search = _build_search(monkeypatch, zot, FakeChromaClient())
-    changed, current_keys = search._get_changed_items_from_api(since_version=3, include_fulltext=False)
+    changed, current_keys = search._get_changed_items_from_api(since_version=3)
     assert [c["key"] for c in changed] == ["NEW"]
     assert current_keys == {"OLD", "NEW"}
 
@@ -304,7 +212,7 @@ def test_get_changed_items_filters_out_attachments_and_notes(monkeypatch):
     zot.load_scenario([note, ann, paper], library_version=10)
     zot.versions_state = {"N1": 10, "A1": 10, "P1": 10}
     search = _build_search(monkeypatch, zot, FakeChromaClient())
-    changed, _ = search._get_changed_items_from_api(since_version=0, include_fulltext=False)
+    changed, _ = search._get_changed_items_from_api(since_version=0)
     assert [c["key"] for c in changed] == ["P1"]
 
 
@@ -316,8 +224,8 @@ def _write_config(tmp_path, extra: dict | None = None):
             "embedding_model": "default",
             "update_config": {"auto_update": False, "update_frequency": "manual"},
             "extraction": {"pdf_max_pages": 10},
-            "fulltext_source": "api",
-            "indexed_fulltext_source": "api",
+            "fulltext": False,
+            "indexed_fulltext": False,
         }
     }
     if extra:
@@ -345,7 +253,7 @@ def test_update_database_bootstrap_scans_full_library(monkeypatch, tmp_path):
     # last_sync_version should be persisted to config
     saved = json.loads(open(config_path).read())
     assert saved["semantic_search"]["last_sync_version"] == 7
-    assert saved["semantic_search"]["indexed_fulltext_source"] == "api"
+    assert saved["semantic_search"]["indexed_fulltext"] is False
 
 
 def test_update_database_incremental_only_fetches_changed(monkeypatch, tmp_path):
@@ -404,65 +312,6 @@ def test_update_database_skips_deletion_when_current_keys_fail(monkeypatch, tmp_
     assert saved["semantic_search"]["last_sync_version"] == 5
 
 
-def test_update_database_keeps_watermark_when_fulltext_discovery_fails(
-    monkeypatch, tmp_path
-):
-    config_path = _write_config(tmp_path, extra={"last_sync_version": 5})
-    zot = FakeZoteroClient()
-    zot.load_scenario([_paper("NEW")], library_version=9)
-    zot.new_fulltext_error = RuntimeError("temporary fulltext API failure")
-    chroma = FakeChromaClient()
-    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
-
-    stats = search.update_database()
-
-    assert stats["processed_items"] == 1
-    saved = json.loads(open(config_path).read())
-    assert saved["semantic_search"]["last_sync_version"] == 5
-
-
-def test_update_database_reindexes_parent_when_attachment_fulltext_changes(
-    monkeypatch, tmp_path
-):
-    """new_fulltext attachment keys should refresh their top-level parent."""
-    config_path = _write_config(tmp_path, extra={"last_sync_version": 5})
-    parent = _paper("PARENT", title="Parent", version=3)
-    attachment = {
-        "key": "ATTACH",
-        "version": 3,
-        "data": {
-            "key": "ATTACH",
-            "itemType": "attachment",
-            "parentItem": "PARENT",
-            "contentType": "application/pdf",
-        },
-    }
-    zot = FakeZoteroClient()
-    zot.load_scenario(
-        [parent, attachment],
-        fulltext={"ATTACH": {"content": "Revised attachment body"}},
-        children={"PARENT": [attachment]},
-        library_version=3,
-    )
-    zot.current_library_version = 9
-    zot.fulltext_versions_state["ATTACH"] = 9
-    chroma = FakeChromaClient(preloaded_ids=["PARENT"])
-    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
-
-    stats = search.update_database()
-
-    assert stats["processed_items"] == 1
-    indexed = [
-        (doc, doc_id)
-        for documents, _metadatas, ids in chroma.added
-        for doc, doc_id in zip(documents, ids, strict=True)
-    ]
-    assert len(indexed) == 1
-    assert indexed[0][1] == "PARENT"
-    assert "Revised attachment body" in indexed[0][0]
-    assert ("new_fulltext", 5) in zot.calls
-
-
 def test_update_database_incremental_noop_when_version_unchanged(monkeypatch, tmp_path):
     """If last_modified_version == last_sync_version, skip ingest entirely."""
     config_path = _write_config(tmp_path, extra={"last_sync_version": 42})
@@ -482,8 +331,8 @@ def test_update_database_incremental_noop_when_version_unchanged(monkeypatch, tm
     assert ("last_modified_version",) in zot.calls
 
 
-def test_update_database_none_mode_skips_api_fulltext(monkeypatch, tmp_path):
-    config_path = _write_config(tmp_path, extra={"fulltext_source": "none"})
+def test_update_database_default_mode_skips_api_fulltext(monkeypatch, tmp_path):
+    config_path = _write_config(tmp_path)
     zot = FakeZoteroClient()
     zot.load_scenario(
         [_paper("A")],
@@ -506,15 +355,15 @@ def test_update_database_none_mode_skips_api_fulltext(monkeypatch, tmp_path):
     assert all("this should NOT appear" not in document for document in indexed_documents)
 
 
-def test_source_change_warns_without_rebuilding_unchanged_items(
+def test_fulltext_mode_change_warns_without_rebuilding_unchanged_items(
     monkeypatch, tmp_path, capsys
 ):
     config_path = _write_config(
         tmp_path,
         extra={
             "last_sync_version": 5,
-            "fulltext_source": "none",
-            "indexed_fulltext_source": "api",
+            "fulltext": False,
+            "indexed_fulltext": True,
         },
     )
     zot = FakeZoteroClient()
@@ -532,9 +381,9 @@ def test_source_change_warns_without_rebuilding_unchanged_items(
     assert chroma.reset_calls == 0
     assert not any(c[0] == "fulltext_item" for c in zot.calls)
     assert chroma.added == []
-    assert "will not rebuild unchanged items" in capsys.readouterr().err
+    assert "will not re-embed unchanged items" in capsys.readouterr().err
     saved = json.loads(open(config_path).read())
-    assert saved["semantic_search"]["indexed_fulltext_source"] == "api"
+    assert saved["semantic_search"]["indexed_fulltext"] is True
 
 
 def test_content_contract_change_warns_without_automatic_rebuild(
@@ -544,8 +393,8 @@ def test_content_contract_change_warns_without_automatic_rebuild(
         tmp_path,
         extra={
             "last_sync_version": 5,
-            "fulltext_source": "api",
-            "indexed_fulltext_source": "api",
+            "fulltext": False,
+            "indexed_fulltext": False,
             "indexed_content_signature": "legacy-v1",
         },
     )
@@ -603,18 +452,18 @@ def test_update_database_force_rebuild_updates_last_sync_version(monkeypatch, tm
 
 # --------- Config loaders ----------
 
-def test_load_fulltext_source_defaults_to_api(monkeypatch, tmp_path):
+def test_load_fulltext_defaults_to_false(monkeypatch, tmp_path):
     # No config file exists
     search = _build_search(monkeypatch, FakeZoteroClient(), FakeChromaClient(),
                            config_path=str(tmp_path / "missing.json"))
-    assert search._load_fulltext_source_setting() == "api"
+    assert search._load_fulltext_setting() is False
 
 
-def test_load_fulltext_source_respects_none(monkeypatch, tmp_path):
-    config_path = _write_config(tmp_path, extra={"fulltext_source": "none"})
+def test_load_fulltext_respects_true(monkeypatch, tmp_path):
+    config_path = _write_config(tmp_path, extra={"fulltext": True})
     search = _build_search(monkeypatch, FakeZoteroClient(), FakeChromaClient(),
                            config_path=config_path)
-    assert search._load_fulltext_source_setting() == "none"
+    assert search._load_fulltext_setting() is True
 
 
 def test_load_last_sync_version_defaults_zero(monkeypatch, tmp_path):
