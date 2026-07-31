@@ -447,7 +447,8 @@ class ChromaClient:
                  collection_name: str = "zotero_library",
                  persist_directory: str | None = None,
                  embedding_model: str = "default",
-                 embedding_config: dict[str, Any] | None = None):
+                 embedding_config: dict[str, Any] | None = None,
+                 allow_embedding_mismatch: bool = False):
         """
         Initialize ChromaDB client.
 
@@ -460,6 +461,8 @@ class ChromaClient:
         self.collection_name = collection_name
         self.embedding_model = embedding_model
         self.embedding_config = embedding_config or {}
+        self.embedding_identity = self._configured_embedding_identity()
+        self._pending_embedding_mismatch = False
 
         # Set up persistent directory
         if persist_directory is None:
@@ -483,56 +486,85 @@ class ChromaClient:
             # Set up embedding function
             self.embedding_function = self._create_embedding_function()
 
-            # Get or create collection with the configured embedding function.
-            # If the user switched embedding models, the persisted collection
-            # will have stale config.  Detect the mismatch and drop/recreate.
+            # Opening a collection must never delete it. A confirmed force
+            # rebuild can opt into opening an incompatible collection solely so
+            # update_database() can replace it after the user's confirmation.
             try:
                 self.collection = self.client.get_or_create_collection(
                     name=self.collection_name,
-                    embedding_function=self.embedding_function
+                    embedding_function=self.embedding_function,
+                    metadata=self._new_collection_metadata(),
                 )
-
-                # ChromaDB may silently persist the old embedding function config.
-                # Check if the stored config matches what we want; if not, recreate.
-                stored_config = getattr(self.collection, 'metadata', {}) or {}
-                if not stored_config:
-                    # Try reading config from the collection's config_json_str
-                    try:
-                        import json as _json
-                        rows = self.client._sysdb.get_collections(name=self.collection_name)
-                        if rows:
-                            raw = getattr(rows[0], 'config_json_str', None) or '{}'
-                            cfg = _json.loads(raw)
-                            ef_cfg = cfg.get('embedding_function', {}).get('config', {})
-                            stored_model = ef_cfg.get('model_name', '')
-                            # Compare stored model with configured model
-                            configured_model = getattr(self.embedding_function, 'model_name', None)
-                            if stored_model and configured_model and stored_model != configured_model:
-                                logger.warning(
-                                    f"Stored embedding model '{stored_model}' differs from "
-                                    f"configured '{configured_model}'. Resetting collection."
-                                )
-                                self.client.delete_collection(name=self.collection_name)
-                                self.collection = self.client.create_collection(
-                                    name=self.collection_name,
-                                    embedding_function=self.embedding_function
-                                )
-                    except Exception:
-                        pass  # Best-effort check; proceed with existing collection
-
             except Exception as e:
                 if "embedding function conflict" in str(e).lower():
-                    logger.warning(
-                        f"Embedding model changed to '{self.embedding_model}'. "
-                        "Resetting collection for rebuild."
-                    )
-                    self.client.delete_collection(name=self.collection_name)
-                    self.collection = self.client.create_collection(
-                        name=self.collection_name,
-                        embedding_function=self.embedding_function
-                    )
+                    self._handle_embedding_mismatch(str(e), allow_embedding_mismatch)
                 else:
                     raise
+
+            stored_model = self._stored_embedding_model()
+            configured_model = getattr(self.embedding_function, "model_name", None)
+            if stored_model and configured_model and stored_model != configured_model:
+                self._handle_embedding_mismatch(
+                    f"stored model '{stored_model}' differs from configured "
+                    f"model '{configured_model}'",
+                    allow_embedding_mismatch,
+                )
+
+            stored_identity = (getattr(self.collection, "metadata", {}) or {}).get(
+                "zotero_mcp_embedding_identity"
+            )
+            if stored_identity and stored_identity != self.embedding_identity:
+                self._handle_embedding_mismatch(
+                    f"stored identity '{stored_identity}' differs from configured "
+                    f"identity '{self.embedding_identity}'",
+                    allow_embedding_mismatch,
+                )
+
+    def _configured_embedding_identity(self) -> str:
+        """Stable user-visible identity for vectors behind a provider alias."""
+        explicit = str(self.embedding_config.get("model_identity") or "").strip()
+        if explicit:
+            return explicit
+        model_name = str(self.embedding_config.get("model_name") or "").strip()
+        return f"{self.embedding_model}:{model_name or self.embedding_model}"
+
+    def _new_collection_metadata(self) -> dict[str, str]:
+        return {"zotero_mcp_embedding_identity": self.embedding_identity}
+
+    def _stored_embedding_model(self) -> str | None:
+        """Read Chroma's persisted embedding model without mutating it."""
+        try:
+            rows = self.client._sysdb.get_collections(name=self.collection_name)
+            if not rows:
+                return None
+            raw = getattr(rows[0], "config_json_str", None) or "{}"
+            cfg = json.loads(raw)
+            return cfg.get("embedding_function", {}).get("config", {}).get(
+                "model_name"
+            )
+        except Exception as e:
+            logger.debug("Could not inspect stored embedding model: %s", e)
+            return None
+
+    def _handle_embedding_mismatch(
+        self,
+        detail: str,
+        allow_embedding_mismatch: bool,
+    ) -> None:
+        message = (
+            f"Semantic index embedding mismatch: {detail}. The existing index "
+            "was left untouched. Run an explicitly confirmed force rebuild to "
+            "replace it. For proxied models, set embedding_config.model_identity "
+            "to the backend model/version rather than the API alias."
+        )
+        if not allow_embedding_mismatch:
+            raise RuntimeError(message)
+        logger.warning("%s Proceeding because a confirmed rebuild was requested.", message)
+        self._pending_embedding_mismatch = True
+        self.collection = self.client.get_collection(
+            name=self.collection_name,
+            embedding_function=_NoEmbeddingFunction(),
+        )
 
     def _create_embedding_function(self) -> EmbeddingFunction:
         """Create the appropriate embedding function based on configuration."""
@@ -799,8 +831,10 @@ class ChromaClient:
             self.client.delete_collection(name=self.collection_name)
             self.collection = self.client.create_collection(
                 name=self.collection_name,
-                embedding_function=self.embedding_function
+                embedding_function=self.embedding_function,
+                metadata=self._new_collection_metadata(),
             )
+            self._pending_embedding_mismatch = False
             logger.info(f"Reset ChromaDB collection '{self.collection_name}'")
         except Exception as e:
             logger.error(f"Error resetting collection: {e}")
@@ -862,7 +896,11 @@ class ChromaClient:
             return set()
 
 
-def create_chroma_client(config_path: str | None = None) -> ChromaClient:
+def create_chroma_client(
+    config_path: str | None = None,
+    *,
+    allow_embedding_mismatch: bool = False,
+) -> ChromaClient:
     """
     Create a ChromaClient instance from configuration.
 
@@ -956,7 +994,8 @@ def create_chroma_client(config_path: str | None = None) -> ChromaClient:
     return ChromaClient(
         collection_name=config["collection_name"],
         embedding_model=config["embedding_model"],
-        embedding_config=config["embedding_config"]
+        embedding_config=config["embedding_config"],
+        allow_embedding_mismatch=allow_embedding_mismatch,
     )
 
 

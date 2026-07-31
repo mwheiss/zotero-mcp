@@ -1021,7 +1021,10 @@ def update_search_database(
         config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
 
         # Create semantic search instance
-        search = create_semantic_search(str(config_path))
+        search = create_semantic_search(
+            str(config_path),
+            allow_embedding_mismatch=force_rebuild,
+        )
 
         stats = search.update_database(
             force_full_rebuild=force_rebuild,

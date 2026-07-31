@@ -571,7 +571,11 @@ def main():
 
         try:
             # Create semantic search instance with optional db_path override
-            search = create_semantic_search(str(config_path), db_path=db_path)
+            search = create_semantic_search(
+                str(config_path),
+                db_path=db_path,
+                allow_embedding_mismatch=args.force_rebuild,
+            )
             if args.openai_batch is True and search.chroma_client.embedding_model != "openai":
                 print("Error: --openai-batch requires ZOTERO_EMBEDDING_MODEL=openai", file=sys.stderr)
                 sys.exit(1)

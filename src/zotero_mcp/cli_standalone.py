@@ -420,7 +420,11 @@ def cmd_db(args):
         db_path = getattr(args, "db_path", None)
         if db_path:
             _save_zotero_db_path_to_config(config_path, db_path)
-        search = create_semantic_search(str(config_path), db_path=db_path)
+        search = create_semantic_search(
+            str(config_path),
+            db_path=db_path,
+            allow_embedding_mismatch=args.force_rebuild,
+        )
         if getattr(args, "openai_batch", None) is True and search.chroma_client.embedding_model != "openai":
             print("Error: --openai-batch requires ZOTERO_EMBEDDING_MODEL=openai", file=sys.stderr)
             sys.exit(1)

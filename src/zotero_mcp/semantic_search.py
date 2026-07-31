@@ -597,7 +597,11 @@ class ZoteroSemanticSearch:
     """Semantic search interface for Zotero libraries using ChromaDB."""
 
     def __init__(
-        self, chroma_client: ChromaClient | None = None, config_path: str | None = None, db_path: str | None = None
+        self,
+        chroma_client: ChromaClient | None = None,
+        config_path: str | None = None,
+        db_path: str | None = None,
+        allow_embedding_mismatch: bool = False,
     ):
         """
         Initialize semantic search.
@@ -607,7 +611,10 @@ class ZoteroSemanticSearch:
             config_path: Path to configuration file
             db_path: Optional path to Zotero database (overrides config file)
         """
-        self.chroma_client = chroma_client or create_chroma_client(config_path)
+        self.chroma_client = chroma_client or create_chroma_client(
+            config_path,
+            allow_embedding_mismatch=allow_embedding_mismatch,
+        )
         self.zotero_client = get_zotero_client()
         self.config_path = config_path
         self.db_path = db_path  # CLI override for Zotero database path
@@ -3042,7 +3049,12 @@ class ZoteroSemanticSearch:
             return False
 
 
-def create_semantic_search(config_path: str | None = None, db_path: str | None = None) -> ZoteroSemanticSearch:
+def create_semantic_search(
+    config_path: str | None = None,
+    db_path: str | None = None,
+    *,
+    allow_embedding_mismatch: bool = False,
+) -> ZoteroSemanticSearch:
     """
     Create a ZoteroSemanticSearch instance.
 
@@ -3053,4 +3065,8 @@ def create_semantic_search(config_path: str | None = None, db_path: str | None =
     Returns:
         Configured ZoteroSemanticSearch instance
     """
-    return ZoteroSemanticSearch(config_path=config_path, db_path=db_path)
+    return ZoteroSemanticSearch(
+        config_path=config_path,
+        db_path=db_path,
+        allow_embedding_mismatch=allow_embedding_mismatch,
+    )
