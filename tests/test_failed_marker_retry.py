@@ -121,11 +121,21 @@ def _run_scan(
 
     chroma = FakeChromaClient(stored_metadata)
     search = semantic_search.ZoteroSemanticSearch(chroma_client=chroma)
-    # A fake-induced error would silently fall back to the API path — fail loudly instead
     monkeypatch.setattr(
         search,
         "_get_items_from_api",
-        lambda *a, **kw: pytest.fail("unexpected fallback to API path"),
+        lambda *a, **kw: [
+            {
+                "key": "ITEMKEY1",
+                "version": 1,
+                "data": {
+                    "key": "ITEMKEY1",
+                    "itemType": "journalArticle",
+                    "title": "Calibration",
+                    "dateModified": DATE_MODIFIED,
+                },
+            }
+        ],
     )
 
     items = search._get_items_from_source(

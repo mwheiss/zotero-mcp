@@ -1022,6 +1022,22 @@ class ZoteroSemanticSearch:
         self._last_scan_indexable_keys = None
 
         try:
+            api_metadata_by_key: dict[str, dict[str, Any]] = {}
+            try:
+                api_metadata_by_key = {
+                    item.get("key", ""): item
+                    for item in self._get_items_from_api(
+                        include_fulltext=False
+                    )
+                    if item.get("key")
+                }
+            except Exception as e:
+                logger.warning(
+                    "Could not load canonical Zotero API metadata for local "
+                    "full-text extraction (%s); using reduced SQLite metadata.",
+                    e,
+                )
+
             # Load per-run config, including extraction limits and db path if provided
             pdf_max_pages = None
             pdf_timeout = 30
@@ -1232,7 +1248,14 @@ class ZoteroSemanticSearch:
                                 chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
                                 local_has_fulltext = bool(att_keys)
                                 chroma_date = existing_metadata.get("date_modified", "")
-                                item_date = getattr(it, "date_modified", "") or ""
+                                canonical_data = api_metadata_by_key.get(
+                                    it.key, {}
+                                ).get("data", {})
+                                item_date = (
+                                    canonical_data.get("dateModified")
+                                    or getattr(it, "date_modified", "")
+                                    or ""
+                                )
                                 metadata_changed = chroma_date != item_date
                                 stored_signature = existing_metadata.get("attachment_signature")
                                 signature_changed = (
@@ -1376,39 +1399,13 @@ class ZoteroSemanticSearch:
                 # Convert to API-compatible format
                 api_items = []
                 for item in local_items:
-                    # Create API-compatible item structure
-                    api_item = {
-                        "key": item.key,
-                        "version": 0,  # Local items don't have versions
-                        "data": {
-                            "key": item.key,
-                            "itemType": getattr(item, "item_type", None) or "journalArticle",
-                            "title": item.title or "",
-                            "abstractNote": item.abstract or "",
-                            "extra": item.extra or "",
-                            # Include fulltext only when extracted
-                            "fulltext": getattr(item, "fulltext", None) or "" if extract_fulltext else "",
-                            "fulltextSource": getattr(item, "fulltext_source", None) or "" if extract_fulltext else "",
-                            # Flag if extraction was attempted but failed (timeout, empty)
-                            "fulltext_attempted": getattr(item, "_fulltext_attempted", False),
-                            "dateAdded": item.date_added,
-                            "dateModified": item.date_modified,
-                            "creators": self._parse_creators_string(item.creators) if item.creators else [],
-                        },
-                    }
-                    # Attachment-key set (computed during the extraction scan);
-                    # persisted to metadata so incremental runs can detect
-                    # newly attached files on previously-failed items.
-                    if (att := getattr(item, "_attachment_keys", None)) is not None:
-                        api_item["data"]["attachmentKeys"] = att
-                    if (signature := getattr(item, "_attachment_signature", None)) is not None:
-                        api_item["data"]["attachmentSignature"] = signature
-
-                    # Add notes if available
-                    if item.notes:
-                        api_item["data"]["notes"] = item.notes
-
-                    api_items.append(api_item)
+                    api_items.append(
+                        self._merge_local_fulltext_with_api_metadata(
+                            item,
+                            api_metadata_by_key.get(item.key),
+                            extract_fulltext=extract_fulltext,
+                        )
+                    )
 
                 logger.info(f"Retrieved {len(api_items)} items from local database")
                 return api_items
@@ -1418,6 +1415,60 @@ class ZoteroSemanticSearch:
             logger.error(f"Error reading from local database: {e}")
             logger.info("Falling back to API...")
             return self._get_items_from_api(limit)
+
+    def _merge_local_fulltext_with_api_metadata(
+        self,
+        item: Any,
+        api_item: dict[str, Any] | None,
+        *,
+        extract_fulltext: bool,
+    ) -> dict[str, Any]:
+        """Overlay local extraction state onto canonical Zotero API metadata."""
+        if api_item:
+            merged = dict(api_item)
+            data = dict(api_item.get("data", {}))
+            merged["data"] = data
+            merged["key"] = api_item.get("key") or item.key
+        else:
+            data = {
+                "key": item.key,
+                "itemType": getattr(item, "item_type", None)
+                or "journalArticle",
+                "title": item.title or "",
+                "abstractNote": item.abstract or "",
+                "extra": item.extra or "",
+                "dateAdded": item.date_added,
+                "dateModified": item.date_modified,
+                "creators": (
+                    self._parse_creators_string(item.creators)
+                    if item.creators
+                    else []
+                ),
+            }
+            if item.notes:
+                data["notes"] = item.notes
+            merged = {"key": item.key, "version": 0, "data": data}
+
+        data["fulltext"] = (
+            getattr(item, "fulltext", None) or ""
+            if extract_fulltext
+            else ""
+        )
+        data["fulltextSource"] = (
+            getattr(item, "fulltext_source", None) or ""
+            if extract_fulltext
+            else ""
+        )
+        data["fulltext_attempted"] = getattr(
+            item, "_fulltext_attempted", False
+        )
+        if (att := getattr(item, "_attachment_keys", None)) is not None:
+            data["attachmentKeys"] = att
+        if (
+            signature := getattr(item, "_attachment_signature", None)
+        ) is not None:
+            data["attachmentSignature"] = signature
+        return merged
 
     def _parse_creators_string(self, creators_str: str) -> list[dict[str, str]]:
         """

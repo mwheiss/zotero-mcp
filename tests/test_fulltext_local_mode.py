@@ -1,6 +1,7 @@
 """Tests for local, API, and metadata-only full-text source selection."""
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -87,3 +88,66 @@ def test_get_items_from_source_rejects_unknown_mode(monkeypatch):
 
     with pytest.raises(ValueError, match="api, local, none"):
         search._get_items_from_source(fulltext_source="surprise")
+
+
+def test_local_fulltext_overlays_complete_api_metadata(monkeypatch):
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    search = semantic_search.ZoteroSemanticSearch(
+        chroma_client=FakeChromaClient()
+    )
+    local_item = SimpleNamespace(
+        key="ITEM1",
+        item_type="journalArticle",
+        title="Stale local title",
+        abstract="Stale local abstract",
+        extra="",
+        date_added="2020-01-01",
+        date_modified="2020-01-02",
+        creators="Local, Author",
+        notes="local workflow note",
+        fulltext="Selected BetterIssa body",
+        fulltext_source="betterissa-indexing",
+        _fulltext_attempted=False,
+        _attachment_keys="ATT1,ATT2",
+        _attachment_signature="signature-v1",
+    )
+    api_item = {
+        "key": "ITEM1",
+        "version": 42,
+        "data": {
+            "key": "ITEM1",
+            "itemType": "bookSection",
+            "title": "Canonical API title",
+            "abstractNote": "Canonical API abstract",
+            "bookTitle": "Canonical API book",
+            "date": "2026",
+            "dateModified": "2026-07-31T00:00:00Z",
+            "DOI": "10.1234/example",
+            "url": "https://example.test/paper",
+            "tags": [{"tag": "canonical-tag"}],
+            "creators": [
+                {
+                    "firstName": "Canonical",
+                    "lastName": "Author",
+                    "creatorType": "author",
+                }
+            ],
+        },
+    }
+
+    merged = search._merge_local_fulltext_with_api_metadata(
+        local_item,
+        api_item,
+        extract_fulltext=True,
+    )
+
+    assert merged["version"] == 42
+    assert merged["data"]["title"] == "Canonical API title"
+    assert merged["data"]["bookTitle"] == "Canonical API book"
+    assert merged["data"]["DOI"] == "10.1234/example"
+    assert merged["data"]["tags"] == [{"tag": "canonical-tag"}]
+    assert merged["data"]["fulltext"] == "Selected BetterIssa body"
+    assert merged["data"]["fulltextSource"] == "betterissa-indexing"
+    assert merged["data"]["attachmentKeys"] == "ATT1,ATT2"
+    assert merged["data"]["attachmentSignature"] == "signature-v1"
+    assert "fulltext" not in api_item["data"]
