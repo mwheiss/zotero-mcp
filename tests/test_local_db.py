@@ -122,6 +122,61 @@ def test_attachment_signature_changes_with_zotero_fulltext_cache(tmp_path):
     assert new_signature != old_signature
 
 
+def test_betterissa_signature_tracks_in_place_enrichment(tmp_path):
+    db_path = tmp_path / "zotero.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE items (
+            itemID INTEGER PRIMARY KEY,
+            key TEXT,
+            dateModified TEXT
+        );
+        CREATE TABLE itemAttachments (
+            itemID INTEGER PRIMARY KEY,
+            parentItemID INTEGER,
+            path TEXT,
+            contentType TEXT,
+            storageModTime INTEGER,
+            storageHash TEXT,
+            lastProcessedModificationTime INTEGER
+        );
+        CREATE TABLE fulltextItems (
+            itemID INTEGER PRIMARY KEY,
+            indexedChars INTEGER,
+            totalChars INTEGER,
+            version INTEGER
+        );
+        CREATE TABLE fields (fieldID INTEGER PRIMARY KEY, fieldName TEXT);
+        CREATE TABLE itemData (itemID INTEGER, fieldID INTEGER, valueID INTEGER);
+        CREATE TABLE itemDataValues (valueID INTEGER PRIMARY KEY, value TEXT);
+        INSERT INTO items VALUES (1, 'PARENT', '2026-01-01 00:00:00');
+        INSERT INTO items VALUES (2, 'ATTACH', '2026-01-01 00:00:00');
+        INSERT INTO itemAttachments VALUES (
+            2, 1, 'storage:artifact.txt', 'text/plain',
+            1000, 'stored-hash', 1000
+        );
+        INSERT INTO fields VALUES (1, 'title');
+        INSERT INTO itemData VALUES (2, 1, 1);
+        INSERT INTO itemDataValues VALUES (1, 'BetterIssa indexing text');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    storage_dir = tmp_path / "storage" / "ATTACH"
+    storage_dir.mkdir(parents=True)
+    artifact = storage_dir / "artifact.txt"
+    artifact.write_text("OCR body")
+
+    with LocalZoteroReader(db_path=str(db_path)) as reader:
+        indexing_signature = reader.get_attachment_signature(1)
+        artifact.write_text("OCR body plus vision description")
+        enriched_signature = reader.get_attachment_signature(1)
+
+    assert enriched_signature != indexing_signature
+
+
 class TestResolveAttachmentPath:
     """Tests for _resolve_attachment_path handling of various Zotero path formats."""
 

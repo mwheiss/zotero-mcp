@@ -89,6 +89,12 @@ def _attachment(key: str, filename: str, content_type: str):
             "text/html",
             True,
         ),
+        (
+            "BetterIssa references",
+            "storage:BetterIssa-references.json",
+            "application/json",
+            False,
+        ),
         ("BetterIssa GROBID TEI", "storage:output.xml", "application/xml", True),
         ("", "storage:BetterIssa-fulltext.txt", "text/plain", True),
         ("BetterIssa OCR PDF", "storage:paper.pdf", "application/pdf", True),
@@ -173,6 +179,87 @@ def test_betterissa_indexing_text_wins_over_every_other_artifact(tmp_path):
 
     assert reader._extract_fulltext_for_item(1) == (
         "deliberately filtered indexing text",
+        "betterissa-indexing",
+    )
+
+
+def test_betterissa_rehydration_advances_to_best_available_artifact(tmp_path):
+    pdf = tmp_path / "source.pdf"
+    pdf.write_text("original PDF body")
+    ocr = tmp_path / "BetterIssa-Advanced-OCR.md"
+    ocr.write_text(
+        "<!-- BetterIssa page 1 -->\nOCR checkpoint body\n"
+        "<!-- BetterIssa page 2 -->\nOCR second page"
+    )
+    semantic = tmp_path / "BetterIssa-semantic-document.json"
+    semantic.write_text(
+        '{"ok": true, "status": "complete", '
+        '"structured": {"plain_text": "semantic body"}}'
+    )
+    indexing = tmp_path / "BetterIssa-indexing.txt"
+    indexing.write_text("final indexing body")
+    reading = tmp_path / "BetterIssa-Reading-View.html"
+    reading.write_text("<html><body>reading view body</body></html>")
+    references = tmp_path / "BetterIssa-references.json"
+    references.write_text('[{"label": "[1]", "raw_reference": "Citation"}]')
+
+    attachments = [_attachment("pdf", pdf.name, "application/pdf")]
+    paths = {"pdf": pdf}
+    metadata = {"pdf": {"title": "Original PDF"}}
+    reader = _Reader(
+        attachments,
+        paths,
+        metadata,
+        caches={"pdf": "Zotero PDF cache"},
+    )
+
+    assert reader._extract_fulltext_for_item(1) == (
+        "Zotero PDF cache",
+        "zotero-cache",
+    )
+
+    attachments.append(_attachment("ocr", ocr.name, "text/markdown"))
+    paths["ocr"] = ocr
+    metadata["ocr"] = {"title": "BetterIssa Advanced OCR Markdown"}
+
+    ocr_text, ocr_source = reader._extract_fulltext_for_item(1)
+    assert ocr_source == "betterissa-ocr"
+    assert ocr_text == "OCR checkpoint body\n\nOCR second page"
+    assert "BetterIssa page" not in ocr_text
+
+    attachments.extend(
+        [
+            _attachment("semantic", semantic.name, "application/json"),
+            _attachment("indexing", indexing.name, "text/plain"),
+            _attachment("reading", reading.name, "text/html"),
+            _attachment("references", references.name, "application/json"),
+        ]
+    )
+    paths.update(
+        {
+            "semantic": semantic,
+            "indexing": indexing,
+            "reading": reading,
+            "references": references,
+        }
+    )
+    metadata.update(
+        {
+            "semantic": {"title": "BetterIssa semantic document"},
+            "indexing": {"title": "BetterIssa indexing text"},
+            "reading": {"title": "BetterIssa Reading View"},
+            "references": {"title": "BetterIssa references"},
+        }
+    )
+
+    assert reader._extract_fulltext_for_item(1) == (
+        "final indexing body",
+        "betterissa-indexing",
+    )
+
+    indexing.write_text("final indexing body\n\nVision description")
+    assert reader._extract_fulltext_for_item(1) == (
+        "final indexing body\n\nVision description",
         "betterissa-indexing",
     )
 

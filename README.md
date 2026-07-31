@@ -218,6 +218,15 @@ zotero-mcp update-db --force-rebuild
 zotero-mcp db-status
 ```
 
+With `--fulltext`, each update selects the best attachment currently
+available for semantic retrieval. BetterIssa sources are preferred in this
+order: `BetterIssa indexing text`, `BetterIssa semantic document`,
+`BetterIssa Advanced OCR Markdown`, then `BetterIssa Reading View`. The
+original PDF and legacy text sources remain fallbacks. `BetterIssa references`
+is never embedded. A later artifact or an in-place BetterIssa upsert changes
+the attachment fingerprint, so the affected item advances to the better source
+on the next `update-db --fulltext` run without a force rebuild.
+
 **Example Semantic Queries in your AI assistant:**
 - *"Find research similar to machine learning concepts in neuroscience"*
 - *"Papers that discuss climate change impacts on agriculture"*

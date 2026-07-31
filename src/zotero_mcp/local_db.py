@@ -28,6 +28,24 @@ _EXTRACTION_TIMEOUT = "__EXTRACTION_TIMEOUT__"
 # signatures for items whose attachments use that precedence policy.
 _ATTACHMENT_SELECTION_VERSION = 2
 
+_BETTERISSA_INDEXING_TITLE = "betterissa indexing text"
+_BETTERISSA_SEMANTIC_TITLE = "betterissa semantic document"
+_BETTERISSA_OCR_TITLE = "betterissa advanced ocr markdown"
+_BETTERISSA_READING_VIEW_TITLE = "betterissa reading view"
+_BETTERISSA_REFERENCES_TITLE = "betterissa references"
+_BETTERISSA_ARTIFACT_TITLES = frozenset(
+    {
+        _BETTERISSA_INDEXING_TITLE,
+        _BETTERISSA_SEMANTIC_TITLE,
+        _BETTERISSA_OCR_TITLE,
+        _BETTERISSA_READING_VIEW_TITLE,
+        _BETTERISSA_REFERENCES_TITLE,
+    }
+)
+_BETTERISSA_SELECTABLE_TITLES = (
+    _BETTERISSA_ARTIFACT_TITLES - {_BETTERISSA_REFERENCES_TITLE}
+)
+
 
 def _extract_pdf_worker(file_path: str, maxpages: int, result_queue):
     """Legacy worker — kept for backward compatibility but no longer used.
@@ -357,10 +375,15 @@ class LocalZoteroReader:
         }
 
     @staticmethod
+    def _normalize_attachment_title(title: str) -> str:
+        return re.sub(r"\s+", " ", (title or "").casefold()).strip()
+
+    @staticmethod
     def _uses_named_attachment_precedence(
         title: str, path: str, content_type: str | None
     ) -> bool:
         """Return whether attachment selection policy can affect this item."""
+        normalized_title = LocalZoteroReader._normalize_attachment_title(title)
         filename = path.rsplit("/", 1)[-1]
         words = re.sub(
             r"[^a-z0-9]+", " ", f"{title} {filename}".casefold()
@@ -378,7 +401,8 @@ class LocalZoteroReader:
         )
         is_betterissa = "betterissa" in words
         return (
-            (
+            normalized_title in _BETTERISSA_SELECTABLE_TITLES
+            or (
                 is_betterissa
                 and (
                     "indexing" in words
@@ -684,6 +708,19 @@ class LocalZoteroReader:
                         parts.append(text.strip())
         return "\n\n".join(parts)
 
+    def _extract_betterissa_ocr_markdown(self, file_path: Path) -> str:
+        """Read the durable OCR checkpoint without page-marker comments."""
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        return re.sub(
+            r"\s*<!--\s*BetterIssa\s+page\s+\d+\s*-->\s*",
+            "\n\n",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+
     def _get_fulltext_meta_for_item(self, item_id: int):
         meta = []
         for key, path, ctype in self._iter_parent_attachments(item_id):
@@ -886,6 +923,9 @@ class LocalZoteroReader:
                 f"{candidate.title} {filename}".casefold(),
             ).strip()
 
+        def normalized_title(candidate: _AttachmentCandidate) -> str:
+            return self._normalize_attachment_title(candidate.title)
+
         def is_pdf(candidate: _AttachmentCandidate) -> bool:
             return (
                 (candidate.content_type or "").lower() == "application/pdf"
@@ -921,6 +961,8 @@ class LocalZoteroReader:
         def has_betterissa_auxiliary_marker(
             candidate: _AttachmentCandidate,
         ) -> bool:
+            if normalized_title(candidate) == _BETTERISSA_REFERENCES_TITLE:
+                return True
             words = set(label(candidate).split())
             return bool(
                 "betterissa" in words
@@ -948,14 +990,22 @@ class LocalZoteroReader:
                 and not is_json(candidate)
                 and not is_html(candidate)
                 and not has_betterissa_auxiliary_marker(candidate)
-                and has_words(candidate, "betterissa", "indexing")
+                and (
+                    normalized_title(candidate) == _BETTERISSA_INDEXING_TITLE
+                    or has_words(candidate, "betterissa", "indexing")
+                )
             )
 
         def is_betterissa_semantic(candidate: _AttachmentCandidate) -> bool:
             return (
                 is_json(candidate)
                 and not has_betterissa_auxiliary_marker(candidate)
-                and has_words(candidate, "betterissa", "semantic", "document")
+                and (
+                    normalized_title(candidate) == _BETTERISSA_SEMANTIC_TITLE
+                    or has_words(
+                        candidate, "betterissa", "semantic", "document"
+                    )
+                )
             )
 
         def is_betterissa_ocr(candidate: _AttachmentCandidate) -> bool:
@@ -964,14 +1014,21 @@ class LocalZoteroReader:
                 and not is_json(candidate)
                 and not is_html(candidate)
                 and not has_betterissa_auxiliary_marker(candidate)
-                and has_words(candidate, "betterissa", "advanced", "ocr")
+                and (
+                    normalized_title(candidate) == _BETTERISSA_OCR_TITLE
+                    or has_words(candidate, "betterissa", "advanced", "ocr")
+                )
             )
 
         def is_betterissa_reading_view(candidate: _AttachmentCandidate) -> bool:
             return (
                 is_html(candidate)
                 and not has_betterissa_auxiliary_marker(candidate)
-                and has_words(candidate, "betterissa", "reading", "view")
+                and (
+                    normalized_title(candidate)
+                    == _BETTERISSA_READING_VIEW_TITLE
+                    or has_words(candidate, "betterissa", "reading", "view")
+                )
             )
 
         def is_betterissa_auxiliary(candidate: _AttachmentCandidate) -> bool:
@@ -1117,6 +1174,10 @@ class LocalZoteroReader:
                     if not resolved or not resolved.exists():
                         continue
                     text = self._extract_betterissa_semantic_document(resolved)
+                elif source == "betterissa-ocr":
+                    if not resolved or not resolved.exists():
+                        continue
+                    text = self._extract_betterissa_ocr_markdown(resolved)
                 elif is_pdf(candidate):
                     cached = self._read_zotero_ft_cache(candidate.key)
                     if cached:
