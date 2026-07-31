@@ -1407,8 +1407,11 @@ class ZoteroSemanticSearch:
         except Exception as e:
             self._last_scan_indexable_keys = None
             logger.error(f"Error reading from local database: {e}")
-            logger.info("Falling back to API...")
-            return self._get_items_from_api(limit)
+            raise RuntimeError(
+                "Local full-text extraction failed; the semantic index was not "
+                "updated with metadata-only API records. Fix the local Zotero "
+                "database/filesystem error and retry."
+            ) from e
 
     def _merge_local_fulltext_with_api_metadata(
         self,

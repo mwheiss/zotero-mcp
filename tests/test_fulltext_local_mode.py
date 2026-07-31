@@ -76,6 +76,25 @@ def test_get_items_from_source_rejects_non_boolean_mode(monkeypatch):
         search._get_items_from_source(fulltext="local")
 
 
+def test_local_fulltext_read_failure_does_not_fall_back_to_api(monkeypatch):
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(
+        semantic_search,
+        "LocalZoteroReader",
+        lambda **kwargs: (_ for _ in ()).throw(OSError("locked")),
+    )
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
+    api_calls = []
+    monkeypatch.setattr(search, "_get_items_from_api", lambda *args: api_calls.append(args) or [])
+
+    with pytest.raises(RuntimeError, match="metadata-only API records"):
+        search._get_items_from_local_db(extract_fulltext=True)
+
+    # The first call loads canonical metadata before opening SQLite. A fallback
+    # would make a second API call from the outer exception handler.
+    assert api_calls == [()]
+
+
 def test_local_fulltext_overlays_complete_api_metadata(monkeypatch):
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
     search = semantic_search.ZoteroSemanticSearch(
