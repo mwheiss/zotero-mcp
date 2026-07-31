@@ -918,6 +918,24 @@ class LocalZoteroReader:
             candidate_words = set(label(candidate).split())
             return all(word in candidate_words for word in words)
 
+        def has_betterissa_auxiliary_marker(
+            candidate: _AttachmentCandidate,
+        ) -> bool:
+            words = set(label(candidate).split())
+            return bool(
+                "betterissa" in words
+                and (
+                    words
+                    & {
+                        "state",
+                        "summary",
+                        "references",
+                        "sections",
+                    }
+                    or {"extraction", "metadata"} <= words
+                )
+            )
+
         def is_fulltext(candidate: _AttachmentCandidate) -> bool:
             words = label(candidate).split()
             return "fulltext" in words or (
@@ -929,12 +947,14 @@ class LocalZoteroReader:
                 not is_pdf(candidate)
                 and not is_json(candidate)
                 and not is_html(candidate)
+                and not has_betterissa_auxiliary_marker(candidate)
                 and has_words(candidate, "betterissa", "indexing")
             )
 
         def is_betterissa_semantic(candidate: _AttachmentCandidate) -> bool:
             return (
                 is_json(candidate)
+                and not has_betterissa_auxiliary_marker(candidate)
                 and has_words(candidate, "betterissa", "semantic", "document")
             )
 
@@ -943,17 +963,29 @@ class LocalZoteroReader:
                 not is_pdf(candidate)
                 and not is_json(candidate)
                 and not is_html(candidate)
+                and not has_betterissa_auxiliary_marker(candidate)
                 and has_words(candidate, "betterissa", "advanced", "ocr")
             )
 
         def is_betterissa_reading_view(candidate: _AttachmentCandidate) -> bool:
             return (
                 is_html(candidate)
+                and not has_betterissa_auxiliary_marker(candidate)
                 and has_words(candidate, "betterissa", "reading", "view")
             )
 
         def is_betterissa_auxiliary(candidate: _AttachmentCandidate) -> bool:
-            return has_words(candidate, "betterissa", "references")
+            words = set(label(candidate).split())
+            if "betterissa" not in words:
+                return False
+            if has_betterissa_auxiliary_marker(candidate):
+                return True
+            return not (
+                is_betterissa_indexing(candidate)
+                or is_betterissa_semantic(candidate)
+                or is_betterissa_ocr(candidate)
+                or is_betterissa_reading_view(candidate)
+            )
 
         def recency(candidate: _AttachmentCandidate):
             return (
@@ -1004,7 +1036,8 @@ class LocalZoteroReader:
                 [
                     candidate
                     for candidate in candidates
-                    if is_xml(candidate)
+                    if not has_betterissa_auxiliary_marker(candidate)
+                    and is_xml(candidate)
                     and (
                         is_named(candidate, "grobid")
                         or is_named(candidate, "tei")
@@ -1016,7 +1049,8 @@ class LocalZoteroReader:
                 [
                     candidate
                     for candidate in candidates
-                    if not is_pdf(candidate)
+                    if not has_betterissa_auxiliary_marker(candidate)
+                    and not is_pdf(candidate)
                     and not is_xml(candidate)
                     and is_fulltext(candidate)
                 ],
@@ -1026,7 +1060,9 @@ class LocalZoteroReader:
                 [
                     candidate
                     for candidate in candidates
-                    if is_pdf(candidate) and is_named(candidate, "ocr")
+                    if not has_betterissa_auxiliary_marker(candidate)
+                    and is_pdf(candidate)
+                    and is_named(candidate, "ocr")
                 ],
             ),
             (
@@ -1034,10 +1070,20 @@ class LocalZoteroReader:
                 [
                     candidate
                     for candidate in candidates
-                    if is_pdf(candidate) and is_fulltext(candidate)
+                    if not has_betterissa_auxiliary_marker(candidate)
+                    and is_pdf(candidate)
+                    and is_fulltext(candidate)
                 ],
             ),
-            ("pdf", [candidate for candidate in candidates if is_pdf(candidate)]),
+            (
+                "pdf",
+                [
+                    candidate
+                    for candidate in candidates
+                    if not has_betterissa_auxiliary_marker(candidate)
+                    and is_pdf(candidate)
+                ],
+            ),
             (
                 "file",
                 [

@@ -271,6 +271,52 @@ def test_betterissa_references_are_not_treated_as_fulltext(tmp_path):
     assert reader._extract_fulltext_for_item(1) is None
 
 
+def test_betterissa_workflow_artifacts_never_reach_generic_fallback(tmp_path):
+    state = tmp_path / "BetterIssa-state.json"
+    state.write_text('{"workflow": "must not be embedded"}')
+    summary = tmp_path / "BetterIssa-summary.md"
+    summary.write_text("processing summary must not be embedded")
+    pdf = tmp_path / "opaque-source.bin"
+    pdf.write_text("paper body from PDF")
+
+    auxiliary_only = _Reader(
+        [
+            _attachment("state", state.name, "application/json"),
+            _attachment("summary", summary.name, "text/markdown"),
+        ],
+        {"state": state, "summary": summary},
+        {
+            "state": {"title": "BetterIssa state"},
+            "summary": {"title": "BetterIssa summary"},
+        },
+    )
+    assert auxiliary_only._extract_fulltext_for_item(1) is None
+
+    reader = _Reader(
+        [
+            _attachment("state", state.name, "application/json"),
+            _attachment("summary", summary.name, "text/markdown"),
+            _attachment("pdf", pdf.name, "application/pdf"),
+        ],
+        {
+            "state": state,
+            "summary": summary,
+            "pdf": pdf,
+        },
+        {
+            "state": {"title": "BetterIssa state"},
+            "summary": {"title": "BetterIssa summary"},
+            "pdf": {"title": "Original source"},
+        },
+        caches={"pdf": "Zotero PDF cache"},
+    )
+
+    assert reader._extract_fulltext_for_item(1) == (
+        "Zotero PDF cache",
+        "zotero-cache",
+    )
+
+
 @pytest.mark.parametrize(
     ("included_keys", "expected_text", "expected_source"),
     [
