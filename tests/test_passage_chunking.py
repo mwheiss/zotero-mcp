@@ -188,6 +188,88 @@ def test_chunking_emits_multiple_passage_ids(monkeypatch):
     assert meta0["index_layout_signature"] == "chunks-v1:120:20:10"
 
 
+def test_fallback_fulltext_gets_separate_metadata_and_body_passages(monkeypatch):
+    s = _chunking_search(monkeypatch)
+    item = _long_item("FALLBACK")
+    item["data"].update(
+        {
+            "fulltextSource": "api:attachment:PDF1",
+            "publicationTitle": "Ignored Journal",
+            "tags": [{"tag": "ignored-tag"}],
+            "note": "ignored note",
+        }
+    )
+
+    prepared = s._prepare_item_batch([item])
+
+    assert prepared.documents[0] == "Mindfulness Paper\n\nAn abstract."
+    assert prepared.metadatas[0]["passage_kind"] == "metadata"
+    assert all(
+        meta["passage_kind"] == "body"
+        for meta in prepared.metadatas[1:]
+    )
+    assert "Mindfulness reduces relapse" in prepared.documents[1]
+    combined = "\n".join(prepared.documents)
+    assert "Ignored Journal" not in combined
+    assert "ignored-tag" not in combined
+    assert "ignored note" not in combined
+
+
+def test_betterissa_indexing_text_is_not_prefixed_or_duplicated(monkeypatch):
+    s = _chunking_search(monkeypatch)
+    item = _long_item("BETTERISSA")
+    item["data"].update(
+        {
+            "title": "Duplicate Zotero Title",
+            "abstractNote": "Duplicate Zotero abstract.",
+            "fulltext": (
+                "Canonical BetterIssa Title\n\n"
+                "Canonical abstract.\n\n"
+                + "Filtered body passage. " * 30
+            ),
+            "fulltextSource": "betterissa-indexing",
+        }
+    )
+
+    prepared = s._prepare_item_batch([item])
+
+    assert all(
+        meta["passage_kind"] == "body"
+        for meta in prepared.metadatas
+    )
+    combined = "\n".join(prepared.documents)
+    assert "Canonical BetterIssa Title" in combined
+    assert "Duplicate Zotero Title" not in combined
+    assert "Duplicate Zotero abstract" not in combined
+
+
+def test_no_fulltext_indexes_only_title_and_abstract(monkeypatch):
+    s = _chunking_search(monkeypatch)
+    item = _long_item("METADATA")
+    item["data"].update(
+        {
+            "fulltext": "",
+            "creators": [
+                {
+                    "firstName": "Ada",
+                    "lastName": "Author",
+                    "creatorType": "author",
+                }
+            ],
+            "tags": [{"tag": "ignored-tag"}],
+            "note": "ignored note",
+        }
+    )
+
+    prepared = s._prepare_item_batch([item])
+
+    assert prepared.documents == ["Mindfulness Paper\n\nAn abstract."]
+    assert prepared.metadatas[0]["passage_kind"] == "metadata"
+    assert prepared.metadatas[0]["index_content_signature"] == (
+        "lean-paper-content-v1"
+    )
+
+
 def test_chunking_added_vs_updated_is_item_granular(monkeypatch):
     # Pretend the item already exists (its chunk #0 is present).
     s = _chunking_search(monkeypatch, existing={"ITEM0001#0"})
@@ -307,6 +389,23 @@ def test_enrich_rejects_overlapping_support_passages(monkeypatch):
 
     assert enriched["supporting_chunk_count"] == 1
     assert [p["chunk_index"] for p in enriched["matched_passages"]] == [0, 4]
+
+
+def test_metadata_and_body_passages_do_not_overlap_by_offset():
+    metadata = {
+        "passage": "Title and abstract",
+        "passage_start": 0,
+        "passage_end": 18,
+        "meta": {"passage_kind": "metadata"},
+    }
+    body = {
+        "passage": "Body opening text",
+        "passage_start": 0,
+        "passage_end": 17,
+        "meta": {"passage_kind": "body"},
+    }
+
+    assert semantic_search._passages_overlap(metadata, body) is False
 
 
 def test_search_adaptively_fetches_until_it_has_distinct_papers(monkeypatch):

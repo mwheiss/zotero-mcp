@@ -101,12 +101,11 @@ class TestAnnotationDocumentText:
 
 
 # ---------------------------------------------------------------------------
-# Non-annotation items still use the standard template
+# Non-annotation items use the lean metadata passage
 # ---------------------------------------------------------------------------
 
 
-def test_journal_article_unchanged(search):
-    """Other item types must keep using title + creators + abstract."""
+def test_journal_article_uses_only_title_and_abstract(search):
     item = {
         "key": "JART0001",
         "data": {
@@ -114,10 +113,15 @@ def test_journal_article_unchanged(search):
             "title": "Some Paper",
             "abstractNote": "We show that …",
             "creators": [{"firstName": "A", "lastName": "Author", "creatorType": "author"}],
-            "tags": [],
+            "publicationTitle": "Journal of Noise",
+            "tags": [{"tag": "workflow-tag"}],
+            "note": "<p>private processing note</p>",
         },
     }
     out = search._create_document_text(item)
     assert "Some Paper" in out
-    assert "Author" in out
     assert "We show that" in out
+    assert "Author" not in out
+    assert "Journal of Noise" not in out
+    assert "workflow-tag" not in out
+    assert "private processing note" not in out

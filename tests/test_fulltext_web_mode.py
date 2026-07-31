@@ -263,6 +263,23 @@ def test_get_items_from_api_with_fulltext_marks_misses_as_attempted(monkeypatch)
     assert items[0]["data"]["fulltext_attempted"] is True
 
 
+def test_get_items_from_api_excludes_all_child_artifact_types(monkeypatch):
+    zot = FakeZoteroClient()
+    zot.load_scenario(
+        [
+            _paper("P1"),
+            _paper("ATT1", item_type="attachment"),
+            _paper("NOTE1", item_type="note"),
+            _paper("ANN1", item_type="annotation"),
+        ]
+    )
+    search = _build_search(monkeypatch, zot, FakeChromaClient())
+
+    items = search._get_items_from_api(include_fulltext=False)
+
+    assert [item["key"] for item in items] == ["P1"]
+
+
 # --------- Integration tests: incremental fetch ----------
 
 def test_get_changed_items_from_api_returns_only_changed_keys(monkeypatch):
@@ -518,6 +535,36 @@ def test_source_change_warns_without_rebuilding_unchanged_items(
     assert "will not rebuild unchanged items" in capsys.readouterr().err
     saved = json.loads(open(config_path).read())
     assert saved["semantic_search"]["indexed_fulltext_source"] == "api"
+
+
+def test_content_contract_change_warns_without_automatic_rebuild(
+    monkeypatch, tmp_path, capsys
+):
+    config_path = _write_config(
+        tmp_path,
+        extra={
+            "last_sync_version": 5,
+            "fulltext_source": "api",
+            "indexed_fulltext_source": "api",
+            "indexed_content_signature": "legacy-v1",
+        },
+    )
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("A")], library_version=5)
+    chroma = FakeChromaClient(preloaded_ids=["A"])
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    stats = search.update_database()
+
+    assert stats["processed_items"] == 0
+    assert chroma.reset_calls == 0
+    assert chroma.added == []
+    assert "will not re-embed unchanged items" in capsys.readouterr().err
+    saved = json.loads(open(config_path).read())
+    assert (
+        saved["semantic_search"]["indexed_content_signature"]
+        == "legacy-v1"
+    )
 
 
 def test_update_database_force_rebuild_triggers_reset_and_full_scan(monkeypatch, tmp_path):

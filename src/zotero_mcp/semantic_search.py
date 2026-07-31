@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 FulltextSource = Literal["api", "local", "none"]
 _FULLTEXT_SOURCES = {"api", "local", "none"}
+_CONTENT_CONTRACT_SIGNATURE = "lean-paper-content-v1"
+_SELF_CONTAINED_FULLTEXT_SOURCES = {"betterissa-indexing"}
 
 
 @dataclass
@@ -495,6 +497,11 @@ def best_snippet(query: str, text: str, width: int = 320) -> tuple[str, int]:
 
 def _passages_overlap(candidate: dict[str, Any], selected: dict[str, Any]) -> bool:
     """Return True when two matched snippets repeat substantially."""
+    candidate_kind = candidate["meta"].get("passage_kind")
+    selected_kind = selected["meta"].get("passage_kind")
+    if candidate_kind and selected_kind and candidate_kind != selected_kind:
+        return False
+
     candidate_text = " ".join(candidate["passage"].lower().split())
     selected_text = " ".join(selected["passage"].lower().split())
     if candidate_text and candidate_text == selected_text:
@@ -517,7 +524,14 @@ def _passage_result(candidate: dict[str, Any]) -> dict[str, Any]:
         "similarity_score": candidate["similarity"],
     }
     meta = candidate["meta"]
-    for key in ("chunk_index", "n_chunks", "char_start", "char_end", "page"):
+    for key in (
+        "chunk_index",
+        "n_chunks",
+        "passage_kind",
+        "char_start",
+        "char_end",
+        "page",
+    ):
         if key in meta:
             result[key] = meta[key]
     if "char_start" not in result and candidate["passage_offset"]:
@@ -760,10 +774,27 @@ class ZoteroSemanticSearch:
             logger.warning(f"Error loading indexed_fulltext_source: {e}")
             return None
 
+    def _load_indexed_content_signature(self) -> str | None:
+        """Return the embedding-content contract used by the complete index."""
+        if not self.config_path or not os.path.exists(self.config_path):
+            return None
+        try:
+            with open(self.config_path) as f:
+                value = (
+                    json.load(f)
+                    .get("semantic_search", {})
+                    .get("indexed_content_signature")
+                )
+            return value if isinstance(value, str) and value else None
+        except Exception as e:
+            logger.warning(f"Error loading indexed_content_signature: {e}")
+            return None
+
     def _save_update_config(
         self,
         last_sync_version: int | None = None,
         indexed_fulltext_source: FulltextSource | None = None,
+        indexed_content_signature: str | None = None,
     ) -> None:
         """Save update configuration and completed-corpus state."""
         if not self.config_path:
@@ -791,6 +822,10 @@ class ZoteroSemanticSearch:
         if indexed_fulltext_source is not None:
             full_config["semantic_search"]["indexed_fulltext_source"] = (
                 indexed_fulltext_source
+            )
+        if indexed_content_signature is not None:
+            full_config["semantic_search"]["indexed_content_signature"] = (
+                indexed_content_signature
             )
 
         try:
@@ -822,37 +857,17 @@ class ZoteroSemanticSearch:
         if item_type == "annotation":
             return self._create_annotation_document_text(data)
 
-        # Extract key fields for semantic search
+        # Keep similarity focused on the paper's subject matter. Bibliographic
+        # identifiers, creators, tags, notes, and workflow state remain
+        # available as result metadata or through Zotero's exact search tools,
+        # but do not influence vector similarity.
         title = data.get("title", "")
         abstract = data.get("abstractNote", "")
-
-        # Format creators as text
-        creators = data.get("creators", [])
-        creators_text = format_creators(creators)
-
-        # Additional searchable content
-        extra_fields = []
-
-        # Publication details
-        if publication := data.get("publicationTitle"):
-            extra_fields.append(publication)
-
-        # Tags
-        if tags := data.get("tags"):
-            tag_text = " ".join([tag.get("tag", "") for tag in tags])
-            extra_fields.append(tag_text)
-
-        # Note content (if available)
-        if note := data.get("note"):
-            # Clean HTML from notes
-            import re
-
-            note_text = re.sub(r"<[^>]+>", "", note)
-            extra_fields.append(note_text)
-
-        # Combine all text fields
-        text_parts = [title, creators_text, abstract] + extra_fields
-        return " ".join(filter(None, text_parts))
+        return "\n\n".join(
+            part.strip()
+            for part in (title, abstract)
+            if part and part.strip()
+        )
 
     def _create_annotation_document_text(self, data: dict[str, Any]) -> str:
         """Build the embedding text for an annotation item.
@@ -1571,9 +1586,12 @@ class ZoteroSemanticSearch:
             if not items:
                 break
 
-            # Filter out attachments and notes by default
+            # Child artifacts are represented only through their parent item.
             filtered_items = [
-                item for item in items if item.get("data", {}).get("itemType") not in ["attachment", "note"]
+                item
+                for item in items
+                if item.get("data", {}).get("itemType")
+                not in {"attachment", "note", "annotation"}
             ]
 
             all_items.extend(filtered_items)
@@ -1754,38 +1772,21 @@ class ZoteroSemanticSearch:
 
     def _prepare_index_records(self, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
         """Prepare ChromaDB records without embedding or writing them."""
-        stats = {"processed": 0, "skipped": 0, "errors": 0}
-        records: list[dict[str, Any]] = []
-
-        for item in items:
-            try:
-                item_key = item.get("key", "")
-                if not item_key:
-                    stats["skipped"] += 1
-                    continue
-
-                fulltext = item.get("data", {}).get("fulltext", "")
-                structured_text = self._create_document_text(item)
-                if fulltext.strip():
-                    doc_text = (structured_text + "\n\n" + fulltext) if structured_text.strip() else fulltext
-                else:
-                    doc_text = structured_text
-                metadata = self._create_metadata(item)
-                metadata["index_layout_signature"] = self._index_layout_signature
-                metadata["index_fulltext_source"] = self._active_fulltext_source
-
-                if not doc_text.strip():
-                    stats["skipped"] += 1
-                    continue
-
-                doc_text = self.chroma_client.truncate_text(doc_text)
-                records.append({"id": item_key, "document": doc_text, "metadata": metadata})
-                stats["processed"] += 1
-
-            except Exception as e:
-                logger.error(f"Error processing item {item.get('key', 'unknown')}: {e}")
-                stats["errors"] += 1
-
+        prepared = self._prepare_item_batch(items)
+        records = [
+            {"id": doc_id, "document": document, "metadata": metadata}
+            for doc_id, document, metadata in zip(
+                prepared.ids,
+                prepared.documents,
+                prepared.metadatas,
+                strict=True,
+            )
+        ]
+        stats = {
+            "processed": prepared.stats["processed"],
+            "skipped": prepared.stats["skipped"],
+            "errors": prepared.stats["errors"],
+        }
         return records, stats
 
     def _submit_openai_batch_index(
@@ -1817,6 +1818,7 @@ class ZoteroSemanticSearch:
             force_full_rebuild=force_full_rebuild,
             target_sync_version=target_sync_version,
             fulltext_source=self._active_fulltext_source,
+            content_signature=_CONTENT_CONTRACT_SIGNATURE,
         )
         stats["batch_submitted"] = True
         stats["batch_run_id"] = manifest["run_id"]
@@ -1911,6 +1913,7 @@ class ZoteroSemanticSearch:
             self._active_fulltext_source = fulltext_source
             stats["fulltext_source"] = fulltext_source
             indexed_fulltext_source = self._load_indexed_fulltext_source()
+            indexed_content_signature = self._load_indexed_content_signature()
             try:
                 collection_has_items = (
                     int(self.chroma_client.get_collection_info().get("count", 0)) > 0
@@ -1929,6 +1932,20 @@ class ZoteroSemanticSearch:
                     f"from the existing index source ({previous}). This incremental "
                     "run will not rebuild unchanged items; the index may contain "
                     "mixed sources until an explicitly confirmed force rebuild.\n"
+                )
+            content_mismatch = (
+                not force_full_rebuild
+                and collection_has_items
+                and indexed_content_signature != _CONTENT_CONTRACT_SIGNATURE
+            )
+            if content_mismatch:
+                previous = indexed_content_signature or "legacy/unknown"
+                sys.stderr.write(
+                    f"WARNING: the existing index uses semantic content contract "
+                    f"{previous}; the current contract is "
+                    f"{_CONTENT_CONTRACT_SIGNATURE}. This incremental run will "
+                    "not re-embed unchanged items. Use an explicitly confirmed "
+                    "force rebuild to migrate the complete index.\n"
                 )
             use_openai_batch = self._resolve_openai_batch_enabled(use_openai_batch)
             if embedding_concurrency < 1:
@@ -2015,6 +2032,11 @@ class ZoteroSemanticSearch:
                     last_sync_version=target_sync_version,
                     indexed_fulltext_source=(
                         None if source_mismatch else fulltext_source
+                    ),
+                    indexed_content_signature=(
+                        None
+                        if content_mismatch
+                        else _CONTENT_CONTRACT_SIGNATURE
                     ),
                 )
                 end_time = datetime.now()
@@ -2436,9 +2458,22 @@ class ZoteroSemanticSearch:
                 )
                 else None
             )
+            completed_content_signature = (
+                _CONTENT_CONTRACT_SIGNATURE
+                if stats["errors"] == 0
+                and limit is None
+                and completed_sync_version is not None
+                and (
+                    force_full_rebuild
+                    or not collection_has_items
+                    or not content_mismatch
+                )
+                else None
+            )
             self._save_update_config(
                 last_sync_version=completed_sync_version,
                 indexed_fulltext_source=completed_source,
+                indexed_content_signature=completed_content_signature,
             )
 
             end_time = datetime.now()
@@ -2487,45 +2522,98 @@ class ZoteroSemanticSearch:
                     stats["skipped"] += 1
                     continue
 
-                # Create document text and metadata
-                # Always include structured fields; append fulltext when available
-                fulltext = item.get("data", {}).get("fulltext", "")
-                structured_text = self._create_document_text(item)
-                if fulltext.strip():
-                    doc_text = (structured_text + "\n\n" + fulltext) if structured_text.strip() else fulltext
-                else:
-                    doc_text = structured_text
+                data = item.get("data", {})
+                fulltext = (data.get("fulltext") or "").strip()
+                metadata_text = self._create_document_text(item).strip()
+                fulltext_source = data.get("fulltextSource", "")
+                self_contained = (
+                    fulltext_source in _SELF_CONTAINED_FULLTEXT_SOURCES
+                )
                 metadata = self._create_metadata(item)
                 metadata["index_layout_signature"] = self._index_layout_signature
                 metadata["index_fulltext_source"] = self._active_fulltext_source
-
-                if not doc_text.strip():
-                    stats["skipped"] += 1
-                    continue
+                metadata["index_content_signature"] = (
+                    _CONTENT_CONTRACT_SIGNATURE
+                )
 
                 if chunking:
-                    # Index one vector per overlapping passage so search can
-                    # return a grounded quote and long PDFs stay searchable
-                    # past the single-vector truncation limit.
-                    passages = split_into_passages(doc_text, chunk_size, overlap, max_chunks)
+                    passages: list[tuple[str, int, int, str, str]] = []
+                    if metadata_text and not self_contained:
+                        passages.append(
+                            (
+                                metadata_text,
+                                0,
+                                len(metadata_text),
+                                "metadata",
+                                metadata_text,
+                            )
+                        )
+                    if fulltext:
+                        passages.extend(
+                            (
+                                text,
+                                start,
+                                end,
+                                "body",
+                                fulltext,
+                            )
+                            for text, start, end in split_into_passages(
+                                fulltext,
+                                chunk_size,
+                                overlap,
+                                max_chunks,
+                            )
+                        )
+                    elif metadata_text and not passages:
+                        passages.append(
+                            (
+                                metadata_text,
+                                0,
+                                len(metadata_text),
+                                "metadata",
+                                metadata_text,
+                            )
+                        )
                     if not passages:
                         stats["skipped"] += 1
                         continue
                     n_chunks = len(passages)
-                    for ci, (chunk_text, c0, c1) in enumerate(passages):
+                    for ci, (
+                        chunk_text,
+                        c0,
+                        c1,
+                        passage_kind,
+                        source_text,
+                    ) in enumerate(passages):
                         cmeta = dict(metadata)
                         cmeta["parent_item_key"] = item_key
                         cmeta["chunk_index"] = ci
                         cmeta["n_chunks"] = n_chunks
+                        cmeta["passage_kind"] = passage_kind
                         cmeta["char_start"] = c0
                         cmeta["char_end"] = c1
-                        page = _page_for_offset(doc_text, c0)
+                        page = (
+                            _page_for_offset(source_text, c0)
+                            if passage_kind == "body"
+                            else None
+                        )
                         if page is not None:
                             cmeta["page"] = page
                         documents.append(self.chroma_client.truncate_text(chunk_text))
                         metadatas.append(cmeta)
                         ids.append(f"{item_key}#{ci}")
                 else:
+                    if fulltext:
+                        doc_text = (
+                            fulltext
+                            if self_contained or not metadata_text
+                            else f"{metadata_text}\n\n{fulltext}"
+                        )
+                    else:
+                        doc_text = metadata_text
+                    if not doc_text:
+                        stats["skipped"] += 1
+                        continue
                     # Truncate to fit the configured embedding model's token limit
                     documents.append(self.chroma_client.truncate_text(doc_text))
                     metadatas.append(metadata)
@@ -2807,6 +2895,9 @@ class ZoteroSemanticSearch:
                 self._save_update_config(
                     last_sync_version=manifest.get("target_sync_version"),
                     indexed_fulltext_source=manifest.get("fulltext_source"),
+                    indexed_content_signature=manifest.get(
+                        "content_signature"
+                    ),
                 )
             return stats
         finally:

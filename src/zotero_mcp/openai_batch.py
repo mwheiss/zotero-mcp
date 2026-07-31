@@ -193,6 +193,7 @@ def submit_embedding_batches(
     force_full_rebuild: bool = False,
     target_sync_version: int | None = None,
     fulltext_source: str | None = None,
+    content_signature: str | None = None,
     client: Any | None = None,
 ) -> dict[str, Any]:
     """Upload JSONL files and create one or more OpenAI embedding batches."""
@@ -216,6 +217,7 @@ def submit_embedding_batches(
         "force_full_rebuild": bool(force_full_rebuild),
         "target_sync_version": target_sync_version,
         "fulltext_source": fulltext_source,
+        "content_signature": content_signature,
         "manifest_path": str(run_dir / "manifest.json"),
         "batches": [],
     }
