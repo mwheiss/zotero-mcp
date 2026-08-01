@@ -1,6 +1,5 @@
 """Regression tests for non-destructive embedding-model mismatches."""
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +10,9 @@ from zotero_mcp import chroma_client
 class _FakePersistentClient:
     def __init__(self, *, conflict=False, metadata=None):
         self.conflict = conflict
-        self.collection = SimpleNamespace(metadata=metadata or {})
+        if metadata is None:
+            metadata = {"hnsw:space": "cosine"}
+        self.collection = SimpleNamespace(metadata=metadata)
         self.deleted = []
         self._sysdb = SimpleNamespace(get_collections=lambda **kwargs: [])
 
@@ -152,37 +153,22 @@ def test_collection_id_read_errors_are_not_treated_as_empty():
         client.get_all_ids()
 
 
-@pytest.mark.parametrize(
-    ("metric", "distance", "expected"),
-    [
-        ("l2", 0.4, 0.8),
-        ("cosine", 0.4, 0.6),
-        ("ip", 0.4, 0.6),
-    ],
-)
-def test_distance_conversion_respects_collection_metric(
-    metric,
-    distance,
-    expected,
-):
+def test_distance_conversion_uses_cosine_distance():
     client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
-    client.collection = SimpleNamespace(metadata={"hnsw:space": metric})
 
-    assert client.distance_to_similarity(distance) == pytest.approx(expected)
+    assert client.distance_to_similarity(0.4) == pytest.approx(0.6)
 
 
-def test_metric_detection_uses_raw_config_without_loading_embedding_function():
-    class Collection:
-        metadata = {}
-        _model = SimpleNamespace(
-            configuration_json=json.dumps({"hnsw": {"space": "cosine"}})
-        )
+def test_non_cosine_collection_requires_confirmed_rebuild(monkeypatch):
+    fake = _FakePersistentClient(metadata={"hnsw:space": "l2"})
 
-        @property
-        def configuration(self):
-            raise AssertionError("must not reconstruct the embedding function")
+    with pytest.raises(RuntimeError, match="not marked as a cosine collection"):
+        _build_client(monkeypatch, fake)
 
-    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
-    client.collection = Collection()
 
-    assert client.distance_metric == "cosine"
+def test_confirmed_rebuild_can_replace_non_cosine_collection(monkeypatch):
+    fake = _FakePersistentClient(metadata={"hnsw:space": "l2"})
+
+    client = _build_client(monkeypatch, fake, allow_embedding_mismatch=True)
+
+    assert client._pending_embedding_mismatch is True

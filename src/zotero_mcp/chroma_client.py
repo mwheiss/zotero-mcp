@@ -548,6 +548,8 @@ class ChromaClient:
                     allow_embedding_mismatch,
                 )
 
+            self._require_cosine_collection(allow_embedding_mismatch)
+
     def _configured_embedding_identity(self) -> str:
         """Stable user-visible identity for vectors behind a provider alias."""
         explicit = str(self.embedding_config.get("model_identity") or "").strip()
@@ -596,6 +598,23 @@ class ChromaClient:
             name=self.collection_name,
             embedding_function=_NoEmbeddingFunction(),
         )
+
+    def _require_cosine_collection(self, allow_rebuild: bool) -> None:
+        """Reject indexes whose distances do not match search scoring."""
+        metadata = getattr(self.collection, "metadata", {}) or {}
+        metric = str(metadata.get("hnsw:space") or "").lower()
+        if metric == "cosine":
+            return
+
+        message = (
+            "Semantic index is not marked as a cosine collection. The existing "
+            "index was left untouched. Run an explicitly confirmed force rebuild "
+            "to replace it."
+        )
+        if not allow_rebuild:
+            raise RuntimeError(message)
+        logger.warning("%s Proceeding because a confirmed rebuild was requested.", message)
+        self._pending_embedding_mismatch = True
 
     def _create_embedding_function(self) -> EmbeddingFunction:
         """Create the appropriate embedding function based on configuration."""
@@ -825,48 +844,9 @@ class ChromaClient:
             logger.error(f"Error performing semantic search: {e}")
             raise
 
-    @property
-    def distance_metric(self) -> str:
-        """Return the collection's configured vector distance metric."""
-        metadata = getattr(self.collection, "metadata", {}) or {}
-        if metric := metadata.get("hnsw:space"):
-            return str(metric).lower()
-        # Do not access Collection.configuration here. Chroma 1.5 reconstructs
-        # the persisted embedding function while loading that property; API
-        # keys are deliberately absent from persisted configs, so merely
-        # scoring a result can otherwise fail with "API key is required".
-        raw_configuration = getattr(
-            getattr(self.collection, "_model", None),
-            "configuration_json",
-            None,
-        )
-        if isinstance(raw_configuration, str):
-            try:
-                configuration = json.loads(raw_configuration)
-            except json.JSONDecodeError:
-                configuration = {}
-        elif isinstance(raw_configuration, dict):
-            configuration = raw_configuration
-        else:
-            configuration = {}
-        if isinstance(configuration, dict):
-            hnsw = configuration.get("hnsw") or {}
-            if isinstance(hnsw, dict) and hnsw.get("space"):
-                return str(hnsw["space"]).lower()
-        # Chroma's historical and current default is squared L2 distance.
-        return "l2"
-
     def distance_to_similarity(self, distance: float) -> float:
-        """Convert Chroma distance to a cosine-like similarity score."""
-        metric = self.distance_metric
-        if metric == "l2":
-            # For normalized embeddings, ||a-b||^2 = 2 - 2*cos(a,b).
-            similarity = 1.0 - float(distance) / 2.0
-        elif metric in {"cosine", "ip"}:
-            similarity = 1.0 - float(distance)
-        else:
-            logger.warning("Unknown Chroma distance metric %s; using 1-distance", metric)
-            similarity = 1.0 - float(distance)
+        """Convert the collection's cosine distance to similarity."""
+        similarity = 1.0 - float(distance)
         return max(-1.0, min(1.0, similarity))
 
     def delete_documents(self, ids: list[str]) -> None:
