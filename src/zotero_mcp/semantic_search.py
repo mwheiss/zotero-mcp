@@ -41,7 +41,7 @@ from .utils import format_creators, is_local_mode, suppress_stdout
 
 logger = logging.getLogger(__name__)
 
-_CONTENT_CONTRACT_SIGNATURE = "lean-paper-content-v1"
+_CONTENT_CONTRACT_SIGNATURE = "lean-paper-content-v2"
 _SELF_CONTAINED_FULLTEXT_SOURCES = {"betterissa-indexing"}
 DEFAULT_MAX_CHUNKS_PER_ITEM = 768
 
@@ -2907,7 +2907,24 @@ class ZoteroSemanticSearch:
             # distinct parent items or reaches a bounded ceiling.
             results = self.chroma_client.search(query_texts=[query], n_results=fetch_limit, where=filters)
             if self._chunking_enabled:
-                max_fetch = max(fetch_limit, limit * 20)
+                # A single book can legitimately own hundreds of highly ranked
+                # chunks. Keep widening to the collection boundary so those
+                # chunks cannot consume a fixed candidate ceiling and hide all
+                # other parents. Most searches still stop after the first or
+                # second small query once enough distinct items are present.
+                try:
+                    max_fetch = max(
+                        fetch_limit,
+                        self.chroma_client.count_documents(),
+                    )
+                except Exception:
+                    max_chunks = int(
+                        self._chunking_config.get(
+                            "max_chunks_per_item",
+                            DEFAULT_MAX_CHUNKS_PER_ITEM,
+                        )
+                    )
+                    max_fetch = max(fetch_limit, limit * max_chunks)
                 while fetch_limit < max_fetch:
                     result_ids = (results.get("ids") or [[]])[0]
                     distinct_items = {raw_id.split("#", 1)[0] for raw_id in result_ids}

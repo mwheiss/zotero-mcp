@@ -928,6 +928,7 @@ class ChromaClient:
                 "embedding_model": self.embedding_model,
                 "persist_directory": self.persist_directory
             }
+
         except Exception as e:
             logger.error(f"Error getting collection info: {e}")
             return {
@@ -937,6 +938,10 @@ class ChromaClient:
                 "persist_directory": self.persist_directory,
                 "error": str(e)
             }
+
+    def count_documents(self) -> int:
+        """Return the number of vector records in the collection."""
+        return int(self.collection.count())
 
     def reset_collection(self) -> None:
         """Reset (clear) the collection."""

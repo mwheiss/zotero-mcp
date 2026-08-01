@@ -281,7 +281,7 @@ def test_no_fulltext_indexes_only_title_and_abstract(monkeypatch):
     assert prepared.documents == ["Mindfulness Paper\n\nAn abstract."]
     assert prepared.metadatas[0]["passage_kind"] == "metadata"
     assert prepared.metadatas[0]["index_content_signature"] == (
-        "lean-paper-content-v1"
+        "lean-paper-content-v2"
     )
 
 
@@ -487,6 +487,52 @@ def test_search_adaptively_fetches_until_it_has_distinct_papers(monkeypatch):
     result = s.search("query", limit=3)
 
     assert s.chroma_client.fetches == [12, 24]
+    assert len(result["results"]) == 3
+
+
+def test_search_can_expand_past_old_fixed_ceiling_for_large_books(monkeypatch):
+    class BookHeavyChroma(ChunkingFakeChroma):
+        def __init__(self):
+            super().__init__()
+            self.fetches = []
+
+        def count_documents(self):
+            return 600
+
+        def search(self, query_texts, n_results, where=None):
+            self.fetches.append(n_results)
+            count = min(n_results, 600)
+            ids = [f"BOOK#{i}" for i in range(min(count, 300))]
+            if count > 300:
+                ids.extend(f"PAPER{i}#0" for i in range(count - 300))
+            return {
+                "ids": [ids],
+                "distances": [[0.1 + i / 10000 for i in range(len(ids))]],
+                "documents": [[f"passage {i}" for i in range(len(ids))]],
+                "metadatas": [[
+                    {"parent_item_key": raw.split("#")[0]}
+                    for raw in ids
+                ]],
+            }
+
+    monkeypatch.setattr(
+        semantic_search,
+        "get_zotero_client",
+        lambda: _ZotItemStub(),
+    )
+    search = semantic_search.ZoteroSemanticSearch(
+        chroma_client=BookHeavyChroma()
+    )
+    search._chunking_config = {
+        "enabled": True,
+        "chunk_size": 6000,
+        "overlap": 750,
+        "max_chunks_per_item": 768,
+    }
+
+    result = search.search("query", limit=3)
+
+    assert search.chroma_client.fetches == [12, 24, 48, 96, 192, 384]
     assert len(result["results"]) == 3
 
 
