@@ -831,11 +831,24 @@ class ChromaClient:
         metadata = getattr(self.collection, "metadata", {}) or {}
         if metric := metadata.get("hnsw:space"):
             return str(metric).lower()
-        configuration = getattr(self.collection, "configuration", {}) or {}
-        if not isinstance(configuration, dict) and hasattr(
-            configuration, "to_json"
-        ):
-            configuration = configuration.to_json()
+        # Do not access Collection.configuration here. Chroma 1.5 reconstructs
+        # the persisted embedding function while loading that property; API
+        # keys are deliberately absent from persisted configs, so merely
+        # scoring a result can otherwise fail with "API key is required".
+        raw_configuration = getattr(
+            getattr(self.collection, "_model", None),
+            "configuration_json",
+            None,
+        )
+        if isinstance(raw_configuration, str):
+            try:
+                configuration = json.loads(raw_configuration)
+            except json.JSONDecodeError:
+                configuration = {}
+        elif isinstance(raw_configuration, dict):
+            configuration = raw_configuration
+        else:
+            configuration = {}
         if isinstance(configuration, dict):
             hnsw = configuration.get("hnsw") or {}
             if isinstance(hnsw, dict) and hnsw.get("space"):

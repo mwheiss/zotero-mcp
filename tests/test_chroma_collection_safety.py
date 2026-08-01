@@ -1,5 +1,6 @@
 """Regression tests for non-destructive embedding-model mismatches."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -168,3 +169,20 @@ def test_distance_conversion_respects_collection_metric(
     client.collection = SimpleNamespace(metadata={"hnsw:space": metric})
 
     assert client.distance_to_similarity(distance) == pytest.approx(expected)
+
+
+def test_metric_detection_uses_raw_config_without_loading_embedding_function():
+    class Collection:
+        metadata = {}
+        _model = SimpleNamespace(
+            configuration_json=json.dumps({"hnsw": {"space": "cosine"}})
+        )
+
+        @property
+        def configuration(self):
+            raise AssertionError("must not reconstruct the embedding function")
+
+    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
+    client.collection = Collection()
+
+    assert client.distance_metric == "cosine"
