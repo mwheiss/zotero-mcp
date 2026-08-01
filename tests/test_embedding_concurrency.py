@@ -124,7 +124,10 @@ def test_default_update_path_writes_each_entry_immediately(
     assert chroma.upserted_batches == [["ITEM0000"], ["ITEM0001"]]
     assert chroma.max_active_embeddings == 0
     assert "embedding_concurrency" not in stats
-    assert "| ETA " in capsys.readouterr().err
+    progress = capsys.readouterr().err
+    assert "| ETA " in progress
+    assert "2/2 finished" in progress
+    assert "| Last: Item 1" in progress
 
 
 class _SkewedChroma(_ConcurrentChroma):

@@ -2106,8 +2106,8 @@ class ZoteroSemanticSearch:
                 try:
                     _write_progress_line(
                         sys.stderr,
-                        f"  [{pct:3d}%] {seen_items}/{total} "
-                        f"| ETA {eta} — {title or 'processing...'}",
+                        f"  [{pct:3d}%] {seen_items}/{total} finished "
+                        f"| ETA {eta} | Last: {title or 'untitled item'}",
                     )
                 except Exception:
                     pass
