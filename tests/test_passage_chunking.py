@@ -158,6 +158,24 @@ class ChunkingFakeChroma:
         return text
 
 
+class ReusingChunkingFakeChroma(ChunkingFakeChroma):
+    def __init__(self):
+        super().__init__()
+        self.records = {}
+        self.metadata_updates = []
+
+    def get_records(self, ids):
+        return {
+            doc_id: self.records[doc_id]
+            for doc_id in ids
+            if doc_id in self.records
+        }
+
+    def update_metadatas(self, ids, metadatas):
+        self.events.append("metadata")
+        self.metadata_updates.extend(zip(ids, metadatas, strict=True))
+
+
 def _chunking_search(monkeypatch, config=None, existing=None):
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
     s = semantic_search.ZoteroSemanticSearch(chroma_client=ChunkingFakeChroma(existing))
@@ -297,6 +315,96 @@ def test_chunking_added_vs_updated_is_item_granular(monkeypatch):
         doc_id.startswith("ITEM0001#")
         for doc_id in s.chroma_client.reconciled[0][1]
     )
+
+
+def test_unchanged_chunk_text_reuses_vectors_and_refreshes_metadata(monkeypatch):
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    client = ReusingChunkingFakeChroma()
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=client)
+    search._chunking_config = {
+        "enabled": True,
+        "chunk_size": 120,
+        "overlap": 20,
+        "max_chunks_per_item": 10,
+    }
+    item = _long_item("REUSE")
+    prepared = search._prepare_item_batch([item])
+    client._existing = set(prepared.ids)
+    client.records = {
+        doc_id: {"document": document, "metadata": {"date_modified": "old"}}
+        for doc_id, document in zip(
+            prepared.ids,
+            prepared.documents,
+            strict=True,
+        )
+    }
+
+    stats = search._process_item_batch([item])
+
+    assert client.upserted_ids == []
+    assert len(client.metadata_updates) == len(prepared.expected_ids)
+    assert stats["reused_embeddings"] == len(prepared.expected_ids)
+    assert stats["updated"] == 1
+    assert all(
+        metadata["embedding_content_sha256"]
+        for _doc_id, metadata in client.metadata_updates
+    )
+    assert client.reconciled == [("REUSE", set(prepared.expected_ids))]
+
+
+def test_only_changed_chunks_are_reembedded(monkeypatch):
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    client = ReusingChunkingFakeChroma()
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=client)
+    search._chunking_config = {
+        "enabled": True,
+        "chunk_size": 120,
+        "overlap": 20,
+        "max_chunks_per_item": 10,
+    }
+    item = _long_item("PARTIAL")
+    prepared = search._prepare_item_batch([item])
+    client._existing = set(prepared.ids)
+    client.records = {
+        doc_id: {"document": document, "metadata": {}}
+        for doc_id, document in zip(
+            prepared.ids,
+            prepared.documents,
+            strict=True,
+        )
+    }
+    changed_id = prepared.ids[1]
+    client.records[changed_id]["document"] = "previous chunk contents"
+
+    stats = search._process_item_batch([item])
+
+    assert client.upserted_ids == [changed_id]
+    assert len(client.metadata_updates) == len(prepared.expected_ids) - 1
+    assert stats["reused_embeddings"] == len(prepared.expected_ids) - 1
+    assert client.reconciled == [("PARTIAL", set(prepared.expected_ids))]
+
+
+def test_force_rebuild_never_reuses_stored_vectors(monkeypatch):
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    client = ReusingChunkingFakeChroma()
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=client)
+    item = _long_item("FORCE")
+    prepared = search._prepare_item_batch([item])
+    client.records = {
+        doc_id: {"document": document, "metadata": metadata}
+        for doc_id, document, metadata in zip(
+            prepared.ids,
+            prepared.documents,
+            prepared.metadatas,
+            strict=True,
+        )
+    }
+
+    stats = search._process_item_batch([item], force_rebuild=True)
+
+    assert client.upserted_ids == prepared.expected_ids
+    assert client.metadata_updates == []
+    assert stats["reused_embeddings"] == 0
 
 
 def test_chunk_layout_migrations_probe_and_reconcile_both_layouts(monkeypatch):

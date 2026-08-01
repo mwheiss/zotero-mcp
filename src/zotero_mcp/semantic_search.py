@@ -7,6 +7,7 @@ over research libraries.
 """
 
 import contextlib
+import hashlib
 import json
 import logging
 import math
@@ -53,6 +54,9 @@ class _PreparedIndexBatch:
     documents: list[str]
     metadatas: list[dict[str, Any]]
     ids: list[str]
+    expected_ids: list[str]
+    metadata_only_ids: list[str]
+    metadata_only_metadatas: list[dict[str, Any]]
     item_keys: list[str]
     stats: dict[str, int]
 
@@ -118,6 +122,11 @@ def _format_eta(seconds: float | None) -> str:
     if minutes:
         return f"{minutes}m {secs:02d}s"
     return f"{secs}s"
+
+
+def _embedding_content_hash(document: str) -> str:
+    """Fingerprint the exact text passed to the embedding provider."""
+    return hashlib.sha256(document.encode("utf-8")).hexdigest()
 
 
 def _display_width(text: str) -> int:
@@ -1687,9 +1696,22 @@ class ZoteroSemanticSearch:
                 self.chroma_client.delete_documents([key])
         return len(to_delete_keys)
 
-    def _prepare_index_records(self, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    def _prepare_index_records(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        force_rebuild: bool = False,
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[str, int],
+        _PreparedIndexBatch,
+    ]:
         """Prepare ChromaDB records without embedding or writing them."""
         prepared = self._prepare_item_batch(items)
+        prepared = self._partition_reusable_embeddings(
+            prepared,
+            force_rebuild=force_rebuild,
+        )
         records = [
             {"id": doc_id, "document": document, "metadata": metadata}
             for doc_id, document, metadata in zip(
@@ -1703,8 +1725,9 @@ class ZoteroSemanticSearch:
             "processed": prepared.stats["processed"],
             "skipped": prepared.stats["skipped"],
             "errors": prepared.stats["errors"],
+            "reused_embeddings": prepared.stats["reused_embeddings"],
         }
-        return records, stats
+        return records, stats, prepared
 
     def _submit_openai_batch_index(
         self,
@@ -1714,14 +1737,57 @@ class ZoteroSemanticSearch:
         stats: dict[str, Any],
     ) -> dict[str, Any]:
         """Prepare records and submit asynchronous OpenAI embedding batches."""
-        records, prepare_stats = self._prepare_index_records(items)
+        records, prepare_stats, prepared = self._prepare_index_records(
+            items,
+            force_rebuild=force_full_rebuild,
+        )
         stats["processed_items"] += prepare_stats["processed"]
         stats["skipped_items"] += prepare_stats["skipped"]
         stats["errors"] += prepare_stats["errors"]
+        stats["reused_embeddings"] = stats.get("reused_embeddings", 0) + (
+            prepare_stats["reused_embeddings"]
+        )
+
+        expected_ids_by_item: dict[str, list[str]] = {}
+        for doc_id in prepared.expected_ids:
+            parent = doc_id.split("#", 1)[0]
+            expected_ids_by_item.setdefault(parent, []).append(doc_id)
+        expected_ids_by_item = {
+            parent: sorted(ids)
+            for parent, ids in expected_ids_by_item.items()
+        }
 
         if not records:
+            if prepared.metadata_only_ids:
+                self.chroma_client.update_metadatas(
+                    prepared.metadata_only_ids,
+                    prepared.metadata_only_metadatas,
+                )
             stats["batch_submitted"] = False
-            stats["batch_error"] = "No documents were prepared for OpenAI Batch API submission"
+            stats["metadata_only"] = bool(prepared.metadata_only_ids)
+            if hasattr(self.chroma_client, "reconcile_item_records"):
+                for parent, expected_ids in expected_ids_by_item.items():
+                    self.chroma_client.reconcile_item_records(
+                        parent,
+                        set(expected_ids),
+                    )
+            self.update_config["last_update"] = datetime.now().isoformat()
+            completed_sync_version = (
+                target_sync_version if stats["errors"] == 0 else None
+            )
+            self._save_update_config(
+                last_sync_version=completed_sync_version,
+                indexed_fulltext=(
+                    self._active_fulltext
+                    if completed_sync_version is not None
+                    else None
+                ),
+                indexed_content_signature=(
+                    _CONTENT_CONTRACT_SIGNATURE
+                    if completed_sync_version is not None
+                    else None
+                ),
+            )
             return stats
 
         ids = [record["id"] for record in records]
@@ -1736,6 +1802,15 @@ class ZoteroSemanticSearch:
             target_sync_version=target_sync_version,
             fulltext=self._active_fulltext,
             content_signature=_CONTENT_CONTRACT_SIGNATURE,
+            expected_ids_by_item=expected_ids_by_item,
+            metadata_only_records=[
+                {"id": doc_id, "metadata": metadata}
+                for doc_id, metadata in zip(
+                    prepared.metadata_only_ids,
+                    prepared.metadata_only_metadatas,
+                    strict=True,
+                )
+            ],
         )
         stats["batch_submitted"] = True
         stats["batch_run_id"] = manifest["run_id"]
@@ -1780,6 +1855,7 @@ class ZoteroSemanticSearch:
             "processed_items": 0,
             "added_items": 0,
             "updated_items": 0,
+            "reused_embeddings": 0,
             "recovered_items": 0,
             "skipped_items": 0,
             "deleted_items": 0,
@@ -2067,13 +2143,18 @@ class ZoteroSemanticSearch:
                     stats=stats,
                 )
                 try:
-                    batch_ids = ", ".join(stats.get("batch_ids", []))
-                    sys.stderr.write(
-                        "  Submitted OpenAI embedding batch"
-                        f"{'es' if len(stats.get('batch_ids', [])) != 1 else ''}: {batch_ids}\n"
-                    )
-                    sys.stderr.write("  Run 'zotero-mcp openai-batch-status' to check progress.\n")
-                    sys.stderr.write("  Run 'zotero-mcp openai-batch-import' after the batch completes.\n")
+                    if stats.get("batch_submitted"):
+                        batch_ids = ", ".join(stats.get("batch_ids", []))
+                        sys.stderr.write(
+                            "  Submitted OpenAI embedding batch"
+                            f"{'es' if len(stats.get('batch_ids', [])) != 1 else ''}: {batch_ids}\n"
+                        )
+                        sys.stderr.write("  Run 'zotero-mcp openai-batch-status' to check progress.\n")
+                        sys.stderr.write("  Run 'zotero-mcp openai-batch-import' after the batch completes.\n")
+                    else:
+                        sys.stderr.write(
+                            "  No embedding batch needed; all vectors were reused.\n"
+                        )
                 except Exception:
                     pass
                 end_time = datetime.now()
@@ -2116,6 +2197,9 @@ class ZoteroSemanticSearch:
                 stats["processed_items"] += batch_stats["processed"]
                 stats["added_items"] += batch_stats["added"]
                 stats["updated_items"] += batch_stats["updated"]
+                stats["reused_embeddings"] += batch_stats.get(
+                    "reused_embeddings", 0
+                )
                 stats["skipped_items"] += batch_stats["skipped"]
                 stats["errors"] += batch_stats["errors"]
 
@@ -2139,6 +2223,7 @@ class ZoteroSemanticSearch:
                 work_queue: Queue[Any] = Queue(maxsize=queue_depth)
                 result_queue: Queue[Any] = Queue(maxsize=queue_depth)
                 stop_pipeline = threading.Event()
+                chroma_access_lock = threading.Lock()
                 work_done = object()
                 worker_done = object()
                 producer_errors: list[Exception] = []
@@ -2156,6 +2241,11 @@ class ZoteroSemanticSearch:
                     try:
                         for item in all_items:
                             prepared = self._prepare_item_batch([item])
+                            with chroma_access_lock:
+                                prepared = self._partition_reusable_embeddings(
+                                    prepared,
+                                    force_rebuild=force_full_rebuild,
+                                )
                             if not put_with_backpressure(
                                 work_queue,
                                 (item, prepared),
@@ -2238,7 +2328,7 @@ class ZoteroSemanticSearch:
                             commit_started = time.monotonic()
                             if error is None:
                                 try:
-                                    if prepared.documents:
+                                    with chroma_access_lock:
                                         self._commit_prepared_batch(
                                             prepared,
                                             force_rebuild=force_full_rebuild,
@@ -2253,9 +2343,9 @@ class ZoteroSemanticSearch:
                                     "saving it for a sequential retry",
                                     error,
                                 )
-                                prepared.stats["errors"] += len(
-                                    prepared.documents
-                                )
+                                prepared.stats["errors"] += prepared.stats[
+                                    "processed"
+                                ]
                                 failed_concurrent_batches.append(prepared)
 
                             item_duration += time.monotonic() - commit_started
@@ -2298,7 +2388,7 @@ class ZoteroSemanticSearch:
                                 force_rebuild=force_full_rebuild,
                                 embeddings=embeddings,
                             )
-                            stats["errors"] -= len(prepared.documents)
+                            stats["errors"] -= prepared.stats["processed"]
                             recovered = prepared.stats["processed"]
                             stats["recovered_items"] += recovered
                             retry_ok += recovered
@@ -2362,6 +2452,10 @@ class ZoteroSemanticSearch:
                 )
                 if stats["recovered_items"]:
                     summary += f", {stats['recovered_items']} recovered"
+                if stats["reused_embeddings"]:
+                    summary += (
+                        f", {stats['reused_embeddings']} unchanged vectors reused"
+                    )
                 sys.stderr.write(summary + "\n")
             except Exception:
                 pass
@@ -2424,7 +2518,14 @@ class ZoteroSemanticSearch:
         items: list[dict[str, Any]],
     ) -> _PreparedIndexBatch:
         """Prepare an item batch without embedding or mutating ChromaDB."""
-        stats = {"processed": 0, "added": 0, "updated": 0, "skipped": 0, "errors": 0}
+        stats = {
+            "processed": 0,
+            "added": 0,
+            "updated": 0,
+            "skipped": 0,
+            "errors": 0,
+            "reused_embeddings": 0,
+        }
 
         chunking = self._chunking_enabled
         chunk_size = int(self._chunking_config.get("chunk_size", 1500))
@@ -2527,7 +2628,11 @@ class ZoteroSemanticSearch:
                         )
                         if page is not None:
                             cmeta["page"] = page
-                        documents.append(self.chroma_client.truncate_text(chunk_text))
+                        document = self.chroma_client.truncate_text(chunk_text)
+                        cmeta["embedding_content_sha256"] = (
+                            _embedding_content_hash(document)
+                        )
+                        documents.append(document)
                         metadatas.append(cmeta)
                         ids.append(f"{item_key}#{ci}")
                 else:
@@ -2543,7 +2648,11 @@ class ZoteroSemanticSearch:
                         stats["skipped"] += 1
                         continue
                     # Truncate to fit the configured embedding model's token limit
-                    documents.append(self.chroma_client.truncate_text(doc_text))
+                    document = self.chroma_client.truncate_text(doc_text)
+                    metadata["embedding_content_sha256"] = (
+                        _embedding_content_hash(document)
+                    )
+                    documents.append(document)
                     metadatas.append(metadata)
                     ids.append(item_key)
 
@@ -2558,9 +2667,59 @@ class ZoteroSemanticSearch:
             documents=documents,
             metadatas=metadatas,
             ids=ids,
+            expected_ids=list(ids),
+            metadata_only_ids=[],
+            metadata_only_metadatas=[],
             item_keys=item_keys_order,
             stats=stats,
         )
+
+    def _partition_reusable_embeddings(
+        self,
+        prepared: _PreparedIndexBatch,
+        *,
+        force_rebuild: bool,
+    ) -> _PreparedIndexBatch:
+        """Move text-identical existing records to metadata-only updates."""
+        if (
+            force_rebuild
+            or not prepared.ids
+            or not hasattr(self.chroma_client, "get_records")
+            or not hasattr(self.chroma_client, "update_metadatas")
+        ):
+            return prepared
+
+        existing = self.chroma_client.get_records(prepared.ids)
+        embed_documents: list[str] = []
+        embed_metadatas: list[dict[str, Any]] = []
+        embed_ids: list[str] = []
+
+        for doc_id, document, metadata in zip(
+            prepared.ids,
+            prepared.documents,
+            prepared.metadatas,
+            strict=True,
+        ):
+            stored = existing.get(doc_id) or {}
+            stored_metadata = stored.get("metadata") or {}
+            current_hash = metadata["embedding_content_sha256"]
+            unchanged = (
+                stored_metadata.get("embedding_content_sha256") == current_hash
+                or stored.get("document") == document
+            )
+            if unchanged:
+                prepared.metadata_only_ids.append(doc_id)
+                prepared.metadata_only_metadatas.append(metadata)
+            else:
+                embed_ids.append(doc_id)
+                embed_documents.append(document)
+                embed_metadatas.append(metadata)
+
+        prepared.ids = embed_ids
+        prepared.documents = embed_documents
+        prepared.metadatas = embed_metadatas
+        prepared.stats["reused_embeddings"] += len(prepared.metadata_only_ids)
+        return prepared
 
     def _commit_prepared_batch(
         self,
@@ -2573,10 +2732,13 @@ class ZoteroSemanticSearch:
         documents = prepared.documents
         metadatas = prepared.metadatas
         ids = prepared.ids
+        expected_ids = prepared.expected_ids
+        metadata_only_ids = prepared.metadata_only_ids
+        metadata_only_metadatas = prepared.metadata_only_metadatas
         item_keys_order = prepared.item_keys
         stats = prepared.stats
 
-        if not documents:
+        if not documents and not metadata_only_ids:
             return stats
         if embeddings is not None and len(embeddings) != len(documents):
             raise ValueError(
@@ -2598,20 +2760,26 @@ class ZoteroSemanticSearch:
         expected_ids_by_item: dict[str, set[str]] = {
             key: set() for key in item_keys_order
         }
-        for doc_id in ids:
+        for doc_id in expected_ids:
             expected_ids_by_item.setdefault(doc_id.split("#", 1)[0], set()).add(
                 doc_id
             )
 
         try:
-            if embeddings is None:
-                self.chroma_client.upsert_documents(documents, metadatas, ids)
-            else:
-                self.chroma_client.upsert_embeddings(
-                    documents,
-                    metadatas,
-                    ids,
-                    embeddings,
+            if documents:
+                if embeddings is None:
+                    self.chroma_client.upsert_documents(documents, metadatas, ids)
+                else:
+                    self.chroma_client.upsert_embeddings(
+                        documents,
+                        metadatas,
+                        ids,
+                        embeddings,
+                    )
+            if metadata_only_ids:
+                self.chroma_client.update_metadatas(
+                    metadata_only_ids,
+                    metadata_only_metadatas,
                 )
             if not force_rebuild and hasattr(
                 self.chroma_client, "reconcile_item_records"
@@ -2645,6 +2813,10 @@ class ZoteroSemanticSearch:
     ) -> dict[str, int]:
         """Prepare, embed, and write a batch through the sequential path."""
         prepared = self._prepare_item_batch(items)
+        prepared = self._partition_reusable_embeddings(
+            prepared,
+            force_rebuild=force_rebuild,
+        )
         return self._commit_prepared_batch(
             prepared,
             force_rebuild=force_rebuild,
@@ -2846,16 +3018,39 @@ class ZoteroSemanticSearch:
             if all(batch.get("imported_at") for batch in all_batches):
                 # Every expected record is now present. Reconcile only at this
                 # point because one item's chunks may span multiple batch files.
-                expected_ids_by_item: dict[str, set[str]] = {}
-                for batch in all_batches:
-                    for record in openai_batch.read_jsonl(
-                        Path(batch["records_path"])
-                    ):
-                        doc_id = record["id"]
-                        parent = record.get("metadata", {}).get(
-                            "parent_item_key"
-                        ) or doc_id.split("#", 1)[0]
-                        expected_ids_by_item.setdefault(parent, set()).add(doc_id)
+                metadata_only_path = manifest.get("metadata_only_records_path")
+                if metadata_only_path:
+                    metadata_only_records = openai_batch.read_jsonl(
+                        Path(metadata_only_path)
+                    )
+                    if metadata_only_records:
+                        self.chroma_client.update_metadatas(
+                            [record["id"] for record in metadata_only_records],
+                            [
+                                record["metadata"]
+                                for record in metadata_only_records
+                            ],
+                        )
+                        stats["reused_embeddings"] = len(
+                            metadata_only_records
+                        )
+                manifest_expected = manifest.get("expected_ids_by_item") or {}
+                expected_ids_by_item: dict[str, set[str]] = {
+                    parent: set(ids)
+                    for parent, ids in manifest_expected.items()
+                }
+                if not expected_ids_by_item:
+                    for batch in all_batches:
+                        for record in openai_batch.read_jsonl(
+                            Path(batch["records_path"])
+                        ):
+                            doc_id = record["id"]
+                            parent = record.get("metadata", {}).get(
+                                "parent_item_key"
+                            ) or doc_id.split("#", 1)[0]
+                            expected_ids_by_item.setdefault(parent, set()).add(
+                                doc_id
+                            )
                 if hasattr(self.chroma_client, "reconcile_item_records"):
                     for parent, expected_ids in expected_ids_by_item.items():
                         self.chroma_client.reconcile_item_records(

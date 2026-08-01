@@ -149,6 +149,28 @@ class _SkewedChroma(_ConcurrentChroma):
         return [[float(i), 1.0] for i, _ in enumerate(documents)]
 
 
+class _ReusingConcurrentChroma(_ConcurrentChroma):
+    def __init__(self):
+        super().__init__()
+        self.records = {}
+        self.metadata_updates = []
+        self.embedding_calls = 0
+
+    def get_records(self, ids):
+        return {
+            doc_id: self.records[doc_id]
+            for doc_id in ids
+            if doc_id in self.records
+        }
+
+    def update_metadatas(self, ids, metadatas):
+        self.metadata_updates.extend(zip(ids, metadatas, strict=True))
+
+    def embed_documents(self, documents):
+        self.embedding_calls += 1
+        return super().embed_documents(documents)
+
+
 def test_fast_worker_takes_next_entry_while_other_worker_is_slow(monkeypatch):
     chroma = _SkewedChroma()
     search = _search(monkeypatch, chroma, _items(3))
@@ -161,6 +183,31 @@ def test_fast_worker_takes_next_entry_while_other_worker_is_slow(monkeypatch):
     assert stats["errors"] == 0
     assert chroma.slow_observed_replacement is True
     assert all(len(batch_ids) == 1 for batch_ids in chroma.upserted_batches)
+
+
+def test_concurrent_metadata_only_updates_do_not_call_encoder(monkeypatch):
+    items = _items(3)
+    chroma = _ReusingConcurrentChroma()
+    search = _search(monkeypatch, chroma, items)
+    prepared = search._prepare_item_batch(items)
+    chroma.records = {
+        doc_id: {"document": document, "metadata": {}}
+        for doc_id, document in zip(
+            prepared.ids,
+            prepared.documents,
+            strict=True,
+        )
+    }
+
+    stats = search.update_database(
+        embedding_concurrency=2,
+    )
+
+    assert stats["errors"] == 0
+    assert stats["reused_embeddings"] == 3
+    assert chroma.embedding_calls == 0
+    assert len(chroma.metadata_updates) == 3
+    assert chroma.upserted_batches == []
 
 
 def test_concurrency_rejects_non_openai_embedding_models(monkeypatch):

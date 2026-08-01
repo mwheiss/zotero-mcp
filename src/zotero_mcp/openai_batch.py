@@ -194,6 +194,8 @@ def submit_embedding_batches(
     target_sync_version: int | None = None,
     fulltext: bool | None = None,
     content_signature: str | None = None,
+    expected_ids_by_item: dict[str, list[str]] | None = None,
+    metadata_only_records: list[dict[str, Any]] | None = None,
     client: Any | None = None,
 ) -> dict[str, Any]:
     """Upload JSONL files and create one or more OpenAI embedding batches."""
@@ -218,9 +220,14 @@ def submit_embedding_batches(
         "target_sync_version": target_sync_version,
         "fulltext": fulltext,
         "content_signature": content_signature,
+        "expected_ids_by_item": expected_ids_by_item or {},
         "manifest_path": str(run_dir / "manifest.json"),
         "batches": [],
     }
+    if metadata_only_records:
+        metadata_only_path = run_dir / "metadata-only-records.jsonl"
+        write_jsonl(metadata_only_path, metadata_only_records)
+        manifest["metadata_only_records_path"] = str(metadata_only_path)
 
     chunks = split_embedding_records(records, model_name)
     for index, (chunk_records, requests) in enumerate(chunks, start=1):

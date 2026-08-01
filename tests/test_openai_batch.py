@@ -106,6 +106,9 @@ def test_submit_embedding_batches_writes_manifest_and_jsonl(tmp_path):
         model_name="text-embedding-3-small",
         embedding_config={"api_key": "test"},
         config_path=str(tmp_path / "config.json"),
+        metadata_only_records=[
+            {"id": "UNCHANGED", "metadata": {"title": "Current title"}},
+        ],
         client=SimpleNamespace(files=FakeFiles(), batches=FakeBatches()),
     )
 
@@ -113,6 +116,9 @@ def test_submit_embedding_batches_writes_manifest_and_jsonl(tmp_path):
     assert Path(manifest["manifest_path"]).exists()
     input_rows = openai_batch.read_jsonl(Path(manifest["batches"][0]["input_path"]))
     assert input_rows[0]["url"] == "/v1/embeddings"
+    assert openai_batch.read_jsonl(
+        Path(manifest["metadata_only_records_path"])
+    ) == [{"id": "UNCHANGED", "metadata": {"title": "Current title"}}]
 
 
 def test_setup_openai_new_config_defaults_to_batch(monkeypatch):
@@ -280,6 +286,150 @@ def test_batch_and_realtime_indexing_share_prepared_payload(monkeypatch):
     }]
     assert "Full text must be included" in captured["records"][0]["document"]
     assert captured["records"][0]["metadata"]["has_fulltext"] is True
+
+
+def test_batch_reuses_unchanged_vectors_without_submission(monkeypatch):
+    class ReusingClient(FakeChromaClient):
+        def __init__(self):
+            super().__init__()
+            self.metadata_updates = []
+            self.reconciled = []
+
+        def get_records(self, ids):
+            return {
+                doc_id: {
+                    "document": "Existing item\n\nA",
+                    "metadata": {},
+                }
+                for doc_id in ids
+            }
+
+        def update_metadatas(self, ids, metadatas):
+            self.metadata_updates.extend(zip(ids, metadatas, strict=True))
+
+        def reconcile_item_records(self, parent, expected_ids):
+            self.reconciled.append((parent, set(expected_ids)))
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(
+        semantic_search.openai_batch,
+        "submit_embedding_batches",
+        lambda **kwargs: pytest.fail("unchanged text must not be submitted"),
+    )
+    client = ReusingClient()
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=client)
+    saved = []
+    monkeypatch.setattr(search, "_save_update_config", lambda **kwargs: saved.append(kwargs))
+
+    stats = search._submit_openai_batch_index(
+        [{
+            "key": "EXISTING",
+            "data": {
+                "title": "Existing item",
+                "abstractNote": "A",
+                "itemType": "journalArticle",
+                "creators": [],
+            },
+        }],
+        force_full_rebuild=False,
+        target_sync_version=42,
+        stats={
+            "processed_items": 0,
+            "skipped_items": 0,
+            "errors": 0,
+        },
+    )
+
+    assert stats["batch_submitted"] is False
+    assert stats["reused_embeddings"] == 1
+    assert len(client.metadata_updates) == 1
+    assert client.reconciled == [("EXISTING", {"EXISTING"})]
+    assert saved == [{
+        "last_sync_version": 42,
+        "indexed_fulltext": False,
+        "indexed_content_signature": "lean-paper-content-v2",
+    }]
+
+
+def test_batch_manifest_keeps_reused_chunks_in_expected_layout(monkeypatch):
+    class ReusingClient(FakeChromaClient):
+        def __init__(self):
+            super().__init__()
+            self.records = {}
+            self.metadata_updates = []
+
+        def get_records(self, ids):
+            return {
+                doc_id: self.records[doc_id]
+                for doc_id in ids
+                if doc_id in self.records
+            }
+
+        def update_metadatas(self, ids, metadatas):
+            self.metadata_updates.extend(zip(ids, metadatas, strict=True))
+
+    item = {
+        "key": "MIXED",
+        "data": {
+            "title": "Mixed item",
+            "abstractNote": "Abstract",
+            "itemType": "journalArticle",
+            "creators": [],
+            "fulltext": "First passage. " * 80,
+            "fulltextSource": "zotero_web_api",
+        },
+    }
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    client = ReusingClient()
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=client)
+    search._chunking_config = {
+        "enabled": True,
+        "chunk_size": 120,
+        "overlap": 20,
+        "max_chunks_per_item": 10,
+    }
+    prepared = search._prepare_item_batch([item])
+    reused_id = prepared.ids[0]
+    client.records[reused_id] = {
+        "document": prepared.documents[0],
+        "metadata": {},
+    }
+    captured = {}
+
+    def capture_submit(**kwargs):
+        captured.update(kwargs)
+        return {
+            "run_id": "run-mixed",
+            "manifest_path": "/tmp/manifest.json",
+            "batches": [{"batch_id": "batch-mixed"}],
+        }
+
+    monkeypatch.setattr(
+        semantic_search.openai_batch,
+        "submit_embedding_batches",
+        capture_submit,
+    )
+
+    search._submit_openai_batch_index(
+        [item],
+        force_full_rebuild=False,
+        target_sync_version=42,
+        stats={
+            "processed_items": 0,
+            "skipped_items": 0,
+            "errors": 0,
+        },
+    )
+
+    submitted_ids = {record["id"] for record in captured["records"]}
+    assert reused_id not in submitted_ids
+    assert captured["expected_ids_by_item"] == {
+        "MIXED": sorted(prepared.expected_ids),
+    }
+    assert [
+        record["id"] for record in captured["metadata_only_records"]
+    ] == [reused_id]
+    assert client.metadata_updates == []
 
 
 def test_chroma_client_upsert_embeddings_passes_precomputed_vectors():
@@ -454,6 +604,11 @@ def test_complete_batch_reconciles_before_advancing_watermark(tmp_path, monkeypa
         ) + "\n",
         encoding="utf-8",
     )
+    metadata_only_path = tmp_path / "metadata-only-records.jsonl"
+    openai_batch.write_jsonl(
+        metadata_only_path,
+        [{"id": "A#2", "metadata": {"title": "Refreshed"}}],
+    )
     manifest = {
         "run_id": "complete",
         "manifest_path": str(tmp_path / "manifest.json"),
@@ -461,6 +616,8 @@ def test_complete_batch_reconciles_before_advancing_watermark(tmp_path, monkeypa
         "target_sync_version": 42,
         "fulltext": True,
         "content_signature": "contract-v2",
+        "expected_ids_by_item": {"A": ["A#0", "A#1", "A#2"]},
+        "metadata_only_records_path": str(metadata_only_path),
         "batches": [{
             "batch_id": "batch-1",
             "status": "completed",
@@ -474,12 +631,16 @@ def test_complete_batch_reconciles_before_advancing_watermark(tmp_path, monkeypa
         def __init__(self):
             super().__init__()
             self.reconciled = []
+            self.metadata_updates = []
 
         def upsert_embeddings(self, documents, metadatas, ids, embeddings):
             pass
 
         def reconcile_item_records(self, parent, expected_ids):
             self.reconciled.append((parent, set(expected_ids)))
+
+        def update_metadatas(self, ids, metadatas):
+            self.metadata_updates.append((list(ids), list(metadatas)))
 
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
     monkeypatch.setattr(semantic_search.openai_batch, "find_manifest", lambda **kwargs: manifest)
@@ -492,7 +653,10 @@ def test_complete_batch_reconciles_before_advancing_watermark(tmp_path, monkeypa
 
     search.import_openai_batch()
 
-    assert client.reconciled == [("A", {"A#0", "A#1"})]
+    assert client.metadata_updates == [
+        (["A#2"], [{"title": "Refreshed"}]),
+    ]
+    assert client.reconciled == [("A", {"A#0", "A#1", "A#2"})]
     assert saved == [{
         "last_sync_version": 42,
         "indexed_fulltext": True,

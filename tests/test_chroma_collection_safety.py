@@ -153,6 +153,72 @@ def test_collection_id_read_errors_are_not_treated_as_empty():
         client.get_all_ids()
 
 
+def test_record_reads_and_metadata_only_updates_preserve_documents():
+    class Collection:
+        def __init__(self):
+            self.updated = []
+
+        def get(self, **kwargs):
+            assert kwargs["include"] == ["documents", "metadatas"]
+            return {
+                "ids": ["A", "B"],
+                "documents": ["alpha", "beta"],
+                "metadatas": [{"old": 1}, {"old": 2}],
+            }
+
+        def update(self, **kwargs):
+            self.updated.append(kwargs)
+
+    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
+    client.client = SimpleNamespace(get_max_batch_size=lambda: 100)
+    client.collection = Collection()
+
+    records = client.get_records(["A", "B"])
+    client.update_metadatas(["A", "B"], [{"new": 1}, {"new": 2}])
+
+    assert records == {
+        "A": {"document": "alpha", "metadata": {"old": 1}},
+        "B": {"document": "beta", "metadata": {"old": 2}},
+    }
+    assert client.collection.updated == [{
+        "ids": ["A", "B"],
+        "metadatas": [{"new": 1}, {"new": 2}],
+    }]
+
+
+def test_real_chroma_metadata_update_preserves_document_and_vector(tmp_path):
+    raw_client = chroma_client.chromadb.PersistentClient(
+        path=str(tmp_path / "chroma")
+    )
+    collection = raw_client.create_collection(
+        "metadata_update",
+        metadata={"hnsw:space": "cosine"},
+    )
+    collection.add(
+        ids=["A"],
+        documents=["unchanged document"],
+        metadatas=[{"title": "Old"}],
+        embeddings=[[0.25, 0.75]],
+    )
+    before = collection.get(
+        ids=["A"],
+        include=["documents", "metadatas", "embeddings"],
+    )
+    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
+    client.client = raw_client
+    client.collection = collection
+
+    client.update_metadatas(["A"], [{"title": "New"}])
+
+    after = collection.get(
+        ids=["A"],
+        include=["documents", "metadatas", "embeddings"],
+    )
+    assert after["documents"] == before["documents"]
+    assert after["embeddings"].tolist() == before["embeddings"].tolist()
+    assert after["metadatas"] == [{"title": "New"}]
+
+
 def test_distance_conversion_uses_cosine_distance():
     client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
 

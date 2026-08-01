@@ -793,6 +793,54 @@ class ChromaClient:
             logger.error(f"Error upserting precomputed embeddings to ChromaDB: {e}")
             raise
 
+    def get_records(self, ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Return stored documents and metadata keyed by record id."""
+        if not ids:
+            return {}
+        try:
+            result = self.collection.get(
+                ids=ids,
+                include=["documents", "metadatas"],
+            )
+            result_ids = result.get("ids", [])
+            documents = result.get("documents", []) or []
+            metadatas = result.get("metadatas", []) or []
+            return {
+                doc_id: {
+                    "document": documents[index] if index < len(documents) else None,
+                    "metadata": metadatas[index] if index < len(metadatas) else None,
+                }
+                for index, doc_id in enumerate(result_ids)
+            }
+        except Exception as e:
+            logger.error("Error reading collection records: %s", e)
+            raise
+
+    def update_metadatas(
+        self,
+        ids: list[str],
+        metadatas: list[dict[str, Any]],
+    ) -> None:
+        """Update metadata without changing documents or embeddings."""
+        if not ids:
+            return
+        if len(ids) != len(metadatas):
+            raise ValueError("ids and metadatas must have equal lengths")
+        try:
+            try:
+                max_batch = int(self.client.get_max_batch_size())
+            except Exception:
+                max_batch = 5000
+            for i in range(0, len(ids), max_batch):
+                self.collection.update(
+                    ids=ids[i:i + max_batch],
+                    metadatas=metadatas[i:i + max_batch],
+                )
+            logger.info("Updated metadata for %s existing documents", len(ids))
+        except Exception as e:
+            logger.error("Error updating document metadata: %s", e)
+            raise
+
     def search(self,
                query_texts: list[str],
                n_results: int = 10,
