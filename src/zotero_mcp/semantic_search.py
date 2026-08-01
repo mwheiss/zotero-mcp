@@ -2738,14 +2738,8 @@ class ZoteroSemanticSearch:
 
         try:
             already_imported = any(batch.get("imported_at") for batch in all_batches)
-            if (
-                manifest.get("force_full_rebuild")
-                and not already_imported
-                and any(not batch.get("imported_at") for batch in batches)
-            ):
-                self.chroma_client.reset_collection()
-
             client = openai_batch.create_openai_client(self.chroma_client.embedding_config)
+            prepared_imports = []
             for batch in batches:
                 if batch.get("imported_at"):
                     stats["batches_skipped"] += 1
@@ -2800,6 +2794,36 @@ class ZoteroSemanticSearch:
                 stats["errors"].extend(row_failures)
                 stats["errors"].extend(missing_errors)
 
+                batch_errors = row_failures + missing_errors
+                if batch_errors:
+                    batch["import_error_at"] = datetime.now().isoformat()
+                    batch["import_error_count"] = len(batch_errors)
+                    continue
+
+                prepared_imports.append(
+                    (batch, records, ids, embeddings_by_id)
+                )
+
+            # A force rebuild must validate the entire replacement before the
+            # old collection is discarded. Partial output leaves the existing
+            # index untouched and the manifest retryable.
+            pending_selected = [
+                batch for batch in batches if not batch.get("imported_at")
+            ]
+            if manifest.get("force_full_rebuild") and len(prepared_imports) != len(
+                pending_selected
+            ):
+                openai_batch.save_manifest(manifest)
+                return stats
+
+            if (
+                manifest.get("force_full_rebuild")
+                and not already_imported
+                and prepared_imports
+            ):
+                self.chroma_client.reset_collection()
+
+            for batch, records, ids, embeddings_by_id in prepared_imports:
                 if ids:
                     existing_ids = self.chroma_client.get_existing_ids(ids)
                     self.chroma_client.upsert_embeddings(
@@ -2814,10 +2838,30 @@ class ZoteroSemanticSearch:
 
                 batch["imported_at"] = datetime.now().isoformat()
                 batch["imported_count"] = len(ids)
+                batch.pop("import_error_at", None)
+                batch.pop("import_error_count", None)
                 stats["batches_imported"] += 1
 
             openai_batch.save_manifest(manifest)
             if all(batch.get("imported_at") for batch in all_batches):
+                # Every expected record is now present. Reconcile only at this
+                # point because one item's chunks may span multiple batch files.
+                expected_ids_by_item: dict[str, set[str]] = {}
+                for batch in all_batches:
+                    for record in openai_batch.read_jsonl(
+                        Path(batch["records_path"])
+                    ):
+                        doc_id = record["id"]
+                        parent = record.get("metadata", {}).get(
+                            "parent_item_key"
+                        ) or doc_id.split("#", 1)[0]
+                        expected_ids_by_item.setdefault(parent, set()).add(doc_id)
+                if hasattr(self.chroma_client, "reconcile_item_records"):
+                    for parent, expected_ids in expected_ids_by_item.items():
+                        self.chroma_client.reconcile_item_records(
+                            parent,
+                            expected_ids,
+                        )
                 self.update_config["last_update"] = datetime.now().isoformat()
                 self._save_update_config(
                     last_sync_version=manifest.get("target_sync_version"),

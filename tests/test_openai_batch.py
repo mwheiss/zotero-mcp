@@ -313,6 +313,7 @@ def test_import_openai_batch_reports_records_missing_from_output(tmp_path, monke
         def __init__(self):
             super().__init__()
             self.upserted = None
+            self.reset_count = 0
 
         def upsert_embeddings(self, documents, metadatas, ids, embeddings):
             self.upserted = {
@@ -321,6 +322,9 @@ def test_import_openai_batch_reports_records_missing_from_output(tmp_path, monke
                 "ids": list(ids),
                 "embeddings": list(embeddings),
             }
+
+        def reset_collection(self):
+            self.reset_count += 1
 
     records_path = tmp_path / "batch-001-records.jsonl"
     openai_batch.write_jsonl(
@@ -367,15 +371,130 @@ def test_import_openai_batch_reports_records_missing_from_output(tmp_path, monke
 
     stats = search.import_openai_batch()
 
-    assert chroma_client.upserted == {
-        "documents": ["doc A"],
-        "metadatas": [{"title": "A"}],
-        "ids": ["A"],
-        "embeddings": [[0.1, 0.2]],
-    }
-    assert stats["imported_items"] == 1
+    assert chroma_client.upserted is None
+    assert stats["imported_items"] == 0
     assert stats["missing_items"] == 1
     assert {
         "custom_id": "B",
         "error": "No embedding or error row returned for batch record",
     } in stats["errors"]
+    assert manifest["batches"][0]["imported_at"] is None
+    assert manifest["batches"][0]["import_error_count"] == 1
+
+
+def test_force_batch_partial_output_does_not_reset_existing_index(
+    tmp_path,
+    monkeypatch,
+):
+    records_path = tmp_path / "records.jsonl"
+    openai_batch.write_jsonl(
+        records_path,
+        [
+            {"id": "A#0", "document": "a", "metadata": {"parent_item_key": "A"}},
+            {"id": "A#1", "document": "b", "metadata": {"parent_item_key": "A"}},
+        ],
+    )
+    records_path.with_name("records-output.jsonl").write_text(
+        json.dumps({
+            "custom_id": "A#0",
+            "response": {"status_code": 200, "body": {"data": [{"embedding": [0.1]}]}},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "run_id": "force-partial",
+        "manifest_path": str(tmp_path / "manifest.json"),
+        "force_full_rebuild": True,
+        "batches": [{
+            "batch_id": "batch-1",
+            "status": "completed",
+            "output_file_id": "file-1",
+            "records_path": str(records_path),
+            "imported_at": None,
+        }],
+    }
+
+    class Client(FakeChromaClient):
+        def __init__(self):
+            super().__init__()
+            self.reset_count = 0
+
+        def reset_collection(self):
+            self.reset_count += 1
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(semantic_search.openai_batch, "find_manifest", lambda **kwargs: manifest)
+    monkeypatch.setattr(semantic_search.openai_batch, "refresh_manifest_status", lambda value, **kwargs: value)
+    monkeypatch.setattr(semantic_search.openai_batch, "create_openai_client", lambda config: object())
+    client = Client()
+
+    stats = semantic_search.ZoteroSemanticSearch(
+        chroma_client=client
+    ).import_openai_batch()
+
+    assert stats["missing_items"] == 1
+    assert client.reset_count == 0
+    assert manifest["batches"][0]["imported_at"] is None
+
+
+def test_complete_batch_reconciles_before_advancing_watermark(tmp_path, monkeypatch):
+    records_path = tmp_path / "records.jsonl"
+    records = [
+        {"id": "A#0", "document": "a", "metadata": {"parent_item_key": "A"}},
+        {"id": "A#1", "document": "b", "metadata": {"parent_item_key": "A"}},
+    ]
+    openai_batch.write_jsonl(records_path, records)
+    records_path.with_name("records-output.jsonl").write_text(
+        "\n".join(
+            json.dumps({
+                "custom_id": record["id"],
+                "response": {"status_code": 200, "body": {"data": [{"embedding": [0.1]}]}},
+            })
+            for record in records
+        ) + "\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "run_id": "complete",
+        "manifest_path": str(tmp_path / "manifest.json"),
+        "force_full_rebuild": False,
+        "target_sync_version": 42,
+        "fulltext": True,
+        "content_signature": "contract-v2",
+        "batches": [{
+            "batch_id": "batch-1",
+            "status": "completed",
+            "output_file_id": "file-1",
+            "records_path": str(records_path),
+            "imported_at": None,
+        }],
+    }
+
+    class Client(FakeChromaClient):
+        def __init__(self):
+            super().__init__()
+            self.reconciled = []
+
+        def upsert_embeddings(self, documents, metadatas, ids, embeddings):
+            pass
+
+        def reconcile_item_records(self, parent, expected_ids):
+            self.reconciled.append((parent, set(expected_ids)))
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(semantic_search.openai_batch, "find_manifest", lambda **kwargs: manifest)
+    monkeypatch.setattr(semantic_search.openai_batch, "refresh_manifest_status", lambda value, **kwargs: value)
+    monkeypatch.setattr(semantic_search.openai_batch, "create_openai_client", lambda config: object())
+    client = Client()
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=client)
+    saved = []
+    monkeypatch.setattr(search, "_save_update_config", lambda **kwargs: saved.append(kwargs))
+
+    search.import_openai_batch()
+
+    assert client.reconciled == [("A", {"A#0", "A#1"})]
+    assert saved == [{
+        "last_sync_version": 42,
+        "indexed_fulltext": True,
+        "indexed_content_signature": "contract-v2",
+    }]
