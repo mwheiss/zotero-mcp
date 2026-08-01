@@ -422,3 +422,18 @@ def test_api_attachment_missing_from_snapshot_defers_item(monkeypatch, capsys):
     output = capsys.readouterr().err
     assert "deferred 1 item(s)" in output
     assert "existing index records were left unchanged" in output
+
+
+def test_pdf_selection_emits_summary_warning(monkeypatch, capsys):
+    items, reader = _run_scan(
+        monkeypatch,
+        {},
+        [("PDF1", "storage:paper.pdf", "application/pdf")],
+        extract_result=("paper text", "pdf"),
+    )
+
+    assert reader.extract_calls == 1
+    assert len(items) == 1
+    output = capsys.readouterr().err
+    assert "Warning: a PDF attachment was selected as full text for 1 item(s)" in output
+    assert "direct extraction" in output

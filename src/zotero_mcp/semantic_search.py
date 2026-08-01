@@ -1190,6 +1190,7 @@ class ZoteroSemanticSearch:
                     total_local = len(local_items)
                     _failed_extractions: list[tuple[str, str]] = []
                     _skipped_failed: list[tuple[str, str]] = []
+                    _pdf_selections: list[tuple[str, bool]] = []
                     _deferred_attachments: list[tuple[str, int]] = []
 
                     # Show startup note
@@ -1443,6 +1444,20 @@ class ZoteroSemanticSearch:
                                             it.fulltext, it.fulltext_source = text[0], text[1]
                                         else:
                                             it.fulltext = text
+                                        details = getattr(
+                                            reader, "last_extraction_details", None
+                                        ) or {}
+                                        selected_pdf = bool(details.get("is_pdf")) or (
+                                            getattr(it, "fulltext_source", None)
+                                            in {"pdf", "ocr-pdf"}
+                                        )
+                                        if selected_pdf:
+                                            _pdf_selections.append(
+                                                (
+                                                    display or f"item {it.key}",
+                                                    bool(details.get("used_zotero_cache")),
+                                                )
+                                            )
                                     else:
                                         # Extraction returned empty — mark as attempted
                                         it._fulltext_attempted = True
@@ -1485,6 +1500,26 @@ class ZoteroSemanticSearch:
                             for name, reason in _failed_extractions:
                                 sys.stderr.write(f"    - {name}\n")
                                 sys.stderr.write(f"      Reason: {reason}\n")
+                        if _pdf_selections:
+                            sys.stderr.write(
+                                f"  Warning: a PDF attachment was selected as full text "
+                                f"for {len(_pdf_selections)} item(s):\n"
+                            )
+                            for name, used_cache in _pdf_selections[:10]:
+                                if used_cache:
+                                    detail = "Zotero extracted-text cache"
+                                else:
+                                    page_cap = (
+                                        f"{pdf_max_pages} pages"
+                                        if pdf_max_pages is not None
+                                        else "no configured page cap"
+                                    )
+                                    detail = f"direct extraction; configured cap: {page_cap}"
+                                sys.stderr.write(f"    - {name} ({detail})\n")
+                            if len(_pdf_selections) > 10:
+                                sys.stderr.write(
+                                    f"    ... and {len(_pdf_selections) - 10} more\n"
+                                )
                         if _deferred_attachments:
                             sys.stderr.write(
                                 f"  Warning: deferred {len(_deferred_attachments)} item(s) "

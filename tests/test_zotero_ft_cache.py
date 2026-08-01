@@ -19,9 +19,8 @@ Two fixes here:
 
 from pathlib import Path
 
-import pytest
-
 from conftest import skip_on_ci
+
 from zotero_mcp.local_db import LocalZoteroReader
 
 
@@ -77,6 +76,11 @@ def test_zotero_ft_cache_short_circuits_pdf_extraction(tmp_path):
     text, source = result
     assert "Full body text" in text
     assert source == "zotero-cache"
+    assert reader.last_extraction_details == {
+        "attachment_key": "ABCDEFGH",
+        "is_pdf": True,
+        "used_zotero_cache": True,
+    }
 
 
 @skip_on_ci
@@ -129,6 +133,11 @@ def test_storage_scan_recovers_from_renamed_pdf(tmp_path):
     assert text == "extracted via scan fallback"
     assert source == "pdf"
     assert captured["path"] == on_disk
+    assert reader.last_extraction_details == {
+        "attachment_key": "RENAMED1",
+        "is_pdf": True,
+        "used_zotero_cache": False,
+    }
 
 
 @skip_on_ci

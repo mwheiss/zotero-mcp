@@ -918,6 +918,7 @@ class LocalZoteroReader:
         attachment's storage folder for a content-type-matching file before
         giving up (#291, #265).
         """
+        self.last_extraction_details: dict[str, Any] | None = None
         metadata = self._get_attachment_selection_metadata(item_id)
         candidates = []
         for index, (key, path, ctype) in enumerate(
@@ -1208,6 +1209,11 @@ class LocalZoteroReader:
                 elif is_pdf(candidate):
                     cached = self._read_zotero_ft_cache(candidate.key)
                     if cached:
+                        self.last_extraction_details = {
+                            "attachment_key": candidate.key,
+                            "is_pdf": True,
+                            "used_zotero_cache": True,
+                        }
                         return cached, "zotero-cache"
                     if not resolved or not resolved.exists():
                         continue
@@ -1224,11 +1230,21 @@ class LocalZoteroReader:
                     text = self._extract_text_from_file(resolved)
 
                 if text == _EXTRACTION_TIMEOUT:
+                    self.last_extraction_details = {
+                        "attachment_key": candidate.key,
+                        "is_pdf": is_pdf(candidate),
+                        "used_zotero_cache": False,
+                    }
                     return _EXTRACTION_TIMEOUT, "timeout"
                 if text:
                     if source == "file" and resolved:
                         suffix = resolved.suffix.lower()
                         source = "html" if suffix in {".html", ".htm"} else "file"
+                    self.last_extraction_details = {
+                        "attachment_key": candidate.key,
+                        "is_pdf": is_pdf(candidate),
+                        "used_zotero_cache": False,
+                    }
                     return text, source
         return None
 
