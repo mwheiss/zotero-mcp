@@ -130,6 +130,7 @@ def test_mcp_tool_description_does_not_disclose_confirmation_phrase():
 
 def test_mcp_force_rebuild_accepts_exact_confirmation(monkeypatch):
     captured = {}
+    factory_args = {}
 
     class FakeSearch:
         def update_database(self, **kwargs):
@@ -147,7 +148,7 @@ def test_mcp_force_rebuild_accepts_exact_confirmation(monkeypatch):
     monkeypatch.setattr(
         semantic_search,
         "create_semantic_search",
-        lambda _config_path: FakeSearch(),
+        lambda _config_path, **kwargs: factory_args.update(kwargs) or FakeSearch(),
     )
     monkeypatch.setattr(search_tools._utils, "is_local_mode", lambda: True)
 
@@ -159,11 +160,13 @@ def test_mcp_force_rebuild_accepts_exact_confirmation(monkeypatch):
 
     assert captured["force_full_rebuild"] is True
     assert captured["fulltext"] is False
+    assert factory_args["allow_embedding_mismatch"] is True
     assert "# Database Update Results" in result
 
 
 def test_mcp_incremental_update_needs_no_confirmation(monkeypatch):
     captured = {}
+    factory_args = {}
 
     class FakeSearch:
         def update_database(self, **kwargs):
@@ -173,7 +176,7 @@ def test_mcp_incremental_update_needs_no_confirmation(monkeypatch):
     monkeypatch.setattr(
         semantic_search,
         "create_semantic_search",
-        lambda _config_path: FakeSearch(),
+        lambda _config_path, **kwargs: factory_args.update(kwargs) or FakeSearch(),
     )
     monkeypatch.setattr(search_tools._utils, "is_local_mode", lambda: True)
 
@@ -181,4 +184,5 @@ def test_mcp_incremental_update_needs_no_confirmation(monkeypatch):
 
     assert captured["force_full_rebuild"] is False
     assert captured["fulltext"] is False
+    assert factory_args["allow_embedding_mismatch"] is False
     assert "# Database Update Results" in result
