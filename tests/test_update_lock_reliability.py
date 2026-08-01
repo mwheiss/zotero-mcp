@@ -61,6 +61,19 @@ def test_acquire_lock_writes_pid(tmp_path, monkeypatch):
             assert lock.read_text().strip() == str(os.getpid())
 
 
+@skip_on_ci
+def test_lock_contender_preserves_holder_pid(tmp_path, monkeypatch):
+    lock = tmp_path / "update.lock"
+    monkeypatch.delenv("ZOTERO_MCP_FORCE_UPDATE", raising=False)
+
+    with semantic_search._acquire_update_lock(lock) as first_acquired:
+        assert first_acquired is True
+        holder_pid = lock.read_text().strip()
+        with semantic_search._acquire_update_lock(lock) as second_acquired:
+            assert second_acquired is False
+        assert lock.read_text().strip() == holder_pid == str(os.getpid())
+
+
 def test_rerank_with_scores_orders_and_scores(monkeypatch):
     rr = semantic_search.CrossEncoderReranker.__new__(semantic_search.CrossEncoderReranker)
 

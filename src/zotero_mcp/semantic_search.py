@@ -265,7 +265,9 @@ def _acquire_update_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = None
     try:
-        fd = open(lock_path, "w")
+        # Do not truncate before acquiring the flock: a losing contender must
+        # preserve the current holder's PID for diagnostics.
+        fd = open(lock_path, "a+")
         try:
             fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
