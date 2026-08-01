@@ -219,6 +219,58 @@ def test_real_chroma_metadata_update_preserves_document_and_vector(tmp_path):
     assert after["metadatas"] == [{"title": "New"}]
 
 
+def test_item_metadata_merge_preserves_fulltext_chunk_fields(tmp_path):
+    raw_client = chroma_client.chromadb.PersistentClient(
+        path=str(tmp_path / "chroma-item-merge")
+    )
+    collection = raw_client.create_collection(
+        "item_metadata_merge",
+        metadata={"hnsw:space": "cosine"},
+    )
+    collection.add(
+        ids=["ITEM#0", "ITEM#1"],
+        documents=["first body passage", "second body passage"],
+        metadatas=[
+            {
+                "parent_item_key": "ITEM",
+                "has_fulltext": True,
+                "chunk_index": 0,
+                "title": "Old",
+            },
+            {
+                "parent_item_key": "ITEM",
+                "has_fulltext": True,
+                "chunk_index": 1,
+                "title": "Old",
+            },
+        ],
+        embeddings=[[0.25, 0.75], [0.5, 0.5]],
+    )
+    before = collection.get(
+        ids=["ITEM#0", "ITEM#1"],
+        include=["documents", "metadatas", "embeddings"],
+    )
+    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
+    client.client = raw_client
+    client.collection = collection
+
+    updated = client.update_item_metadata("ITEM", {"title": "New"})
+
+    after = collection.get(
+        ids=["ITEM#0", "ITEM#1"],
+        include=["documents", "metadatas", "embeddings"],
+    )
+    assert updated == 2
+    assert after["documents"] == before["documents"]
+    assert after["embeddings"].tolist() == before["embeddings"].tolist()
+    assert [metadata["title"] for metadata in after["metadatas"]] == [
+        "New",
+        "New",
+    ]
+    assert all(metadata["has_fulltext"] is True for metadata in after["metadatas"])
+    assert [metadata["chunk_index"] for metadata in after["metadatas"]] == [0, 1]
+
+
 def test_distance_conversion_uses_cosine_distance():
     client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
 

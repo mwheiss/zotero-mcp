@@ -2,6 +2,7 @@
 
 import json
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,12 +18,14 @@ from zotero_mcp import semantic_search
 class FakeChromaClient:
     """Minimal ChromaClient stand-in that records operations for assertions."""
 
-    def __init__(self, preloaded_ids=None):
+    def __init__(self, preloaded_ids=None, preloaded_metadata=None):
         self.embedding_max_tokens = 8000
         self._ids = set(preloaded_ids or [])
         self.added = []  # list of (docs, metas, ids)
         self.deleted = []  # list of ids deleted
         self.reset_calls = 0
+        self.metadata_by_key = dict(preloaded_metadata or {})
+        self.metadata_updates = []
 
     def truncate_text(self, text, max_tokens=None):
         return text[:4000]
@@ -37,7 +40,16 @@ class FakeChromaClient:
         return {"count": len(self._ids)}
 
     def get_document_metadata(self, doc_id):
-        return None
+        return self.metadata_by_key.get(doc_id)
+
+    def update_item_metadata(self, item_key, updates):
+        if item_key not in self._ids:
+            return 0
+        existing = dict(self.metadata_by_key.get(item_key, {}))
+        existing.update(updates)
+        self.metadata_by_key[item_key] = existing
+        self.metadata_updates.append((item_key, dict(updates)))
+        return 1
 
     def upsert_documents(self, documents, metadatas, ids):
         self.added.append((list(documents), list(metadatas), list(ids)))
@@ -70,6 +82,7 @@ class FakeZoteroClient:
         self.current_library_version = 0
         self.current_versions_error = None
         self.new_fulltext_error = None
+        self.deleted_state = {"items": []}
         # Pagination helper
         self.items_order = []
         # Recording calls for assertions
@@ -126,6 +139,10 @@ class FakeZoteroClient:
         if self.new_fulltext_error:
             raise self.new_fulltext_error
         return {k: v for k, v in self.fulltext_versions_state.items() if v > since}
+
+    def deleted(self, since):
+        self.calls.append(("deleted", since))
+        return self.deleted_state
 
     def last_modified_version(self, **kwargs):
         self.calls.append(("last_modified_version",))
@@ -229,6 +246,35 @@ def test_get_changed_items_filters_out_attachments_and_notes(monkeypatch):
     search = _build_search(monkeypatch, zot, FakeChromaClient())
     changed, _ = search._get_changed_items_from_api(since_version=0)
     assert [c["key"] for c in changed] == ["P1"]
+
+
+def test_attachment_only_change_reconciles_parent(monkeypatch):
+    parent = _paper("P1")
+    attachment = _paper("ATT1", item_type="attachment")
+    attachment["data"]["parentItem"] = "P1"
+    zot = FakeZoteroClient()
+    zot.load_scenario([parent, attachment], library_version=8)
+    zot.versions_state = {"P1": 3, "ATT1": 8}
+    search = _build_search(monkeypatch, zot, FakeChromaClient())
+
+    changed, _ = search._get_changed_items_from_api(since_version=5)
+
+    assert [item["key"] for item in changed] == ["P1"]
+
+
+def test_deleted_attachment_reconciles_parent(monkeypatch):
+    parent = _paper("P1")
+    attachment = _paper("ATT1", item_type="attachment")
+    attachment["data"].update({"parentItem": "P1", "deleted": True})
+    zot = FakeZoteroClient()
+    zot.load_scenario([parent, attachment], library_version=8)
+    zot.versions_state = {"P1": 3}
+    zot.deleted_state = {"items": ["ATT1"]}
+    search = _build_search(monkeypatch, zot, FakeChromaClient())
+
+    changed, _ = search._get_changed_items_from_api(since_version=5)
+
+    assert [item["key"] for item in changed] == ["P1"]
 
 
 # --------- Integration tests: update_database orchestration ----------
@@ -370,7 +416,7 @@ def test_update_database_default_mode_skips_api_fulltext(monkeypatch, tmp_path):
     assert all("this should NOT appear" not in document for document in indexed_documents)
 
 
-def test_fulltext_mode_change_warns_without_rebuilding_unchanged_items(
+def test_metadata_only_noop_keeps_fulltext_index_state(
     monkeypatch, tmp_path, capsys
 ):
     config_path = _write_config(
@@ -396,9 +442,188 @@ def test_fulltext_mode_change_warns_without_rebuilding_unchanged_items(
     assert chroma.reset_calls == 0
     assert not any(c[0] == "fulltext_item" for c in zot.calls)
     assert chroma.added == []
-    assert "will not re-embed unchanged items" in capsys.readouterr().err
+    assert "full-text mode" not in capsys.readouterr().err
     saved = json.loads(open(config_path).read())
     assert saved["semantic_search"]["indexed_fulltext"] is True
+
+
+def test_metadata_change_preserves_existing_fulltext_vectors(monkeypatch, tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        extra={
+            "last_sync_version": 5,
+            "fulltext": False,
+            "indexed_fulltext": True,
+        },
+    )
+    changed = _paper("A", title="Revised title", version=8)
+    changed["data"]["dateModified"] = "2026-08-01T00:00:00Z"
+    zot = FakeZoteroClient()
+    zot.load_scenario([changed], library_version=8)
+    zot.versions_state = {"A": 8}
+    chroma = FakeChromaClient(
+        preloaded_ids=["A"],
+        preloaded_metadata={
+            "A": {
+                "has_fulltext": True,
+                "fulltext_source": "betterissa-indexing",
+                "attachment_signature": "same",
+            }
+        },
+    )
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    stats = search.update_database()
+
+    assert chroma.added == []
+    assert chroma.deleted == []
+    assert chroma.metadata_updates[0][0] == "A"
+    assert chroma.metadata_by_key["A"]["title"] == "Revised title"
+    assert chroma.metadata_by_key["A"]["has_fulltext"] is True
+    assert stats["preserved_fulltext_items"] == 1
+
+
+def test_complete_fulltext_enrichment_promotes_index_state(monkeypatch, tmp_path, capsys):
+    config_path = _write_config(
+        tmp_path,
+        extra={
+            "last_sync_version": 5,
+            "fulltext": False,
+            "indexed_fulltext": False,
+        },
+    )
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("A")], library_version=8)
+    chroma = FakeChromaClient(preloaded_ids=["A"])
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+    monkeypatch.setattr(search, "_get_items_from_source", lambda **kwargs: [])
+    monkeypatch.setattr(
+        search, "_verify_local_snapshot_version", lambda version: version
+    )
+
+    search.update_database(fulltext=True)
+
+    assert "full-text mode" not in capsys.readouterr().err
+    saved = json.loads(open(config_path).read())
+    assert saved["semantic_search"]["indexed_fulltext"] is True
+
+
+def test_metadata_first_update_downgrades_when_source_was_deleted(
+    monkeypatch, tmp_path
+):
+    class Reader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_item_by_key(self, key):
+            return SimpleNamespace(item_id=1)
+
+        def get_fulltext_meta_for_item(self, item_id):
+            return [["STALE", "storage:page.html", "text/html"]]
+
+        def get_attachment_signature(self, item_id, allowed_attachment_keys):
+            assert allowed_attachment_keys == set()
+            return "empty-signature"
+
+        def extract_fulltext_for_item(self, item_id, allowed_attachment_keys):
+            assert allowed_attachment_keys == set()
+            return None
+
+    config_path = _write_config(tmp_path)
+    zot = FakeZoteroClient()
+    item = _paper("A")
+    zot.load_scenario([item], children={"A": []}, library_version=8)
+    chroma = FakeChromaClient(
+        preloaded_ids=["A"],
+        preloaded_metadata={
+            "A": {
+                "has_fulltext": True,
+                "attachment_signature": "old-signature",
+            }
+        },
+    )
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+    monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
+    monkeypatch.setattr(
+        semantic_search, "LocalZoteroReader", lambda **kwargs: Reader()
+    )
+
+    remaining, preserved_items, _records, complete = (
+        search._maintain_existing_fulltext([item])
+    )
+
+    assert complete is True
+    assert preserved_items == 0
+    assert len(remaining) == 1
+    assert remaining[0]["data"]["fulltext"] == ""
+    assert remaining[0]["data"]["fulltext_attempted"] is True
+    assert (
+        remaining[0]["data"]["fulltextError"]
+        == "No candidate full-text attachment was available."
+    )
+
+
+def test_metadata_first_update_keeps_unchanged_fulltext(monkeypatch, tmp_path):
+    class Reader:
+        extract_calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_item_by_key(self, key):
+            return SimpleNamespace(item_id=1)
+
+        def get_fulltext_meta_for_item(self, item_id):
+            return [["ATT1", "storage:paper.pdf", "application/pdf"]]
+
+        def get_attachment_signature(self, item_id, allowed_attachment_keys):
+            return "same-signature"
+
+        def extract_fulltext_for_item(self, item_id, allowed_attachment_keys):
+            self.extract_calls += 1
+            return ("should not be extracted", "pdf")
+
+    attachment = _paper("ATT1", item_type="attachment")
+    attachment["data"]["parentItem"] = "A"
+    zot = FakeZoteroClient()
+    item = _paper("A", title="Updated metadata title")
+    zot.load_scenario([item], children={"A": [attachment]}, library_version=8)
+    chroma = FakeChromaClient(
+        preloaded_ids=["A"],
+        preloaded_metadata={
+            "A": {
+                "has_fulltext": True,
+                "attachment_signature": "same-signature",
+            }
+        },
+    )
+    search = _build_search(
+        monkeypatch,
+        zot,
+        chroma,
+        config_path=_write_config(tmp_path),
+    )
+    reader = Reader()
+    monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
+    monkeypatch.setattr(
+        semantic_search, "LocalZoteroReader", lambda **kwargs: reader
+    )
+
+    remaining, preserved_items, preserved_records, complete = (
+        search._maintain_existing_fulltext([item])
+    )
+
+    assert remaining == []
+    assert complete is True
+    assert preserved_items == preserved_records == 1
+    assert reader.extract_calls == 0
+    assert chroma.metadata_by_key["A"]["title"] == "Updated metadata title"
 
 
 def test_content_contract_change_warns_without_automatic_rebuild(

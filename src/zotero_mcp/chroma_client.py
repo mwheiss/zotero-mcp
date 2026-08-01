@@ -841,6 +841,38 @@ class ChromaClient:
             logger.error("Error updating document metadata: %s", e)
             raise
 
+    def update_item_metadata(
+        self,
+        item_key: str,
+        updates: dict[str, Any],
+    ) -> int:
+        """Merge item-level metadata into every existing record for an item.
+
+        Documents, embeddings, full-text provenance, and chunk coordinates are
+        preserved. This lets a metadata-only Zotero sync refresh result fields
+        without falsely treating the absence of extracted text in that run as
+        evidence that previously indexed full text was removed.
+        """
+        ids = self.get_item_chunk_ids(item_key)
+        ids.update(self.get_existing_ids([item_key]))
+        if not ids:
+            return 0
+
+        ordered_ids = sorted(ids)
+        records = self.get_records(ordered_ids)
+        update_ids = []
+        merged_metadatas = []
+        for doc_id in ordered_ids:
+            record = records.get(doc_id)
+            if not record or not isinstance(record.get("metadata"), dict):
+                continue
+            metadata = dict(record["metadata"])
+            metadata.update(updates)
+            update_ids.append(doc_id)
+            merged_metadatas.append(metadata)
+        self.update_metadatas(update_ids, merged_metadatas)
+        return len(update_ids)
+
     def search(self,
                query_texts: list[str],
                n_results: int = 10,

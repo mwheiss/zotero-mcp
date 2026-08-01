@@ -795,7 +795,7 @@ class ZoteroSemanticSearch:
             return 0
 
     def _load_indexed_fulltext(self) -> bool | None:
-        """Return the full-text mode used for the last complete update."""
+        """Return whether the completed index contains maintained full text."""
         if not self.config_path or not os.path.exists(self.config_path):
             return None
         try:
@@ -1760,6 +1760,7 @@ class ZoteroSemanticSearch:
             callers must skip deletion in that case.
         """
         logger.info(f"Fetching changed items since library version {since_version}...")
+        self._last_api_attachment_keys_by_parent = None
         try:
             changed_versions = self.zotero_client.item_versions(since=since_version) or {}
         except Exception as e:
@@ -1767,6 +1768,18 @@ class ZoteroSemanticSearch:
 
         discovery_complete = True
         changed_keys = set(changed_versions.keys())
+        deleted_method = getattr(self.zotero_client, "deleted", None)
+        if callable(deleted_method):
+            try:
+                deleted = deleted_method(since=since_version) or {}
+                changed_keys.update(deleted.get("items", []))
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch deletions since version %s: %s",
+                    since_version,
+                    e,
+                )
+                discovery_complete = False
 
         try:
             current_versions = self.zotero_client.item_versions() or {}
@@ -1779,7 +1792,8 @@ class ZoteroSemanticSearch:
         if not changed_keys:
             return [], current_keys if discovery_complete else None
 
-        changed_items: list[dict[str, Any]] = []
+        changed_items_by_key: dict[str, dict[str, Any]] = {}
+        changed_parent_keys: set[str] = set()
         for key in changed_keys:
             try:
                 item = self.zotero_client.item(key)
@@ -1792,11 +1806,36 @@ class ZoteroSemanticSearch:
             item_type = item.get("data", {}).get("itemType")
             # Don't index attachments/notes as standalone entries; only
             # top-level research items participate in semantic search.
-            if item_type in {"attachment", "note", "annotation"}:
+            if item_type == "attachment":
+                if parent_key := item.get("data", {}).get("parentItem"):
+                    changed_parent_keys.add(parent_key)
                 continue
-            changed_items.append(item)
+            if item.get("data", {}).get("deleted", False):
+                continue
+            if item_type in {"note", "annotation"}:
+                continue
+            changed_items_by_key[key] = item
 
-        return changed_items, current_keys if discovery_complete else None
+        # Attachment changes do not reliably bump the parent item's version.
+        # Reconcile the parent so an existing full-text record can be refreshed
+        # or downgraded when its selected source changes or is deleted.
+        for parent_key in changed_parent_keys - changed_items_by_key.keys():
+            try:
+                parent = self.zotero_client.item(parent_key)
+            except Exception as e:
+                logger.debug(
+                    "item(%s) failed while resolving changed attachment parent: %s",
+                    parent_key,
+                    e,
+                )
+                discovery_complete = False
+                continue
+            if parent:
+                changed_items_by_key[parent_key] = parent
+
+        return list(changed_items_by_key.values()), (
+            current_keys if discovery_complete else None
+        )
 
     def _verify_local_snapshot_version(self, target_sync_version: int) -> int | None:
         """Decide whether the local sqlite snapshot supports promoting the
@@ -1878,6 +1917,224 @@ class ZoteroSemanticSearch:
                 self.chroma_client.delete_documents([key])
         return len(to_delete_keys)
 
+    def _maintain_existing_fulltext(
+        self,
+        items: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int, int, bool]:
+        """Maintain already-enriched items during a metadata-first update.
+
+        Unchanged attachment signatures preserve documents and vectors while
+        refreshing Zotero metadata. Changed signatures trigger extraction and
+        normal payload-hash reconciliation, which may upgrade, refresh, or
+        legitimately downgrade the item if its source disappeared.
+        """
+        remaining = []
+        preserved_items = 0
+        preserved_records = 0
+        snapshot_complete = True
+        update_item_metadata = getattr(
+            self.chroma_client, "update_item_metadata", None
+        )
+        if not callable(update_item_metadata):
+            return items, 0, 0, True
+
+        def preserve(item: dict[str, Any]) -> bool:
+            nonlocal preserved_items, preserved_records
+            updated_records = update_item_metadata(
+                item.get("key", ""),
+                self._create_metadata(item),
+            )
+            if not updated_records:
+                return False
+            preserved_items += 1
+            preserved_records += updated_records
+            return True
+
+        fulltext_items = []
+        for item in items:
+            item_key = item.get("key", "")
+            existing = (
+                self.chroma_client.get_document_metadata(item_key)
+                if item_key
+                else None
+            )
+            if existing and existing.get("has_fulltext") is True:
+                fulltext_items.append((item, existing))
+            else:
+                remaining.append(item)
+
+        if not fulltext_items:
+            return remaining, 0, 0, True
+
+        # Without local attachment access, absence of full text in the API item
+        # is not evidence of removal. Preserve the best known representation.
+        if not is_local_mode():
+            for item, _existing in fulltext_items:
+                if not preserve(item):
+                    remaining.append(item)
+            return remaining, preserved_items, preserved_records, True
+
+        pdf_max_pages = None
+        pdf_timeout = 30
+        zotero_db_path = self.db_path
+        try:
+            if self.config_path and os.path.exists(self.config_path):
+                with open(self.config_path) as config_file:
+                    semantic_config = json.load(config_file).get(
+                        "semantic_search", {}
+                    )
+                extraction_config = semantic_config.get("extraction", {})
+                pdf_max_pages = extraction_config.get("pdf_max_pages")
+                pdf_timeout = extraction_config.get("pdf_timeout", 30)
+                if not zotero_db_path:
+                    zotero_db_path = semantic_config.get("zotero_db_path")
+        except Exception:
+            pass
+
+        downgraded = []
+        truncated_pdfs = []
+        with (
+            suppress_stdout(),
+            LocalZoteroReader(
+                db_path=zotero_db_path,
+                pdf_max_pages=pdf_max_pages,
+                pdf_timeout=pdf_timeout,
+            ) as reader,
+        ):
+            for item, existing in fulltext_items:
+                item_key = item.get("key", "")
+                local_item = reader.get_item_by_key(item_key)
+                if local_item is None:
+                    snapshot_complete = False
+                    if not preserve(item):
+                        remaining.append(item)
+                    continue
+
+                try:
+                    if self._last_api_attachment_keys_by_parent is not None:
+                        api_attachment_keys = set(
+                            self._last_api_attachment_keys_by_parent.get(
+                                item_key, set()
+                            )
+                        )
+                    else:
+                        children = self.zotero_client.children(item_key) or []
+                        api_attachment_keys = {
+                            child.get("key") or child.get("data", {}).get("key")
+                            for child in children
+                            if child.get("data", {}).get("itemType")
+                            == "attachment"
+                            and not child.get("data", {}).get("deleted", False)
+                        }
+                        api_attachment_keys.discard(None)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not verify attachments for %s (%s); preserving "
+                        "its existing full text and sync watermark.",
+                        item_key,
+                        exc,
+                    )
+                    snapshot_complete = False
+                    if not preserve(item):
+                        remaining.append(item)
+                    continue
+
+                local_attachment_keys = {
+                    key
+                    for key, _path, _ctype in reader.get_fulltext_meta_for_item(
+                        local_item.item_id
+                    )
+                }
+                if api_attachment_keys - local_attachment_keys:
+                    snapshot_complete = False
+                    if not preserve(item):
+                        remaining.append(item)
+                    continue
+
+                allowed_attachment_keys = (
+                    local_attachment_keys & api_attachment_keys
+                )
+                signature = reader.get_attachment_signature(
+                    local_item.item_id,
+                    allowed_attachment_keys,
+                )
+                if existing.get("attachment_signature") == signature:
+                    if not preserve(item):
+                        remaining.append(item)
+                    continue
+
+                extracted = reader.extract_fulltext_for_item(
+                    local_item.item_id,
+                    allowed_attachment_keys,
+                )
+                if (
+                    isinstance(extracted, tuple)
+                    and len(extracted) == 2
+                    and extracted[1] == "timeout"
+                ):
+                    snapshot_complete = False
+                    if not preserve(item):
+                        remaining.append(item)
+                    continue
+
+                refreshed = {
+                    **item,
+                    "data": dict(item.get("data", {})),
+                }
+                data = refreshed["data"]
+                data["attachmentKeys"] = ",".join(
+                    sorted(allowed_attachment_keys)
+                )
+                data["attachmentSignature"] = signature
+                if extracted:
+                    data["fulltext"], data["fulltextSource"] = extracted
+                    details = getattr(reader, "last_extraction_details", None) or {}
+                    page_count = details.get("page_count")
+                    page_cap = details.get("page_cap")
+                    if (
+                        isinstance(page_count, int)
+                        and isinstance(page_cap, int)
+                        and page_count > page_cap
+                    ):
+                        truncated_pdfs.append(
+                            (
+                                data.get("title") or item_key,
+                                page_count,
+                                page_cap,
+                            )
+                        )
+                else:
+                    data["fulltext"] = ""
+                    data["fulltextSource"] = ""
+                    data["fulltext_attempted"] = True
+                    data["fulltextError"] = (
+                        "No selected attachment yielded usable text."
+                        if allowed_attachment_keys
+                        else "No candidate full-text attachment was available."
+                    )
+                    downgraded.append(data.get("title") or item_key)
+                remaining.append(refreshed)
+
+        if downgraded:
+            sys.stderr.write(
+                f"\nFull-text sources were removed or became unusable for "
+                f"{len(downgraded)} changed item(s); rebuilding them from "
+                "metadata only:\n"
+            )
+            for title in downgraded[:10]:
+                sys.stderr.write(f"  - {title}\n")
+        if truncated_pdfs:
+            sys.stderr.write(
+                f"\nWarning: the PDF page cap truncated full-text extraction "
+                f"for {len(truncated_pdfs)} changed item(s):\n"
+            )
+            for title, page_count, page_cap in truncated_pdfs[:10]:
+                sys.stderr.write(
+                    f"  - {title} ({page_count} pages; indexed first {page_cap})\n"
+                )
+
+        return remaining, preserved_items, preserved_records, snapshot_complete
+
     def _prepare_index_records(
         self,
         items: list[dict[str, Any]],
@@ -1917,8 +2174,11 @@ class ZoteroSemanticSearch:
         force_full_rebuild: bool,
         target_sync_version: int | None,
         stats: dict[str, Any],
+        indexed_fulltext_state: bool | None = None,
     ) -> dict[str, Any]:
         """Prepare records and submit asynchronous OpenAI embedding batches."""
+        if indexed_fulltext_state is None:
+            indexed_fulltext_state = self._active_fulltext
         records, prepare_stats, prepared = self._prepare_index_records(
             items,
             force_rebuild=force_full_rebuild,
@@ -1960,7 +2220,7 @@ class ZoteroSemanticSearch:
             self._save_update_config(
                 last_sync_version=completed_sync_version,
                 indexed_fulltext=(
-                    self._active_fulltext
+                    indexed_fulltext_state
                     if completed_sync_version is not None
                     else None
                 ),
@@ -1982,7 +2242,7 @@ class ZoteroSemanticSearch:
             config_path=self.config_path,
             force_full_rebuild=force_full_rebuild,
             target_sync_version=target_sync_version,
-            fulltext=self._active_fulltext,
+            fulltext=indexed_fulltext_state,
             content_signature=_CONTENT_CONTRACT_SIGNATURE,
             expected_ids_by_item=expected_ids_by_item,
             metadata_only_records=[
@@ -2096,26 +2356,11 @@ class ZoteroSemanticSearch:
                 )
             except Exception:
                 collection_has_items = False
-            mode_mismatch = (
-                not force_full_rebuild
-                and collection_has_items
-                and indexed_fulltext != fulltext
+            indexed_fulltext_state = (
+                fulltext
+                if force_full_rebuild or not collection_has_items
+                else indexed_fulltext is True or fulltext
             )
-            if mode_mismatch:
-                previous = (
-                    "enabled"
-                    if indexed_fulltext is True
-                    else "disabled"
-                    if indexed_fulltext is False
-                    else "unknown"
-                )
-                requested = "enabled" if fulltext else "disabled"
-                sys.stderr.write(
-                    f"WARNING: requested full-text mode ({requested}) differs "
-                    f"from the existing index ({previous}). This incremental "
-                    "run will not re-embed unchanged items; the index may "
-                    "remain mixed until an explicitly confirmed force rebuild.\n"
-                )
             content_mismatch = (
                 not force_full_rebuild
                 and collection_has_items
@@ -2213,9 +2458,7 @@ class ZoteroSemanticSearch:
                 self.update_config["last_update"] = datetime.now().isoformat()
                 self._save_update_config(
                     last_sync_version=target_sync_version,
-                    indexed_fulltext=(
-                        None if mode_mismatch else fulltext
-                    ),
+                    indexed_fulltext=indexed_fulltext_state,
                     indexed_content_signature=(
                         None
                         if content_mismatch
@@ -2312,7 +2555,28 @@ class ZoteroSemanticSearch:
                         logger.warning(f"Local deletion pass failed: {e}")
                         target_sync_version = None
 
-            stats["total_items"] = len(all_items)
+            preserved_fulltext_items = 0
+            if not extract_fulltext and not force_full_rebuild and all_items:
+                (
+                    all_items,
+                    preserved_fulltext_items,
+                    preserved_fulltext_records,
+                    maintenance_snapshot_complete,
+                ) = self._maintain_existing_fulltext(all_items)
+                if not maintenance_snapshot_complete:
+                    target_sync_version = None
+                if preserved_fulltext_items:
+                    stats["processed_items"] += preserved_fulltext_items
+                    stats["updated_items"] += preserved_fulltext_items
+                    stats["reused_embeddings"] += preserved_fulltext_records
+                    stats["preserved_fulltext_items"] = preserved_fulltext_items
+                    sys.stderr.write(
+                        f"\nPreserved unchanged indexed full text for "
+                        f"{preserved_fulltext_items} changed item(s); "
+                        "refreshed Zotero metadata only.\n"
+                    )
+
+            stats["total_items"] = len(all_items) + preserved_fulltext_items
             logger.info(f"Found {stats['total_items']} items to process")
 
             if use_openai_batch:
@@ -2326,6 +2590,7 @@ class ZoteroSemanticSearch:
                     all_items,
                     force_full_rebuild=force_full_rebuild,
                     target_sync_version=target_sync_version,
+                    indexed_fulltext_state=indexed_fulltext_state,
                     stats=stats,
                 )
                 try:
@@ -2349,7 +2614,7 @@ class ZoteroSemanticSearch:
                 return stats
 
             # User-friendly progress reporting
-            total = stats["total_items"] = len(all_items)
+            total = len(all_items)
             try:
                 sys.stderr.write(f"\nIndexing {total} items...\n\n")
                 sys.stderr.flush()
@@ -2650,15 +2915,10 @@ class ZoteroSemanticSearch:
             self.update_config["last_update"] = datetime.now().isoformat()
             completed_sync_version = target_sync_version if stats["errors"] == 0 else None
             completed_fulltext = (
-                fulltext
+                indexed_fulltext_state
                 if stats["errors"] == 0
                 and limit is None
                 and completed_sync_version is not None
-                and (
-                    force_full_rebuild
-                    or not collection_has_items
-                    or not mode_mismatch
-                )
                 else None
             )
             completed_content_signature = (
@@ -2746,7 +3006,7 @@ class ZoteroSemanticSearch:
                 )
                 metadata = self._create_metadata(item)
                 metadata["index_layout_signature"] = self._index_layout_signature
-                metadata["index_fulltext"] = self._active_fulltext
+                metadata["index_fulltext"] = bool(fulltext)
                 metadata["index_content_signature"] = (
                     _CONTENT_CONTRACT_SIGNATURE
                 )
