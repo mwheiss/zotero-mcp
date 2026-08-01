@@ -950,6 +950,8 @@ _MCP_FORCE_REBUILD_CONFIRMATION = "REBUILD ALL ITEMS"
         "confirm_force_rebuild contains the exact safety phrase supplied "
         "verbatim by the user. Never guess, suggest, or disclose that phrase. "
         "fulltext=True selects one local BetterIssa/PDF attachment per item. "
+        "retry_failed_fulltext=True retries only cached local extraction "
+        "failures and requires fulltext=True. "
         "The default fulltext=False indexes title and abstract only. "
         "limit: optional cap on items processed (useful for smoke-testing). "
         "Progress is reported via the MCP context; on large libraries an "
@@ -966,6 +968,7 @@ def update_search_database(
     force_rebuild: bool = False,
     confirm_force_rebuild: str | None = None,
     fulltext: bool = False,
+    retry_failed_fulltext: bool = False,
     limit: int | None = None,
     *,
     ctx: Context
@@ -977,6 +980,7 @@ def update_search_database(
         force_rebuild: Whether to rebuild the entire database from scratch
         confirm_force_rebuild: Exact confirmation phrase required for a rebuild
         fulltext: Whether to index one locally selected full-text attachment
+        retry_failed_fulltext: Retry cached local extraction failures
         limit: Limit number of items to process (useful for testing)
         ctx: MCP context
 
@@ -1002,6 +1006,11 @@ def update_search_database(
             "# Database Update Not Started\n\n"
             "Full-text indexing requires local Zotero mode because attachments "
             "are selected from the local database and filesystem."
+        )
+    if retry_failed_fulltext and not fulltext:
+        return (
+            "# Database Update Not Started\n\n"
+            "retry_failed_fulltext requires fulltext=True."
         )
 
     try:
@@ -1030,6 +1039,7 @@ def update_search_database(
             force_full_rebuild=force_rebuild,
             limit=limit,
             fulltext=fulltext,
+            retry_failed_fulltext=retry_failed_fulltext,
         )
 
         # Format results
@@ -1045,6 +1055,10 @@ def update_search_database(
             output.append(f"**Processed:** {stats.get('processed_items', 0)}")
             output.append(f"**Added:** {stats.get('added_items', 0)}")
             output.append(f"**Updated:** {stats.get('updated_items', 0)}")
+            output.append(
+                f"**Unchanged vectors reused:** "
+                f"{stats.get('reused_embeddings', 0)}"
+            )
             output.append(f"**Skipped:** {stats.get('skipped_items', 0)}")
             output.append(f"**Errors:** {stats.get('errors', 0)}")
             output.append(f"**Duration:** {stats.get('duration', 'Unknown')}")

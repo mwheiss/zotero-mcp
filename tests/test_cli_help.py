@@ -45,6 +45,8 @@ def test_update_db_help_documents_fulltext_switch(monkeypatch, capsys):
     assert "--fulltext" in output
     assert "{api,local,none}" not in output
     assert "title and abstract only" in output
+    assert "--retry-failed-fulltext" in output
+    assert "does not rebuild unaffected items" in " ".join(output.split())
 
 
 def test_zotero_mcp_help_update_db_shows_batch_flags(capsys):

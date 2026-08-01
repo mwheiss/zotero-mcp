@@ -204,6 +204,8 @@ def _print_update_stats(stats: dict) -> None:
     else:
         print(f"- Added: {stats.get('added_items', 0)}")
         print(f"- Updated: {stats.get('updated_items', 0)}")
+    if stats.get("reused_embeddings"):
+        print(f"- Unchanged vectors reused: {stats['reused_embeddings']}")
     print(f"- Skipped: {stats.get('skipped_items', 0)}")
     print(f"- Errors: {stats.get('errors', 0)}")
     print(f"- Duration: {stats.get('duration', 'Unknown')}")
@@ -356,6 +358,14 @@ def main():
         help=(
             "Index one locally selected BetterIssa/PDF attachment per item "
             "(default: title and abstract only)"
+        ),
+    )
+    update_db_parser.add_argument(
+        "--retry-failed-fulltext",
+        action="store_true",
+        help=(
+            "Retry items whose previous local full-text extraction failed "
+            "(requires --fulltext; does not rebuild unaffected items)"
         ),
     )
     update_db_parser.add_argument("--config-path",
@@ -551,6 +561,12 @@ def main():
         if args.force_rebuild and not _confirm_force_rebuild():
             print("Force rebuild cancelled.")
             sys.exit(0)
+        if args.retry_failed_fulltext and not args.fulltext:
+            print(
+                "Error: --retry-failed-fulltext requires --fulltext.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
         # Setup Zotero environment variables
         setup_zotero_environment()
@@ -600,6 +616,7 @@ def main():
                 fulltext=args.fulltext,
                 use_openai_batch=args.openai_batch,
                 embedding_concurrency=args.embedding_concurrency,
+                retry_failed_fulltext=args.retry_failed_fulltext,
             )
 
             _print_update_stats(stats)

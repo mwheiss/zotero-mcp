@@ -129,6 +129,14 @@ def _embedding_content_hash(document: str) -> str:
     return hashlib.sha256(document.encode("utf-8")).hexdigest()
 
 
+def _publication_year(value: str | None) -> str:
+    """Extract a display year from Zotero's free-form publication date."""
+    if not value:
+        return ""
+    match = re.search(r"(?<!\d)(?:1\d{3}|20\d{2}|21\d{2})(?!\d)", value)
+    return match.group(0) if match else ""
+
+
 def _display_width(text: str) -> int:
     """Return the number of terminal columns occupied by *text*."""
     width = 0
@@ -943,6 +951,8 @@ class ZoteroSemanticSearch:
             # Extraction was attempted but failed (timeout, empty, etc.)
             # Mark so we don't retry on every incremental update
             metadata["has_fulltext"] = "failed"
+            if data.get("fulltextError"):
+                metadata["fulltext_error"] = data["fulltextError"]
 
         # Record the attachment-key set (local mode only) so update runs can
         # retry a "failed" item once its attachments change — attaching a file
@@ -979,6 +989,7 @@ class ZoteroSemanticSearch:
         fulltext: bool = False,
         chroma_client: ChromaClient | None = None,
         force_rebuild: bool = False,
+        retry_failed_fulltext: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Get canonical API metadata with optional local full text.
@@ -1008,6 +1019,7 @@ class ZoteroSemanticSearch:
                 extract_fulltext=True,
                 chroma_client=chroma_client,
                 force_rebuild=force_rebuild,
+                retry_failed_fulltext=retry_failed_fulltext,
             )
         return self._get_items_from_api(limit)
 
@@ -1017,6 +1029,7 @@ class ZoteroSemanticSearch:
         extract_fulltext: bool = False,
         chroma_client: ChromaClient | None = None,
         force_rebuild: bool = False,
+        retry_failed_fulltext: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Get items from local Zotero database.
@@ -1169,8 +1182,8 @@ class ZoteroSemanticSearch:
                     _extraction_stopped = False  # Set True when circuit breaker trips
 
                     total_local = len(local_items)
-                    _skipped_pdfs = []  # Collect timeout/error names for summary
-                    _skipped_failed = []  # Items skipped because extraction previously failed
+                    _failed_extractions: list[tuple[str, str]] = []
+                    _skipped_failed: list[tuple[str, str]] = []
 
                     # Show startup note
                     try:
@@ -1195,15 +1208,16 @@ class ZoteroSemanticSearch:
                         # Build display string: Author (Year) — Title
                         title = getattr(it, "title", "") or ""
                         creators = getattr(it, "creators", "") or ""
-                        date = getattr(it, "date_added", "") or ""
+                        canonical_data = api_metadata_by_key.get(
+                            it.key, {}
+                        ).get("data", {})
+                        publication_date = canonical_data.get("date", "")
                         first_author = ""
                         if creators:
                             first_author = creators.split(";")[0].split(",")[0].strip()
                             if first_author:
                                 first_author += " et al." if ";" in creators else ""
-                        year = ""
-                        if date and len(date) >= 4:
-                            year = date[:4]
+                        year = _publication_year(publication_date)
                         citation = ""
                         if first_author and year:
                             citation = f"{first_author} ({year}) — "
@@ -1258,9 +1272,6 @@ class ZoteroSemanticSearch:
                                 chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
                                 local_has_fulltext = bool(att_keys)
                                 chroma_date = existing_metadata.get("date_modified", "")
-                                canonical_data = api_metadata_by_key.get(
-                                    it.key, {}
-                                ).get("data", {})
                                 item_date = (
                                     canonical_data.get("dateModified")
                                     or getattr(it, "date_modified", "")
@@ -1279,22 +1290,37 @@ class ZoteroSemanticSearch:
                                 # replaced bad PDF and a PDF newly attached to an item that
                                 # was indexed metadata-only)
                                 if chroma_has_fulltext == "failed":
-                                    stored_att_keys = existing_metadata.get("attachment_keys")
-                                    attachment_unchanged = (
-                                        stored_signature == attachment_signature
-                                        if stored_signature is not None
-                                        else stored_att_keys == att_keys
-                                    )
+                                    if retry_failed_fulltext:
+                                        updated_existing += 1
+                                        attachment_unchanged = False
+                                    else:
+                                        stored_att_keys = existing_metadata.get(
+                                            "attachment_keys"
+                                        )
+                                        attachment_unchanged = (
+                                            stored_signature == attachment_signature
+                                            if stored_signature is not None
+                                            else stored_att_keys == att_keys
+                                        )
                                     if (
-                                        not metadata_changed
+                                        not retry_failed_fulltext
+                                        and not metadata_changed
                                         and attachment_unchanged
                                         and not layout_changed
                                     ):
                                         # Nothing changed since the failure — don't retry
                                         should_extract = False
                                         skipped_existing += 1
-                                        _skipped_failed.append(display or f"item {it.key}")
-                                    else:
+                                        reason = existing_metadata.get(
+                                            "fulltext_error"
+                                        ) or (
+                                            "The previous attempt returned no usable text; "
+                                            "a detailed reason was not recorded."
+                                        )
+                                        _skipped_failed.append(
+                                            (display or f"item {it.key}", reason)
+                                        )
+                                    elif not retry_failed_fulltext:
                                         # Item or its attachments changed since last
                                         # failure (legacy records without attachment_keys
                                         # retry once, then converge) — retry
@@ -1332,7 +1358,13 @@ class ZoteroSemanticSearch:
                                 text = reader.extract_fulltext_for_item(it.item_id)
                                 # Circuit breaker: stop PDF extraction after consecutive timeouts
                                 if isinstance(text, tuple) and len(text) == 2 and text[1] == "timeout":
-                                    _skipped_pdfs.append(display or f"item {it.key}")
+                                    failure_reason = (
+                                        f"PDF extraction timed out after {pdf_timeout} seconds."
+                                    )
+                                    it._fulltext_error = failure_reason
+                                    _failed_extractions.append(
+                                        (display or f"item {it.key}", failure_reason)
+                                    )
                                     consecutive_timeouts += 1
                                     if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
                                         logger.warning(
@@ -1363,6 +1395,17 @@ class ZoteroSemanticSearch:
                                     else:
                                         # Extraction returned empty — mark as attempted
                                         it._fulltext_attempted = True
+                                        failure_reason = (
+                                            "No selected attachment yielded usable text. "
+                                            "The file may be missing, unsupported, empty, "
+                                            "image-only, encrypted, or corrupt."
+                                            if att_keys
+                                            else "No candidate full-text attachment was available."
+                                        )
+                                        it._fulltext_error = failure_reason
+                                        _failed_extractions.append(
+                                            (display or f"item {it.key}", failure_reason)
+                                        )
                             extracted += 1
                             items_to_process.append(it)
 
@@ -1379,21 +1422,32 @@ class ZoteroSemanticSearch:
                             parts.append(f"{skipped_existing} already up to date")
                         sys.stderr.write(", ".join(parts) + "\n")
                         if updated_existing > 0:
-                            sys.stderr.write(f"  ({updated_existing} items updated with new fulltext)\n")
-                        if _skipped_pdfs:
-                            sys.stderr.write(f"  Skipped {len(_skipped_pdfs)} PDF(s) (timed out):\n")
-                            for name in _skipped_pdfs:
+                            sys.stderr.write(
+                                f"  ({updated_existing} existing items selected "
+                                "for full-text refresh)\n"
+                            )
+                        if _failed_extractions:
+                            sys.stderr.write(
+                                f"  Full-text extraction failed for "
+                                f"{len(_failed_extractions)} item(s):\n"
+                            )
+                            for name, reason in _failed_extractions:
                                 sys.stderr.write(f"    - {name}\n")
+                                sys.stderr.write(f"      Reason: {reason}\n")
                         if _skipped_failed:
                             sys.stderr.write(
-                                f"  {len(_skipped_failed)} item(s) skipped (PDF extraction previously failed):\n"
+                                f"  {len(_skipped_failed)} item(s) not retried "
+                                "because a previous full-text extraction failed:\n"
                             )
-                            for name in _skipped_failed[:5]:  # Show first 5
+                            for name, reason in _skipped_failed[:5]:
                                 sys.stderr.write(f"    - {name}\n")
+                                sys.stderr.write(f"      Reason: {reason}\n")
                             if len(_skipped_failed) > 5:
                                 sys.stderr.write(f"    ... and {len(_skipped_failed) - 5} more\n")
                             sys.stderr.write(
-                                "  (To retry these, attach or replace the PDF, or run with --force-rebuild)\n"
+                                "  Retry only these cached failures with:\n"
+                                "    zotero-mcp update-db --fulltext "
+                                "--retry-failed-fulltext\n"
                             )
                     except Exception:
                         pass
@@ -1481,6 +1535,8 @@ class ZoteroSemanticSearch:
             signature := getattr(item, "_attachment_signature", None)
         ) is not None:
             data["attachmentSignature"] = signature
+        if (error := getattr(item, "_fulltext_error", None)) is not None:
+            data["fulltextError"] = error
         return merged
 
     def _parse_creators_string(self, creators_str: str) -> list[dict[str, str]]:
@@ -1828,6 +1884,7 @@ class ZoteroSemanticSearch:
         fulltext: bool | None = None,
         use_openai_batch: bool | None = None,
         embedding_concurrency: int = 1,
+        retry_failed_fulltext: bool = False,
     ) -> dict[str, Any]:
         """
         Update the semantic search database with Zotero items.
@@ -1843,6 +1900,8 @@ class ZoteroSemanticSearch:
             embedding_concurrency: Number of realtime OpenAI-compatible
                 embedding batches to run concurrently. ChromaDB reads and
                 writes remain sequential. Defaults to 1.
+            retry_failed_fulltext: Retry cached local full-text extraction
+                failures without rebuilding unaffected items.
 
         Returns:
             Update statistics
@@ -2088,6 +2147,7 @@ class ZoteroSemanticSearch:
                     fulltext=fulltext,
                     chroma_client=self.chroma_client if not force_full_rebuild else None,
                     force_rebuild=force_full_rebuild,
+                    retry_failed_fulltext=retry_failed_fulltext,
                 )
                 # The local-extraction scan may lag behind the API version
                 # captured above (immutable sqlite reads skip WAL contents);

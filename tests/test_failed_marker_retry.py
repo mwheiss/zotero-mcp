@@ -31,7 +31,7 @@ class FakeItem:
         self.extra = ""
         self.doi = None
         self.notes = None
-        self.creators = None
+        self.creators = "Kim, A."
         self.date_added = "2026-07-01 00:00:00"
         self.date_modified = DATE_MODIFIED
         self.fulltext = None
@@ -106,6 +106,8 @@ def _run_scan(
     *,
     attachment_signature=None,
     extract_result=("extracted text", "pdf"),
+    retry_failed_fulltext=False,
+    publication_date="1952",
 ):
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
     monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
@@ -132,6 +134,7 @@ def _run_scan(
                     "key": "ITEMKEY1",
                     "itemType": "journalArticle",
                     "title": "Calibration",
+                    "date": publication_date,
                     "dateModified": DATE_MODIFIED,
                 },
             }
@@ -139,7 +142,10 @@ def _run_scan(
     )
 
     items = search._get_items_from_source(
-        fulltext=True, chroma_client=chroma, force_rebuild=False
+        fulltext=True,
+        chroma_client=chroma,
+        force_rebuild=False,
+        retry_failed_fulltext=retry_failed_fulltext,
     )
     return items, reader
 
@@ -154,6 +160,76 @@ def test_failed_item_skipped_when_nothing_changed(monkeypatch):
     items, reader = _run_scan(monkeypatch, stored, attachments=[])
     assert items == []
     assert reader.extract_calls == 0
+
+
+def test_retry_failed_fulltext_bypasses_cached_failure(monkeypatch):
+    stored = {
+        "has_fulltext": "failed",
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "ATTKEY1",
+        "attachment_signature": "same-signature",
+    }
+    attachments = [("ATTKEY1", "storage:paper.pdf", "application/pdf")]
+
+    items, reader = _run_scan(
+        monkeypatch,
+        stored,
+        attachments,
+        attachment_signature="same-signature",
+        retry_failed_fulltext=True,
+    )
+
+    assert len(items) == 1
+    assert reader.extract_calls == 1
+    assert items[0]["data"]["fulltext"] == "extracted text"
+
+
+def test_cached_failure_summary_uses_publication_year_and_explains_retry(
+    monkeypatch,
+    capsys,
+):
+    stored = {
+        "has_fulltext": "failed",
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "",
+        "fulltext_error": "The PDF is encrypted.",
+    }
+
+    _run_scan(monkeypatch, stored, attachments=[])
+
+    output = capsys.readouterr().err
+    assert "Kim (1952)" in output
+    assert "Kim (2026)" not in output
+    assert "Reason: The PDF is encrypted." in output
+    assert "--retry-failed-fulltext" in output
+
+
+def test_new_extraction_failure_is_saved_with_actionable_reason(monkeypatch):
+    stored = {
+        "has_fulltext": "failed",
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "",
+    }
+
+    items, reader = _run_scan(
+        monkeypatch,
+        stored,
+        attachments=[],
+        extract_result=None,
+        retry_failed_fulltext=True,
+    )
+
+    assert reader.extract_calls == 1
+    assert items[0]["data"]["fulltextError"] == (
+        "No candidate full-text attachment was available."
+    )
+    metadata = semantic_search.ZoteroSemanticSearch(
+        chroma_client=FakeChromaClient({})
+    )._create_metadata(items[0])
+    assert metadata["has_fulltext"] == "failed"
+    assert metadata["fulltext_error"] == (
+        "No candidate full-text attachment was available."
+    )
 
 
 def test_failed_item_retried_when_attachment_added(monkeypatch):

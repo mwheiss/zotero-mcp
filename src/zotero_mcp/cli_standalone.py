@@ -404,6 +404,16 @@ def cmd_db(args):
     ):
         print("Force rebuild cancelled.")
         return
+    if (
+        args.subcommand == "update"
+        and getattr(args, "retry_failed_fulltext", False)
+        and not getattr(args, "fulltext", False)
+    ):
+        print(
+            "Error: --retry-failed-fulltext requires --fulltext.",
+            file=sys.stderr,
+        )
+        return
 
     from pathlib import Path
     setup_zotero_environment()
@@ -439,6 +449,9 @@ def cmd_db(args):
             limit=args.limit,
             fulltext=fulltext,
             use_openai_batch=getattr(args, "openai_batch", None),
+            retry_failed_fulltext=getattr(
+                args, "retry_failed_fulltext", False
+            ),
         )
         _print_update_stats(stats)
         if stats.get("error"):
@@ -809,6 +822,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--fulltext",
         action="store_true",
     )
+    dbu.add_argument("--retry-failed-fulltext", action="store_true")
     dbu.add_argument("--config-path")
     dbu.add_argument("--db-path")
     dbu_batch = dbu.add_mutually_exclusive_group()
