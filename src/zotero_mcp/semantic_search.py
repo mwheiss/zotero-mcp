@@ -1192,7 +1192,7 @@ class ZoteroSemanticSearch:
                     total_local = len(local_items)
                     _failed_extractions: list[tuple[str, str]] = []
                     _skipped_failed: list[tuple[str, str]] = []
-                    _pdf_selections: list[tuple[str, bool]] = []
+                    _truncated_pdfs: list[tuple[str, int, int]] = []
                     _deferred_attachments: list[tuple[str, int]] = []
 
                     # Show startup note
@@ -1449,15 +1449,18 @@ class ZoteroSemanticSearch:
                                         details = getattr(
                                             reader, "last_extraction_details", None
                                         ) or {}
-                                        selected_pdf = bool(details.get("is_pdf")) or (
-                                            getattr(it, "fulltext_source", None)
-                                            in {"pdf", "ocr-pdf"}
-                                        )
-                                        if selected_pdf:
-                                            _pdf_selections.append(
+                                        page_count = details.get("page_count")
+                                        page_cap = details.get("page_cap")
+                                        if (
+                                            isinstance(page_count, int)
+                                            and isinstance(page_cap, int)
+                                            and page_count > page_cap
+                                        ):
+                                            _truncated_pdfs.append(
                                                 (
                                                     display or f"item {it.key}",
-                                                    bool(details.get("used_zotero_cache")),
+                                                    page_count,
+                                                    page_cap,
                                                 )
                                             )
                                     else:
@@ -1502,25 +1505,19 @@ class ZoteroSemanticSearch:
                             for name, reason in _failed_extractions:
                                 sys.stderr.write(f"    - {name}\n")
                                 sys.stderr.write(f"      Reason: {reason}\n")
-                        if _pdf_selections:
+                        if _truncated_pdfs:
                             sys.stderr.write(
-                                f"  Warning: a PDF attachment was selected as full text "
-                                f"for {len(_pdf_selections)} item(s):\n"
+                                "  Warning: the PDF page cap truncated full-text "
+                                f"extraction for {len(_truncated_pdfs)} item(s):\n"
                             )
-                            for name, used_cache in _pdf_selections[:10]:
-                                if used_cache:
-                                    detail = "Zotero extracted-text cache"
-                                else:
-                                    page_cap = (
-                                        f"{pdf_max_pages} pages"
-                                        if pdf_max_pages is not None
-                                        else "no configured page cap"
-                                    )
-                                    detail = f"direct extraction; configured cap: {page_cap}"
-                                sys.stderr.write(f"    - {name} ({detail})\n")
-                            if len(_pdf_selections) > 10:
+                            for name, page_count, page_cap in _truncated_pdfs[:10]:
                                 sys.stderr.write(
-                                    f"    ... and {len(_pdf_selections) - 10} more\n"
+                                    f"    - {name} ({page_count} pages; indexed first "
+                                    f"{page_cap})\n"
+                                )
+                            if len(_truncated_pdfs) > 10:
+                                sys.stderr.write(
+                                    f"    ... and {len(_truncated_pdfs) - 10} more\n"
                                 )
                         if _deferred_attachments:
                             sys.stderr.write(

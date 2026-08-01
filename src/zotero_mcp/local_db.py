@@ -483,15 +483,7 @@ class LocalZoteroReader:
         import subprocess
         import sys
 
-        # Page limit (preserve existing fallback chain)
-        if isinstance(self.pdf_max_pages, int) and self.pdf_max_pages > 0:
-            maxpages = self.pdf_max_pages
-        else:
-            max_pages_env = os.getenv("ZOTERO_PDF_MAXPAGES")
-            try:
-                maxpages = int(max_pages_env) if max_pages_env else 10
-            except ValueError:
-                maxpages = 10
+        maxpages = self._effective_pdf_max_pages()
 
         timeout = self.pdf_timeout or 30
 
@@ -551,6 +543,33 @@ class LocalZoteroReader:
             sys.stderr.write(f"\r{' ' * 120}\r")  # Clear progress line before warning
             logger.warning(f"PDF extraction failed: {file_path.name}: {e}")
             return ""
+
+    def _effective_pdf_max_pages(self) -> int:
+        """Return the positive page cap used by direct PDF extraction."""
+        if isinstance(self.pdf_max_pages, int) and self.pdf_max_pages > 0:
+            return self.pdf_max_pages
+        max_pages_env = os.getenv("ZOTERO_PDF_MAXPAGES")
+        try:
+            configured = int(max_pages_env) if max_pages_env else 10
+        except ValueError:
+            configured = 10
+        return configured if configured > 0 else 10
+
+    @staticmethod
+    def _get_pdf_page_count(file_path: Path) -> int | None:
+        """Read a PDF's page-tree count without rendering or extracting it."""
+        try:
+            from pdfminer.pdfdocument import PDFDocument
+            from pdfminer.pdfparser import PDFParser
+            from pdfminer.pdftypes import resolve1
+
+            with file_path.open("rb") as handle:
+                document = PDFDocument(PDFParser(handle))
+                pages = resolve1(document.catalog["Pages"])
+                count = int(resolve1(pages["Count"]))
+                return count if count >= 0 else None
+        except Exception:
+            return None
 
     def _extract_text_from_html(self, file_path: Path) -> str:
         """Extract text from HTML using markitdown if available; fallback to stripping tags."""
@@ -1244,6 +1263,16 @@ class LocalZoteroReader:
                         "attachment_key": candidate.key,
                         "is_pdf": is_pdf(candidate),
                         "used_zotero_cache": False,
+                        "page_count": (
+                            self._get_pdf_page_count(resolved)
+                            if is_pdf(candidate) and resolved
+                            else None
+                        ),
+                        "page_cap": (
+                            self._effective_pdf_max_pages()
+                            if is_pdf(candidate)
+                            else None
+                        ),
                     }
                     return text, source
         return None

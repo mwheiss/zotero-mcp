@@ -19,6 +19,7 @@ Two fixes here:
 
 from pathlib import Path
 
+import pytest
 from conftest import skip_on_ci
 
 from zotero_mcp.local_db import LocalZoteroReader
@@ -137,7 +138,21 @@ def test_storage_scan_recovers_from_renamed_pdf(tmp_path):
         "attachment_key": "RENAMED1",
         "is_pdf": True,
         "used_zotero_cache": False,
+        "page_count": None,
+        "page_cap": 10,
     }
+
+
+def test_pdf_page_count_reads_page_tree(tmp_path):
+    fitz = pytest.importorskip("fitz")
+    path = tmp_path / "three-pages.pdf"
+    document = fitz.open()
+    for _ in range(3):
+        document.new_page()
+    document.save(path)
+    document.close()
+
+    assert LocalZoteroReader._get_pdf_page_count(path) == 3
 
 
 @skip_on_ci

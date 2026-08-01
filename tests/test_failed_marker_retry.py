@@ -47,6 +47,7 @@ class FakeReader:
         attachments=(),
         attachment_signature=None,
         extract_result=("extracted text", "pdf"),
+        extraction_details=None,
         **kwargs,
     ):
         self._attachments = list(attachments)
@@ -56,6 +57,7 @@ class FakeReader:
             else ",".join(sorted(row[0] for row in self._attachments))
         )
         self._extract_result = extract_result
+        self._extraction_details = extraction_details
         self.extract_calls = 0
 
     def __enter__(self):
@@ -86,6 +88,7 @@ class FakeReader:
         self.extract_calls += 1
         if allowed_attachment_keys == set():
             return None
+        self.last_extraction_details = self._extraction_details
         return self._extract_result
 
 
@@ -114,6 +117,7 @@ def _run_scan(
     *,
     attachment_signature=None,
     extract_result=("extracted text", "pdf"),
+    extraction_details=None,
     retry_failed_fulltext=False,
     publication_date="1952",
     api_attachment_keys=None,
@@ -125,6 +129,7 @@ def _run_scan(
         attachments=attachments,
         attachment_signature=attachment_signature,
         extract_result=extract_result,
+        extraction_details=extraction_details,
     )
     monkeypatch.setattr(
         semantic_search, "LocalZoteroReader", lambda *a, **kw: reader
@@ -424,16 +429,31 @@ def test_api_attachment_missing_from_snapshot_defers_item(monkeypatch, capsys):
     assert "existing index records were left unchanged" in output
 
 
-def test_pdf_selection_emits_summary_warning(monkeypatch, capsys):
+def test_pdf_over_page_cap_emits_summary_warning(monkeypatch, capsys):
     items, reader = _run_scan(
         monkeypatch,
         {},
         [("PDF1", "storage:paper.pdf", "application/pdf")],
         extract_result=("paper text", "pdf"),
+        extraction_details={"page_count": 75, "page_cap": 50},
     )
 
     assert reader.extract_calls == 1
     assert len(items) == 1
     output = capsys.readouterr().err
-    assert "Warning: a PDF attachment was selected as full text for 1 item(s)" in output
-    assert "direct extraction" in output
+    assert "PDF page cap truncated full-text extraction for 1 item(s)" in output
+    assert "75 pages; indexed first 50" in output
+
+
+def test_pdf_within_page_cap_does_not_emit_warning(monkeypatch, capsys):
+    items, reader = _run_scan(
+        monkeypatch,
+        {},
+        [("PDF1", "storage:paper.pdf", "application/pdf")],
+        extract_result=("paper text", "pdf"),
+        extraction_details={"page_count": 50, "page_cap": 50},
+    )
+
+    assert reader.extract_calls == 1
+    assert len(items) == 1
+    assert "PDF page cap" not in capsys.readouterr().err
