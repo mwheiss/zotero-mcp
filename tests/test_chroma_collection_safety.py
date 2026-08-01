@@ -94,6 +94,7 @@ def test_reset_stamps_embedding_identity(monkeypatch):
     assert created["metadata"]["zotero_mcp_embedding_identity"] == (
         "Qwen3-Embedding-8B-Q8_0"
     )
+    assert created["metadata"]["hnsw:space"] == "cosine"
 
 
 class _RecordCollection:
@@ -148,3 +149,22 @@ def test_collection_id_read_errors_are_not_treated_as_empty():
 
     with pytest.raises(OSError, match="database unavailable"):
         client.get_all_ids()
+
+
+@pytest.mark.parametrize(
+    ("metric", "distance", "expected"),
+    [
+        ("l2", 0.4, 0.8),
+        ("cosine", 0.4, 0.6),
+        ("ip", 0.4, 0.6),
+    ],
+)
+def test_distance_conversion_respects_collection_metric(
+    metric,
+    distance,
+    expected,
+):
+    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
+    client.collection = SimpleNamespace(metadata={"hnsw:space": metric})
+
+    assert client.distance_to_similarity(distance) == pytest.approx(expected)

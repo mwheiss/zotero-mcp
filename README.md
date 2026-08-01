@@ -218,6 +218,23 @@ zotero-mcp update-db --force-rebuild
 zotero-mcp db-status
 ```
 
+For an OpenAI-compatible proxy whose API model name is only an alias, declare
+the real backend identity and optional retrieval instruction in `config.json`.
+Changing `model_identity` then blocks search until an explicitly confirmed
+force rebuild, preventing vectors from different models from being mixed:
+
+```json
+{
+  "semantic_search": {
+    "embedding_config": {
+      "model_name": "api-alias",
+      "model_identity": "Qwen3-Embedding-8B-Q8_0",
+      "query_instruction": "Given a scientific literature search query, retrieve relevant passages that identify papers addressing the query"
+    }
+  }
+}
+```
+
 With `--fulltext`, each update selects the best attachment currently
 available for semantic retrieval. BetterIssa sources are preferred in this
 order: `BetterIssa indexing text`, `BetterIssa semantic document`,

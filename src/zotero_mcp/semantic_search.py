@@ -2991,7 +2991,12 @@ class ZoteroSemanticSearch:
             document = documents[i] if i < len(documents) else ""
             meta = metadatas[i] if i < len(metadatas) else {}
             passage, passage_offset = best_snippet(query, document)
-            similarity = (1 - distance) if distance is not None else 0
+            if distance is None:
+                similarity = 0
+            elif hasattr(self.chroma_client, "distance_to_similarity"):
+                similarity = self.chroma_client.distance_to_similarity(distance)
+            else:
+                similarity = 1 - distance
             meta = meta if isinstance(meta, dict) else {}
             global_start = (
                 int(meta["char_start"]) + passage_offset

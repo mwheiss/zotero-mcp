@@ -26,6 +26,17 @@ from zotero_mcp.utils import suppress_stdout
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_QWEN_QUERY_INSTRUCTION = (
+    "Given a scientific literature search query, retrieve relevant passages "
+    "that identify papers addressing the query"
+)
+
+
+def _instruct_query(text: str, instruction: str | None) -> str:
+    if not instruction:
+        return text
+    return f"Instruct: {instruction.strip()}\nQuery: {text}"
+
 
 @register_embedding_function
 class OpenAIEmbeddingFunction(EmbeddingFunction):
@@ -49,13 +60,15 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
 
     def __init__(self, model_name: str = "text-embedding-3-small", api_key: str | None = None,
                  base_url: str | None = None, request_batch_size: int | None = None,
-                 rate_limit_rps: float | None = None):
+                 rate_limit_rps: float | None = None,
+                 query_instruction: str | None = None):
         import threading
         self.model_name = model_name
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
         self.request_batch_size = int(request_batch_size) if request_batch_size else self.DEFAULT_REQUEST_BATCH_SIZE
         self.rate_limit_rps: float | None = float(rate_limit_rps) if rate_limit_rps else None
+        self.query_instruction = query_instruction
         self._rate_lock = threading.Lock()
         self._last_request_ts: float = 0.0
         if not self.api_key:
@@ -133,8 +146,8 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         return vecs
 
     def embed_query(self, text: str) -> list[float]:
-        """Embed a query string. No special handling needed for OpenAI."""
-        return self.__call__([text])[0]
+        """Embed a query, optionally using an asymmetric retrieval prompt."""
+        return self.__call__([_instruct_query(text, self.query_instruction)])[0]
 
     def truncate(self, text: str, max_tokens: int) -> str:
         """Truncate using tiktoken cl100k_base (correct for OpenAI models)."""
@@ -316,8 +329,15 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
     collection's config (see OpenAIEmbeddingFunction for details).
     """
 
-    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B"):
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-Embedding-0.6B",
+        query_instruction: str | None = None,
+    ):
         self.model_name = model_name
+        self.query_instruction = query_instruction
+        if self.query_instruction is None and "qwen3" in model_name.casefold():
+            self.query_instruction = DEFAULT_QWEN_QUERY_INSTRUCTION
 
         try:
             from sentence_transformers import SentenceTransformer
@@ -348,8 +368,8 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
         return embeddings.tolist()
 
     def embed_query(self, text: str) -> list[float]:
-        """Embed a query string. No special handling needed for HuggingFace."""
-        return self.__call__([text])[0]
+        """Embed a query, optionally using an asymmetric retrieval prompt."""
+        return self.__call__([_instruct_query(text, self.query_instruction)])[0]
 
     def truncate(self, text: str, max_tokens: int) -> str:
         """Truncate using the model's own tokenizer."""
@@ -378,9 +398,17 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
     # Ollama models vary; use a conservative, char-based fallback budget.
     max_input_tokens = 8000
 
-    def __init__(self, model_name: str = "qwen3-embedding", base_url: str | None = None):
+    def __init__(
+        self,
+        model_name: str = "qwen3-embedding",
+        base_url: str | None = None,
+        query_instruction: str | None = None,
+    ):
         self.model_name = model_name
         self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/")
+        self.query_instruction = query_instruction
+        if self.query_instruction is None and "qwen3" in model_name.casefold():
+            self.query_instruction = DEFAULT_QWEN_QUERY_INSTRUCTION
 
     @staticmethod
     def name() -> str:
@@ -429,8 +457,8 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
         return embeddings
 
     def embed_query(self, text: str) -> list[float]:
-        """Embed a query string. No special handling needed for Ollama."""
-        return self.__call__([text])[0]
+        """Embed a query, optionally using an asymmetric retrieval prompt."""
+        return self.__call__([_instruct_query(text, self.query_instruction)])[0]
 
     def truncate(self, text: str, max_tokens: int) -> str:
         """Truncate using character-based estimation for local Ollama models."""
@@ -529,7 +557,10 @@ class ChromaClient:
         return f"{self.embedding_model}:{model_name or self.embedding_model}"
 
     def _new_collection_metadata(self) -> dict[str, str]:
-        return {"zotero_mcp_embedding_identity": self.embedding_identity}
+        return {
+            "zotero_mcp_embedding_identity": self.embedding_identity,
+            "hnsw:space": "cosine",
+        }
 
     def _stored_embedding_model(self) -> str | None:
         """Read Chroma's persisted embedding model without mutating it."""
@@ -568,6 +599,9 @@ class ChromaClient:
 
     def _create_embedding_function(self) -> EmbeddingFunction:
         """Create the appropriate embedding function based on configuration."""
+        query_instruction = self.embedding_config.get("query_instruction")
+        if query_instruction is None and "qwen3" in self.embedding_identity.casefold():
+            query_instruction = DEFAULT_QWEN_QUERY_INSTRUCTION
         if self.embedding_model == "openai":
             model_name = self.embedding_config.get("model_name", "text-embedding-3-small")
             api_key = self.embedding_config.get("api_key")
@@ -576,6 +610,7 @@ class ChromaClient:
                 model_name=model_name, api_key=api_key, base_url=base_url,
                 request_batch_size=self.embedding_config.get("request_batch_size"),
                 rate_limit_rps=self.embedding_config.get("rate_limit_rps"),
+                query_instruction=query_instruction,
             )
 
         elif self.embedding_model == "gemini":
@@ -587,19 +622,32 @@ class ChromaClient:
         elif self.embedding_model == "ollama":
             model_name = self.embedding_config.get("model_name", "qwen3-embedding")
             base_url = self.embedding_config.get("base_url")
-            return OllamaEmbeddingFunction(model_name=model_name, base_url=base_url)
+            return OllamaEmbeddingFunction(
+                model_name=model_name,
+                base_url=base_url,
+                query_instruction=query_instruction,
+            )
 
         elif self.embedding_model == "qwen":
             model_name = self.embedding_config.get("model_name", "Qwen/Qwen3-Embedding-0.6B")
-            return HuggingFaceEmbeddingFunction(model_name=model_name)
+            return HuggingFaceEmbeddingFunction(
+                model_name=model_name,
+                query_instruction=query_instruction,
+            )
 
         elif self.embedding_model == "embeddinggemma":
             model_name = self.embedding_config.get("model_name", "google/embeddinggemma-300m")
-            return HuggingFaceEmbeddingFunction(model_name=model_name)
+            return HuggingFaceEmbeddingFunction(
+                model_name=model_name,
+                query_instruction=query_instruction,
+            )
 
         elif self.embedding_model not in ["default", "openai", "gemini", "ollama"]:
             # Treat any other value as a HuggingFace model name
-            return HuggingFaceEmbeddingFunction(model_name=self.embedding_model)
+            return HuggingFaceEmbeddingFunction(
+                model_name=self.embedding_model,
+                query_instruction=query_instruction,
+            )
 
         else:
             # Use ChromaDB's default embedding function (all-MiniLM-L6-v2)
@@ -776,6 +824,37 @@ class ChromaClient:
         except Exception as e:
             logger.error(f"Error performing semantic search: {e}")
             raise
+
+    @property
+    def distance_metric(self) -> str:
+        """Return the collection's configured vector distance metric."""
+        metadata = getattr(self.collection, "metadata", {}) or {}
+        if metric := metadata.get("hnsw:space"):
+            return str(metric).lower()
+        configuration = getattr(self.collection, "configuration", {}) or {}
+        if not isinstance(configuration, dict) and hasattr(
+            configuration, "to_json"
+        ):
+            configuration = configuration.to_json()
+        if isinstance(configuration, dict):
+            hnsw = configuration.get("hnsw") or {}
+            if isinstance(hnsw, dict) and hnsw.get("space"):
+                return str(hnsw["space"]).lower()
+        # Chroma's historical and current default is squared L2 distance.
+        return "l2"
+
+    def distance_to_similarity(self, distance: float) -> float:
+        """Convert Chroma distance to a cosine-like similarity score."""
+        metric = self.distance_metric
+        if metric == "l2":
+            # For normalized embeddings, ||a-b||^2 = 2 - 2*cos(a,b).
+            similarity = 1.0 - float(distance) / 2.0
+        elif metric in {"cosine", "ip"}:
+            similarity = 1.0 - float(distance)
+        else:
+            logger.warning("Unknown Chroma distance metric %s; using 1-distance", metric)
+            similarity = 1.0 - float(distance)
+        return max(-1.0, min(1.0, similarity))
 
     def delete_documents(self, ids: list[str]) -> None:
         """

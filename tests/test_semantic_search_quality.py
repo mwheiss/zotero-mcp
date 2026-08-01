@@ -141,8 +141,6 @@ class TestGeminiQueryEmbedding:
 
         # Verify embed_content was called
         mock_client.models.embed_content.assert_called_once()
-        call_kwargs = mock_client.models.embed_content.call_args
-        config_arg = call_kwargs.kwargs.get("config") or call_kwargs[1].get("config")
         # Verify the task_type was retrieval_query
         mock_types.EmbedContentConfig.assert_called_once_with(task_type="retrieval_query")
         assert result == [0.1, 0.2, 0.3]
@@ -171,6 +169,57 @@ class TestGeminiQueryEmbedding:
             task_type="retrieval_document",
             title="Zotero library document",
         )
+
+
+class TestQwenQueryInstruction:
+    def test_qwen_ollama_model_gets_default_scientific_instruction(self):
+        from zotero_mcp.chroma_client import (
+            DEFAULT_QWEN_QUERY_INSTRUCTION,
+            OllamaEmbeddingFunction,
+        )
+
+        ef = OllamaEmbeddingFunction(model_name="qwen3-embedding")
+
+        assert ef.query_instruction == DEFAULT_QWEN_QUERY_INSTRUCTION
+
+    def test_openai_compatible_query_gets_configured_instruction(self):
+        from zotero_mcp.chroma_client import OpenAIEmbeddingFunction
+
+        response = MagicMock()
+        response.data = [MagicMock(embedding=[0.1, 0.2])]
+        ef = OpenAIEmbeddingFunction.__new__(OpenAIEmbeddingFunction)
+        ef.model_name = "api-alias"
+        ef.query_instruction = "Retrieve scientific papers"
+        ef.request_batch_size = 1
+        ef.rate_limit_rps = None
+        ef.client = MagicMock()
+        ef.client.embeddings.create.return_value = response
+
+        result = ef.embed_query("muon capture")
+
+        assert list(result) == [0.1, 0.2]
+        assert ef.client.embeddings.create.call_args.kwargs["input"] == [
+            "Instruct: Retrieve scientific papers\nQuery: muon capture"
+        ]
+
+    def test_documents_are_not_prefixed(self):
+        from zotero_mcp.chroma_client import OpenAIEmbeddingFunction
+
+        response = MagicMock()
+        response.data = [MagicMock(embedding=[0.1])]
+        ef = OpenAIEmbeddingFunction.__new__(OpenAIEmbeddingFunction)
+        ef.model_name = "api-alias"
+        ef.query_instruction = "Retrieve scientific papers"
+        ef.request_batch_size = 1
+        ef.rate_limit_rps = None
+        ef.client = MagicMock()
+        ef.client.embeddings.create.return_value = response
+
+        ef(["paper body"])
+
+        assert ef.client.embeddings.create.call_args.kwargs["input"] == [
+            "paper body"
+        ]
 
 
 # ---------------------------------------------------------------------------
