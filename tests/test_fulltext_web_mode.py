@@ -188,6 +188,21 @@ def test_get_items_from_api_excludes_all_child_artifact_types(monkeypatch):
     assert [item["key"] for item in items] == ["P1"]
 
 
+def test_get_items_from_api_tracks_active_attachments_by_parent(monkeypatch):
+    zot = FakeZoteroClient()
+    active = _paper("ATT1", item_type="attachment")
+    active["data"]["parentItem"] = "P1"
+    deleted = _paper("ATT2", item_type="attachment")
+    deleted["data"]["parentItem"] = "P1"
+    deleted["data"]["deleted"] = True
+    zot.load_scenario([_paper("P1"), active, deleted])
+    search = _build_search(monkeypatch, zot, FakeChromaClient())
+
+    search._get_items_from_api()
+
+    assert search._last_api_attachment_keys_by_parent == {"P1": {"ATT1"}}
+
+
 # --------- Integration tests: incremental fetch ----------
 
 def test_get_changed_items_from_api_returns_only_changed_keys(monkeypatch):

@@ -70,14 +70,22 @@ class FakeReader:
     def get_items_with_text(self, limit=None, include_fulltext=False, key_filter=None, collection_keys=None):
         return [FakeItem()]
 
-    def get_fulltext_meta_for_item(self, item_id):
-        return [list(row) for row in self._attachments]
+    def get_fulltext_meta_for_item(self, item_id, allowed_attachment_keys=None):
+        return [
+            list(row)
+            for row in self._attachments
+            if allowed_attachment_keys is None or row[0] in allowed_attachment_keys
+        ]
 
-    def get_attachment_signature(self, item_id):
+    def get_attachment_signature(self, item_id, allowed_attachment_keys=None):
+        if allowed_attachment_keys is not None:
+            return ",".join(sorted(allowed_attachment_keys))
         return self._attachment_signature
 
-    def extract_fulltext_for_item(self, item_id):
+    def extract_fulltext_for_item(self, item_id, allowed_attachment_keys=None):
         self.extract_calls += 1
+        if allowed_attachment_keys == set():
+            return None
         return self._extract_result
 
 
@@ -108,6 +116,7 @@ def _run_scan(
     extract_result=("extracted text", "pdf"),
     retry_failed_fulltext=False,
     publication_date="1952",
+    api_attachment_keys=None,
 ):
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
     monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
@@ -123,10 +132,12 @@ def _run_scan(
 
     chroma = FakeChromaClient(stored_metadata)
     search = semantic_search.ZoteroSemanticSearch(chroma_client=chroma)
-    monkeypatch.setattr(
-        search,
-        "_get_items_from_api",
-        lambda *a, **kw: [
+    def fake_api_items(*args, **kwargs):
+        if api_attachment_keys is not None:
+            search._last_api_attachment_keys_by_parent = {
+                "ITEMKEY1": set(api_attachment_keys)
+            }
+        return [
             {
                 "key": "ITEMKEY1",
                 "version": 1,
@@ -138,8 +149,9 @@ def _run_scan(
                     "dateModified": DATE_MODIFIED,
                 },
             }
-        ],
-    )
+        ]
+
+    monkeypatch.setattr(search, "_get_items_from_api", fake_api_items)
 
     items = search._get_items_from_source(
         fulltext=True,
@@ -364,3 +376,49 @@ def test_successful_item_drops_stale_fulltext_when_attachment_removed(monkeypatc
     assert reader.extract_calls == 1
     assert items[0]["data"]["fulltext"] == ""
     assert items[0]["data"]["fulltext_attempted"] is True
+
+
+def test_api_deleted_attachment_overrides_stale_local_snapshot(monkeypatch, capsys):
+    stored = {
+        "has_fulltext": True,
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "WEBPAGE1",
+        "attachment_signature": "WEBPAGE1",
+    }
+
+    items, reader = _run_scan(
+        monkeypatch,
+        stored,
+        [("WEBPAGE1", "storage:page.html", "text/html")],
+        extract_result=None,
+        api_attachment_keys=set(),
+    )
+
+    assert reader.extract_calls == 1
+    assert len(items) == 1
+    assert items[0]["data"]["attachmentKeys"] == ""
+    assert items[0]["data"]["fulltext"] == ""
+    assert items[0]["data"]["fulltext_attempted"] is True
+    assert "No candidate full-text attachment was available." in capsys.readouterr().err
+
+
+def test_api_attachment_missing_from_snapshot_defers_item(monkeypatch, capsys):
+    stored = {
+        "has_fulltext": True,
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "PDF1",
+        "attachment_signature": "PDF1",
+    }
+
+    items, reader = _run_scan(
+        monkeypatch,
+        stored,
+        [],
+        api_attachment_keys={"PDF1"},
+    )
+
+    assert items == []
+    assert reader.extract_calls == 0
+    output = capsys.readouterr().err
+    assert "deferred 1 item(s)" in output
+    assert "existing index records were left unchanged" in output

@@ -721,14 +721,27 @@ class LocalZoteroReader:
             flags=re.IGNORECASE,
         ).strip()
 
-    def _get_fulltext_meta_for_item(self, item_id: int):
+    def _get_fulltext_meta_for_item(
+        self,
+        item_id: int,
+        allowed_attachment_keys: set[str] | None = None,
+    ):
         meta = []
         for key, path, ctype in self._iter_parent_attachments(item_id):
+            if (
+                allowed_attachment_keys is not None
+                and key not in allowed_attachment_keys
+            ):
+                continue
             meta.append([key, path, ctype])
 
         return meta
 
-    def get_attachment_signature(self, item_id: int) -> str:
+    def get_attachment_signature(
+        self,
+        item_id: int,
+        allowed_attachment_keys: set[str] | None = None,
+    ) -> str:
         """Return a stable change token for an item's extractable content.
 
         Zotero records hashes/modification times for stored attachments and a
@@ -773,6 +786,11 @@ class LocalZoteroReader:
         uses_named_precedence = False
         for row in rows:
             key = row["attachmentKey"]
+            if (
+                allowed_attachment_keys is not None
+                and key not in allowed_attachment_keys
+            ):
+                continue
             content_type = row["contentType"]
             zotero_path = row["path"] or ""
             title = selection_metadata.get(key, {}).get("title", "")
@@ -880,7 +898,11 @@ class LocalZoteroReader:
         # rather than a stub or thumbnail.
         return max(candidates, key=lambda p: p.stat().st_size)
 
-    def _extract_fulltext_for_item(self, item_id: int) -> tuple[str, str] | None:
+    def _extract_fulltext_for_item(
+        self,
+        item_id: int,
+        allowed_attachment_keys: set[str] | None = None,
+    ) -> tuple[str, str] | None:
         """Attempt to extract fulltext and source from the item's best attachment.
 
         Preference order:
@@ -901,6 +923,11 @@ class LocalZoteroReader:
         for index, (key, path, ctype) in enumerate(
             self._iter_parent_attachments(item_id)
         ):
+            if (
+                allowed_attachment_keys is not None
+                and key not in allowed_attachment_keys
+            ):
+                continue
             details = metadata.get(key, {})
             candidates.append(
                 _AttachmentCandidate(
@@ -1481,12 +1508,20 @@ class LocalZoteroReader:
 
     # Public helper to quickly check full text metadata for item.
     # Returns one [key, path, content_type] row per attachment of the item.
-    def get_fulltext_meta_for_item(self, item_id: int) -> list[list[str | None]]:
-        return self._get_fulltext_meta_for_item(item_id)
+    def get_fulltext_meta_for_item(
+        self,
+        item_id: int,
+        allowed_attachment_keys: set[str] | None = None,
+    ) -> list[list[str | None]]:
+        return self._get_fulltext_meta_for_item(item_id, allowed_attachment_keys)
 
     # Public helper to extract fulltext on demand for a specific item
-    def extract_fulltext_for_item(self, item_id: int) -> tuple[str, str] | None:
-        return self._extract_fulltext_for_item(item_id)
+    def extract_fulltext_for_item(
+        self,
+        item_id: int,
+        allowed_attachment_keys: set[str] | None = None,
+    ) -> tuple[str, str] | None:
+        return self._extract_fulltext_for_item(item_id, allowed_attachment_keys)
 
     def get_attachment_paths(self, parent_key: str) -> list[dict]:
         """Return resolved filesystem paths for a parent item's attachments.

@@ -642,6 +642,11 @@ class ZoteroSemanticSearch:
         # the snapshot set, this excludes deleted, child, filtered, and
         # deduplicated items and can be reconciled against ChromaDB.
         self._last_scan_indexable_keys: set[str] | None = None
+        # Active attachment keys grouped by parent from the canonical API item
+        # listing. Local immutable SQLite reads can retain attachments that
+        # Zotero has already deleted from its live state.
+        self._last_api_attachment_keys_by_parent: dict[str, set[str]] | None = None
+        self._last_scan_attachment_snapshot_complete = True
 
         # Load update configuration
         self.update_config = self._load_update_config()
@@ -1045,6 +1050,7 @@ class ZoteroSemanticSearch:
         """
         logger.info("Fetching items from local Zotero database...")
         self._last_scan_indexable_keys = None
+        self._last_scan_attachment_snapshot_complete = True
 
         try:
             api_metadata_by_key: dict[str, dict[str, Any]] = {}
@@ -1184,6 +1190,7 @@ class ZoteroSemanticSearch:
                     total_local = len(local_items)
                     _failed_extractions: list[tuple[str, str]] = []
                     _skipped_failed: list[tuple[str, str]] = []
+                    _deferred_attachments: list[tuple[str, int]] = []
 
                     # Show startup note
                     try:
@@ -1246,16 +1253,54 @@ class ZoteroSemanticSearch:
 
                         should_extract = True
 
-                        # Current attachment-key set, stored in metadata so a
+                        local_attachment_rows = reader.get_fulltext_meta_for_item(
+                            it.item_id
+                        )
+                        local_attachment_keys = {
+                            key for key, _path, _ctype in local_attachment_rows
+                        }
+                        api_attachment_map = self._last_api_attachment_keys_by_parent
+                        allowed_attachment_keys: set[str] | None = None
+                        if api_attachment_map is not None:
+                            api_attachment_keys = api_attachment_map.get(it.key, set())
+                            missing_local_keys = (
+                                api_attachment_keys - local_attachment_keys
+                            )
+                            if missing_local_keys:
+                                self._last_scan_attachment_snapshot_complete = False
+                                _deferred_attachments.append(
+                                    (display or f"item {it.key}", len(missing_local_keys))
+                                )
+                                continue
+                            # Exclude SQLite rows that the live Zotero API has
+                            # already deleted, even before WAL checkpointing.
+                            allowed_attachment_keys = (
+                                local_attachment_keys & api_attachment_keys
+                            )
+
+                        # Current active attachment-key set, stored in metadata so a
                         # later run can detect attachment changes. Attaching a
                         # file does NOT bump the parent's dateModified, so the
                         # date check alone never clears a "failed" marker.
+                        active_attachment_rows = (
+                            local_attachment_rows
+                            if allowed_attachment_keys is None
+                            else reader.get_fulltext_meta_for_item(
+                                it.item_id, allowed_attachment_keys
+                            )
+                        )
                         att_keys = ",".join(
-                            sorted(k for k, _p, _c in reader.get_fulltext_meta_for_item(it.item_id))
+                            sorted(k for k, _p, _c in active_attachment_rows)
                         )
                         it._attachment_keys = att_keys
                         if hasattr(reader, "get_attachment_signature"):
-                            attachment_signature = reader.get_attachment_signature(it.item_id)
+                            attachment_signature = (
+                                reader.get_attachment_signature(it.item_id)
+                                if allowed_attachment_keys is None
+                                else reader.get_attachment_signature(
+                                    it.item_id, allowed_attachment_keys
+                                )
+                            )
                         else:
                             # Compatibility for custom/legacy readers. The key
                             # set still detects added and removed attachments.
@@ -1355,7 +1400,13 @@ class ZoteroSemanticSearch:
                             # Extract fulltext if item doesn't have it yet
                             # (skip if circuit breaker has tripped)
                             if not getattr(it, "fulltext", None) and not _extraction_stopped:
-                                text = reader.extract_fulltext_for_item(it.item_id)
+                                text = (
+                                    reader.extract_fulltext_for_item(it.item_id)
+                                    if allowed_attachment_keys is None
+                                    else reader.extract_fulltext_for_item(
+                                        it.item_id, allowed_attachment_keys
+                                    )
+                                )
                                 # Circuit breaker: stop PDF extraction after consecutive timeouts
                                 if isinstance(text, tuple) and len(text) == 2 and text[1] == "timeout":
                                     failure_reason = (
@@ -1434,6 +1485,24 @@ class ZoteroSemanticSearch:
                             for name, reason in _failed_extractions:
                                 sys.stderr.write(f"    - {name}\n")
                                 sys.stderr.write(f"      Reason: {reason}\n")
+                        if _deferred_attachments:
+                            sys.stderr.write(
+                                f"  Warning: deferred {len(_deferred_attachments)} item(s) "
+                                "because active API attachments are not yet visible in "
+                                "the local SQLite snapshot:\n"
+                            )
+                            for name, count in _deferred_attachments[:10]:
+                                sys.stderr.write(
+                                    f"    - {name} ({count} pending attachment(s))\n"
+                                )
+                            if len(_deferred_attachments) > 10:
+                                sys.stderr.write(
+                                    f"    ... and {len(_deferred_attachments) - 10} more\n"
+                                )
+                            sys.stderr.write(
+                                "  Their existing index records were left unchanged; "
+                                "the next update will retry them.\n"
+                            )
                         if _skipped_failed:
                             sys.stderr.write(
                                 f"  {len(_skipped_failed)} item(s) not retried "
@@ -1579,6 +1648,8 @@ class ZoteroSemanticSearch:
             List of items from API
         """
         logger.info("Fetching items from Zotero API...")
+        self._last_api_attachment_keys_by_parent = None
+        attachment_keys_by_parent: dict[str, set[str]] = {}
 
         # Fetch items in batches to handle large libraries
         batch_size = 100
@@ -1606,6 +1677,17 @@ class ZoteroSemanticSearch:
             if not items:
                 break
 
+            for item in items:
+                data = item.get("data", {})
+                if data.get("itemType") != "attachment":
+                    continue
+                parent_key = data.get("parentItem")
+                attachment_key = item.get("key") or data.get("key")
+                if parent_key and attachment_key and not data.get("deleted", False):
+                    attachment_keys_by_parent.setdefault(parent_key, set()).add(
+                        attachment_key
+                    )
+
             # Child artifacts are represented only through their parent item.
             filtered_items = [
                 item
@@ -1622,6 +1704,8 @@ class ZoteroSemanticSearch:
 
         if limit:
             all_items = all_items[:limit]
+
+        self._last_api_attachment_keys_by_parent = attachment_keys_by_parent
 
         logger.info(f"Retrieved {len(all_items)} items from API")
         return all_items
@@ -1696,6 +1780,14 @@ class ZoteroSemanticSearch:
             present in the sqlite snapshot, otherwise None (keep the
             previous watermark so the next update re-covers the gap).
         """
+        if not getattr(self, "_last_scan_attachment_snapshot_complete", True):
+            logger.warning(
+                "Active Zotero API attachments are missing from the local "
+                "sqlite snapshot; keeping previous sync watermark so the next "
+                "update can pick them up."
+            )
+            return None
+
         try:
             api_keys = set((self.zotero_client.item_versions() or {}).keys())
 
