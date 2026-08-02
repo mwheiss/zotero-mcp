@@ -74,6 +74,31 @@ def test_zotero_mcp_cli_cancellation_happens_before_setup(
     assert "Force rebuild cancelled." in capsys.readouterr().out
 
 
+def test_zotero_mcp_cli_reports_graceful_update_interrupt(
+    monkeypatch,
+    capsys,
+):
+    class InterruptedSearch:
+        chroma_client = SimpleNamespace(embedding_model="openai")
+
+        def update_database(self, **_kwargs):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(sys, "argv", ["zotero-mcp", "update-db"])
+    monkeypatch.setattr(cli, "setup_zotero_environment", lambda: None)
+    monkeypatch.setattr(
+        semantic_search,
+        "create_semantic_search",
+        lambda *_args, **_kwargs: InterruptedSearch(),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 130
+    assert "Database update stopped cleanly" in capsys.readouterr().err
+
+
 def test_cli_force_clear_requires_force_rebuild(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["zotero-mcp", "update-db", "--force-clear"])
 

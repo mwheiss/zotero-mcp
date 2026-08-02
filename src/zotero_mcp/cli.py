@@ -646,6 +646,13 @@ def main():
                 print(f"Error: {stats['error']}")
                 sys.exit(1)
 
+        except KeyboardInterrupt:
+            print(
+                "\nDatabase update stopped cleanly. Completed incremental "
+                "entries were kept; an unfinished staged rebuild was discarded.",
+                file=sys.stderr,
+            )
+            sys.exit(130)
         except Exception as e:
             print(f"Error updating database: {e}")
             sys.exit(1)
