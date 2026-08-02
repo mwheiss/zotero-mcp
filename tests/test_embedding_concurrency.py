@@ -1,9 +1,41 @@
 """Tests for opt-in concurrent realtime embedding during update-db."""
 
+import io
+import signal
 import threading
 import time
 
+import pytest
+
 from zotero_mcp import semantic_search
+
+
+def test_first_interrupt_requests_stop_and_explains_second_interrupt():
+    stream = io.StringIO()
+    controller = semantic_search._UpdateInterruptController(stream=stream)
+
+    controller._handle_sigint(None, None)
+
+    assert controller.stop_requested.is_set()
+    assert "waiting for active model calls" in stream.getvalue()
+    assert "Press Ctrl+C again to exit immediately" in stream.getvalue()
+
+
+def test_second_interrupt_forces_exit_130(monkeypatch):
+    stream = io.StringIO()
+    controller = semantic_search._UpdateInterruptController(stream=stream)
+    controller._handle_sigint(None, None)
+
+    def fake_exit(status):
+        raise SystemExit(status)
+
+    monkeypatch.setattr(semantic_search.os, "_exit", fake_exit)
+
+    with pytest.raises(SystemExit) as exc:
+        controller._handle_sigint(None, None)
+
+    assert exc.value.code == 130
+    assert "forcing immediate exit" in stream.getvalue()
 
 
 def _items(count: int) -> list[dict]:
@@ -81,6 +113,13 @@ class _ConcurrentChroma:
         self.upserted_batches.append(list(ids))
 
 
+class _InterruptingChroma(_ConcurrentChroma):
+    def upsert_documents(self, documents, metadatas, ids):
+        super().upsert_documents(documents, metadatas, ids)
+        if self.sequential_upserts == 1:
+            signal.raise_signal(signal.SIGINT)
+
+
 def _search(monkeypatch, chroma, items):
     monkeypatch.setenv("ZOTERO_MCP_FORCE_UPDATE", "1")
     monkeypatch.setattr(
@@ -140,6 +179,24 @@ def test_default_update_path_writes_each_entry_immediately(
     assert "| ETA " in progress
     assert "2/2 finished" in progress
     assert "| Last: Item 1" in progress
+
+
+def test_first_sigint_finishes_current_entry_and_stops_before_next(
+    monkeypatch,
+    capsys,
+):
+    chroma = _InterruptingChroma()
+    search = _search(monkeypatch, chroma, _items(3))
+    old_handler = signal.getsignal(signal.SIGINT)
+
+    with pytest.raises(KeyboardInterrupt):
+        search.update_database()
+
+    assert chroma.upserted_batches == [["ITEM0000"]]
+    assert signal.getsignal(signal.SIGINT) is old_handler
+    output = capsys.readouterr().err
+    assert "stopping new work" in output
+    assert "Press Ctrl+C again" in output
 
 
 class _SkewedChroma(_ConcurrentChroma):

@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import re
+import signal
 import statistics
 import sys
 import threading
@@ -120,6 +121,57 @@ class _CumulativeETA:
         if completed <= 0 or elapsed <= 0:
             return None
         return elapsed * (self.total - completed) / completed
+
+
+class _UpdateInterruptController:
+    """Turn SIGINT into a graceful stop, then an explicit forced exit."""
+
+    def __init__(self, stream=None):
+        self.stop_requested = threading.Event()
+        self._stream = stream or sys.stderr
+        self._old_handler: Any = None
+        self._installed = False
+        self._interrupt_count = 0
+
+    def install(self) -> None:
+        """Install the handler when update_database runs on the main thread."""
+        if threading.current_thread() is not threading.main_thread():
+            return
+        self._old_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, self._handle_sigint)
+        self._installed = True
+
+    def restore(self) -> None:
+        """Restore the caller's SIGINT behavior after indexing finishes."""
+        if not self._installed:
+            return
+        signal.signal(signal.SIGINT, self._old_handler)
+        self._installed = False
+
+    def _write(self, message: str) -> None:
+        try:
+            self._stream.write(message)
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def _handle_sigint(self, _signum, _frame) -> None:
+        self._interrupt_count += 1
+        if self._interrupt_count == 1:
+            self.stop_requested.set()
+            self._write(
+                "\n\nInterrupt received: stopping new work and waiting for "
+                "active model calls to finish.\n"
+                "Press Ctrl+C again to exit immediately; this may interrupt "
+                "an in-progress database write.\n"
+            )
+            return
+
+        self._write(
+            "\nSecond interrupt received: forcing immediate exit "
+            "(status 130).\n"
+        )
+        os._exit(130)
 
 
 def _format_eta(seconds: float | None) -> str:
@@ -2438,6 +2490,7 @@ class ZoteroSemanticSearch:
             "duration": None,
         }
         staged_rebuild_active = False
+        interrupt_controller: _UpdateInterruptController | None = None
 
         # Guard against concurrent rebuilds: the MCP server auto-launches
         # update_database on startup while the user may also run
@@ -2940,6 +2993,16 @@ class ZoteroSemanticSearch:
             )
             _failed_docs: list[_PreparedIndexBatch] = []
             failed_concurrent_batches: list[_PreparedIndexBatch] = []
+            interrupt_controller = _UpdateInterruptController()
+            interrupt_controller.install()
+            stop_pipeline = interrupt_controller.stop_requested
+            set_cancel_event = getattr(
+                self.chroma_client,
+                "set_embedding_cancel_event",
+                None,
+            )
+            if set_cancel_event is not None:
+                set_cancel_event(stop_pipeline)
 
             def report_item_progress(item: dict[str, Any]) -> None:
                 nonlocal seen_items
@@ -2972,6 +3035,8 @@ class ZoteroSemanticSearch:
 
             if embedding_concurrency == 1:
                 for item in all_items:
+                    if stop_pipeline.is_set():
+                        break
                     item_started = time.monotonic()
                     batch_stats = self._process_item_batch(
                         [item],
@@ -2985,7 +3050,6 @@ class ZoteroSemanticSearch:
                 queue_depth = embedding_concurrency * 2
                 work_queue: Queue[Any] = Queue(maxsize=queue_depth)
                 result_queue: Queue[Any] = Queue(maxsize=queue_depth)
-                stop_pipeline = threading.Event()
                 chroma_access_lock = threading.Lock()
                 work_done = object()
                 worker_done = object()
@@ -3075,8 +3139,14 @@ class ZoteroSemanticSearch:
 
                     completed_workers = 0
                     try:
-                        while completed_workers < embedding_concurrency:
-                            result = result_queue.get()
+                        while (
+                            completed_workers < embedding_concurrency
+                            and not stop_pipeline.is_set()
+                        ):
+                            try:
+                                result = result_queue.get(timeout=0.1)
+                            except Empty:
+                                continue
                             if result is worker_done:
                                 completed_workers += 1
                                 continue
@@ -3116,13 +3186,17 @@ class ZoteroSemanticSearch:
                             report_item_progress(item)
                             accumulate_batch_stats(prepared.stats)
                     finally:
-                        stop_pipeline.set()
+                        if completed_workers < embedding_concurrency:
+                            stop_pipeline.set()
                         producer.join()
                         for worker in workers:
                             worker.result()
 
                     if producer_errors:
                         raise producer_errors[0]
+
+                if stop_pipeline.is_set():
+                    raise KeyboardInterrupt
 
                 if failed_concurrent_batches:
                     import time as _retry_time
@@ -3170,6 +3244,9 @@ class ZoteroSemanticSearch:
                     except Exception:
                         pass
 
+            if stop_pipeline.is_set():
+                raise KeyboardInterrupt
+
             # Retry any documents that failed during the main run
             if _failed_docs:
                 try:
@@ -3206,6 +3283,8 @@ class ZoteroSemanticSearch:
                     pass
 
             # Clear the progress line and show summary
+            if stop_pipeline.is_set():
+                raise KeyboardInterrupt
             if staged_rebuild_active:
                 if stats["errors"] == 0:
                     self.chroma_client.commit_staged_rebuild()
@@ -3281,6 +3360,24 @@ class ZoteroSemanticSearch:
             stats["duration"] = str(end_time - start_time)
             return stats
         finally:
+            if interrupt_controller is not None:
+                try:
+                    interrupt_controller.restore()
+                except Exception as e:
+                    logger.warning("Could not restore SIGINT handler: %s", e)
+                set_cancel_event = getattr(
+                    self.chroma_client,
+                    "set_embedding_cancel_event",
+                    None,
+                )
+                if set_cancel_event is not None:
+                    try:
+                        set_cancel_event(None)
+                    except Exception as e:
+                        logger.warning(
+                            "Could not clear embedding cancellation: %s",
+                            e,
+                        )
             if staged_rebuild_active:
                 try:
                     self.chroma_client.abort_staged_rebuild()

@@ -162,8 +162,13 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         batch_size = self.request_batch_size or self.DEFAULT_REQUEST_BATCH_SIZE
         vecs: Embeddings = []
         for i in range(0, len(input), batch_size):
+            cancel_event = getattr(self, "_zotero_mcp_cancel_event", None)
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Embedding update cancellation requested")
             sub = input[i:i + batch_size]
             self._wait_for_rate_limit()
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Embedding update cancellation requested")
             response = self.client.embeddings.create(
                 model=self.model_name,
                 input=sub,
@@ -520,6 +525,7 @@ class ChromaClient:
         self._pending_embedding_mismatch = False
         self._rebuild_original_collection = None
         self._rebuild_staging_name: str | None = None
+        self._embedding_cancel_event = None
 
         # Set up persistent directory
         if persist_directory is None:
@@ -834,11 +840,21 @@ class ChromaClient:
 
     def embed_documents(self, documents: list[str]) -> list[list[float]]:
         """Compute document embeddings without mutating the collection."""
+        setattr(
+            self.embedding_function,
+            "_zotero_mcp_cancel_event",
+            self._embedding_cancel_event,
+        )
         embeddings = self.embedding_function(documents)
         return [
             embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
             for embedding in embeddings
         ]
+
+    def set_embedding_cancel_event(self, event) -> None:
+        """Set cooperative cancellation for realtime embedding requests."""
+        self._embedding_cancel_event = event
+        setattr(self.embedding_function, "_zotero_mcp_cancel_event", event)
 
     def upsert_embeddings(self,
                          documents: list[str],

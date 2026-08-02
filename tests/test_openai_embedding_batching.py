@@ -8,6 +8,8 @@ install it).
 
 import threading
 
+import pytest
+
 from zotero_mcp.chroma_client import OpenAIEmbeddingFunction
 
 
@@ -61,6 +63,25 @@ def test_encoding_format_is_float_on_every_request():
     ef, calls = _make(batch_size=2)
     ef([0, 1, 2, 3])
     assert calls and all(c["encoding_format"] == "float" for c in calls)
+
+
+def test_cancellation_stops_before_the_next_http_subrequest():
+    ef, calls = _make(batch_size=2)
+    cancel_event = threading.Event()
+    ef._zotero_mcp_cancel_event = cancel_event
+    original_create = ef.client.embeddings.create
+
+    def create_and_cancel(**kwargs):
+        response = original_create(**kwargs)
+        cancel_event.set()
+        return response
+
+    ef.client.embeddings.create = create_and_cancel
+
+    with pytest.raises(InterruptedError, match="cancellation requested"):
+        ef([0, 1, 2, 3])
+
+    assert [call["input"] for call in calls] == [[0, 1]]
 
 
 def test_rate_limit_noop_when_unset():
