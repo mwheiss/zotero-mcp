@@ -74,6 +74,21 @@ def test_zotero_mcp_cli_cancellation_happens_before_setup(
     assert "Force rebuild cancelled." in capsys.readouterr().out
 
 
+def test_cli_force_clear_requires_force_rebuild(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["zotero-mcp", "update-db", "--force-clear"])
+
+    def unexpected_setup():
+        raise AssertionError("backend setup must not run for invalid flags")
+
+    monkeypatch.setattr(cli, "setup_zotero_environment", unexpected_setup)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
+    assert "requires --force-rebuild" in capsys.readouterr().err
+
+
 def test_standalone_cli_cancellation_happens_before_setup(
     monkeypatch, capsys
 ):
@@ -154,11 +169,13 @@ def test_mcp_force_rebuild_accepts_exact_confirmation(monkeypatch):
 
     result = search_tools.update_search_database(
         force_rebuild=True,
+        force_clear=True,
         confirm_force_rebuild="REBUILD ALL ITEMS",
         ctx=_Context(),
     )
 
     assert captured["force_full_rebuild"] is True
+    assert captured["force_clear"] is True
     assert captured["fulltext"] is False
     assert factory_args["allow_embedding_mismatch"] is True
     assert "# Database Update Results" in result
@@ -183,6 +200,23 @@ def test_mcp_incremental_update_needs_no_confirmation(monkeypatch):
     result = search_tools.update_search_database(ctx=_Context())
 
     assert captured["force_full_rebuild"] is False
+    assert captured["force_clear"] is False
     assert captured["fulltext"] is False
     assert factory_args["allow_embedding_mismatch"] is False
     assert "# Database Update Results" in result
+
+
+def test_mcp_force_clear_requires_force_rebuild(monkeypatch):
+    def unexpected_create(*_args, **_kwargs):
+        raise AssertionError("search backend must not be created")
+
+    monkeypatch.setattr(
+        semantic_search, "create_semantic_search", unexpected_create
+    )
+
+    result = search_tools.update_search_database(
+        force_clear=True,
+        ctx=_Context(),
+    )
+
+    assert "force_clear requires force_rebuild=True" in result

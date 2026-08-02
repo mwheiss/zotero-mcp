@@ -214,6 +214,9 @@ zotero-mcp update-db --fulltext --db-path "/Your_custom_path/zotero.sqlite"
 # If you have embedding conflicts or changed models, force a rebuild
 zotero-mcp update-db --force-rebuild
 
+# Destructive alternative: clear the live index before a realtime rebuild
+zotero-mcp update-db --force-rebuild --force-clear --no-openai-batch
+
 # Check database status
 zotero-mcp db-status
 ```
@@ -438,6 +441,7 @@ zotero-mcp openai-batch-status             # Check latest OpenAI embedding batch
 zotero-mcp openai-batch-import             # Import completed OpenAI batch embeddings
 zotero-mcp update-db --fulltext            # Add one preferred local attachment per item
 zotero-mcp update-db --force-rebuild       # Force complete database rebuild
+zotero-mcp update-db --force-rebuild --force-clear --no-openai-batch # Clear first instead of staging
 zotero-mcp update-db --fulltext --force-rebuild  # Rebuild with local attachments
 zotero-mcp update-db --fulltext --db-path "your_path/to/zotero.sqlite" # Customize your Zotero database path
 zotero-mcp db-status                       # Show database status and info
@@ -445,6 +449,14 @@ zotero-mcp db-status                       # Show database status and info
 # General
 zotero-mcp version                         # Show current version
 ```
+
+Updates prune removed Zotero items first and refresh changed bibliographic
+metadata immediately. Replacement vectors are written only after encoding
+succeeds, and obsolete chunks are removed after that upsert. Realtime
+`--force-rebuild` runs build a complete staging collection and activate it only
+after success, leaving the current index searchable during long rebuilds.
+`--force-clear` explicitly opts out of staging and invalidates the live index
+before encoding; it requires `--force-rebuild` and realtime embeddings.
 
 ## ⌨️ CLI Mode (`zotero-cli`)
 

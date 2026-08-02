@@ -8,6 +8,7 @@ for semantic search over Zotero libraries.
 import json
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -491,6 +492,8 @@ class ChromaClient:
         self.embedding_config = embedding_config or {}
         self.embedding_identity = self._configured_embedding_identity()
         self._pending_embedding_mismatch = False
+        self._rebuild_original_collection = None
+        self._rebuild_staging_name: str | None = None
 
         # Set up persistent directory
         if persist_directory is None:
@@ -1030,6 +1033,89 @@ class ChromaClient:
         except Exception as e:
             logger.error(f"Error resetting collection: {e}")
             raise
+
+    def begin_staged_rebuild(self) -> None:
+        """Route rebuild writes to a new collection without touching the index."""
+        if self._rebuild_original_collection is not None:
+            raise RuntimeError("A staged semantic-index rebuild is already active")
+
+        staging_name = f"{self.collection_name}__rebuild_{uuid.uuid4().hex}"
+        original_collection = self.collection
+        try:
+            staging_collection = self.client.create_collection(
+                name=staging_name,
+                embedding_function=self.embedding_function,
+                metadata=self._new_collection_metadata(),
+            )
+        except Exception as e:
+            logger.error("Error creating staged rebuild collection: %s", e)
+            raise
+
+        self._rebuild_original_collection = original_collection
+        self._rebuild_staging_name = staging_name
+        self.collection = staging_collection
+        logger.info(
+            "Building replacement for ChromaDB collection '%s' in staging",
+            self.collection_name,
+        )
+
+    def commit_staged_rebuild(self) -> None:
+        """Replace the live collection after its staged replacement is complete."""
+        original_collection = self._rebuild_original_collection
+        staging_name = self._rebuild_staging_name
+        if original_collection is None or staging_name is None:
+            raise RuntimeError("No staged semantic-index rebuild is active")
+
+        staging_collection = self.collection
+        backup_name = f"{self.collection_name}__replaced_{uuid.uuid4().hex}"
+        try:
+            original_collection.modify(name=backup_name)
+            try:
+                staging_collection.modify(name=self.collection_name)
+            except Exception:
+                original_collection.modify(name=self.collection_name)
+                raise
+        except Exception as e:
+            self.collection = original_collection
+            logger.error("Error activating staged rebuild collection: %s", e)
+            raise
+
+        self.collection = staging_collection
+        self._pending_embedding_mismatch = False
+        self._rebuild_original_collection = None
+        self._rebuild_staging_name = None
+        try:
+            self.client.delete_collection(name=backup_name)
+        except Exception as e:
+            # The replacement is already active. Leaving the uniquely named
+            # backup consumes disk but is safer than undoing a successful swap.
+            logger.warning(
+                "Replacement index is active, but old collection cleanup failed: %s",
+                e,
+            )
+        logger.info(
+            "Activated rebuilt ChromaDB collection '%s'",
+            self.collection_name,
+        )
+
+    def abort_staged_rebuild(self) -> None:
+        """Discard an incomplete staged rebuild and restore the live handle."""
+        original_collection = self._rebuild_original_collection
+        staging_name = self._rebuild_staging_name
+        if original_collection is None or staging_name is None:
+            return
+
+        self.collection = original_collection
+        self._rebuild_original_collection = None
+        self._rebuild_staging_name = None
+        try:
+            self.client.delete_collection(name=staging_name)
+        except Exception as e:
+            logger.warning("Could not remove incomplete rebuild collection: %s", e)
+        logger.info(
+            "Discarded incomplete rebuild; collection '%s' was left untouched",
+            self.collection_name,
+        )
 
     def document_exists(self, doc_id: str) -> bool:
         """Check if a document exists in the collection."""

@@ -349,7 +349,15 @@ def main():
     # Update database command
     update_db_parser = subparsers.add_parser("update-db", help="Update semantic search database")
     update_db_parser.add_argument("--force-rebuild", action="store_true",
-                                 help="Force complete rebuild of the database")
+                                 help="Build and activate a complete replacement index")
+    update_db_parser.add_argument(
+        "--force-clear",
+        action="store_true",
+        help=(
+            "Clear the live index before a forced rebuild instead of staging "
+            "the replacement (requires --force-rebuild and realtime embeddings)"
+        ),
+    )
     update_db_parser.add_argument("--limit", type=int,
                                  help="Limit number of items to process (for testing)")
     update_db_parser.add_argument(
@@ -558,6 +566,12 @@ def main():
         sys.exit(setup_main(args))
 
     elif args.command == "update-db":
+        if args.force_clear and not args.force_rebuild:
+            print(
+                "Error: --force-clear requires --force-rebuild.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         if args.force_rebuild and not _confirm_force_rebuild():
             print("Force rebuild cancelled.")
             sys.exit(0)
@@ -612,6 +626,7 @@ def main():
                 print("Indexing Zotero title and abstract only (full text disabled)...")
             stats = search.update_database(
                 force_full_rebuild=args.force_rebuild,
+                force_clear=args.force_clear,
                 limit=args.limit,
                 fulltext=args.fulltext,
                 use_openai_batch=args.openai_batch,

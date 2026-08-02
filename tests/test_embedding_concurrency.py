@@ -41,6 +41,15 @@ class _ConcurrentChroma:
     def reset_collection(self):
         pass
 
+    def begin_staged_rebuild(self):
+        pass
+
+    def commit_staged_rebuild(self):
+        pass
+
+    def abort_staged_rebuild(self):
+        pass
+
     def truncate_text(self, text, max_tokens=None):
         return text
 

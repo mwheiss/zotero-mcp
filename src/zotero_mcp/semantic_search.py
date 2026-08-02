@@ -45,6 +45,20 @@ logger = logging.getLogger(__name__)
 _CONTENT_CONTRACT_SIGNATURE = "lean-paper-content-v2"
 _SELF_CONTAINED_FULLTEXT_SOURCES = {"betterissa-indexing"}
 DEFAULT_MAX_CHUNKS_PER_ITEM = 768
+_IMMEDIATE_METADATA_FIELDS = {
+    "item_key",
+    "item_type",
+    "title",
+    "date",
+    "date_added",
+    "date_modified",
+    "creators",
+    "publication",
+    "url",
+    "doi",
+    "tags",
+    "citation_key",
+}
 
 
 @dataclass
@@ -989,6 +1003,42 @@ class ZoteroSemanticSearch:
     def should_update_database(self) -> bool:
         """Check if the database should be updated based on configuration."""
         return should_update(self.update_config)
+
+    def _refresh_bibliographic_metadata(
+        self,
+        items: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        """Refresh result metadata without changing embedding state or vectors."""
+        get_metadata = getattr(
+            self.chroma_client, "get_document_metadata", None
+        )
+        update_metadata = getattr(
+            self.chroma_client, "update_item_metadata", None
+        )
+        if not callable(get_metadata) or not callable(update_metadata):
+            return 0, 0
+
+        refreshed_items = 0
+        refreshed_records = 0
+        for item in items:
+            item_key = item.get("key", "")
+            if not item_key:
+                continue
+            existing = get_metadata(item_key)
+            if not existing:
+                continue
+            current = self._create_metadata(item)
+            updates = {
+                key: current.get(key, "")
+                for key in _IMMEDIATE_METADATA_FIELDS
+            }
+            if all(existing.get(key, "") == value for key, value in updates.items()):
+                continue
+            updated_records = update_metadata(item_key, updates)
+            if updated_records:
+                refreshed_items += 1
+                refreshed_records += updated_records
+        return refreshed_items, refreshed_records
 
     def _get_items_from_source(
         self,
@@ -2266,6 +2316,7 @@ class ZoteroSemanticSearch:
     def update_database(
         self,
         force_full_rebuild: bool = False,
+        force_clear: bool = False,
         limit: int | None = None,
         fulltext: bool | None = None,
         use_openai_batch: bool | None = None,
@@ -2277,6 +2328,8 @@ class ZoteroSemanticSearch:
 
         Args:
             force_full_rebuild: Whether to rebuild the entire database
+            force_clear: Clear the live collection before a forced realtime
+                rebuild instead of building its replacement in staging.
             limit: Limit number of items to process (for testing)
             fulltext: Whether to select and extract one local attachment.
                 False indexes API title and abstract only. None uses the
@@ -2308,6 +2361,7 @@ class ZoteroSemanticSearch:
             "start_time": start_time.isoformat(),
             "duration": None,
         }
+        staged_rebuild_active = False
 
         # Guard against concurrent rebuilds: the MCP server auto-launches
         # update_database on startup while the user may also run
@@ -2376,6 +2430,13 @@ class ZoteroSemanticSearch:
                     "force rebuild to migrate the complete index.\n"
                 )
             use_openai_batch = self._resolve_openai_batch_enabled(use_openai_batch)
+            if force_clear and not force_full_rebuild:
+                raise ValueError("force_clear requires force_full_rebuild")
+            if force_clear and use_openai_batch:
+                raise ValueError(
+                    "force_clear cannot be combined with OpenAI Batch mode; "
+                    "use realtime embeddings for an immediate clear"
+                )
             if embedding_concurrency < 1:
                 raise ValueError("embedding_concurrency must be at least 1")
             if embedding_concurrency > 1:
@@ -2394,10 +2455,11 @@ class ZoteroSemanticSearch:
                     embedding_concurrency,
                 )
 
-            # In batch mode, defer destructive rebuilds until import so the
-            # existing search index remains usable while the batch runs.
-            if force_full_rebuild and not use_openai_batch:
-                logger.info("Force rebuilding database...")
+            # Explicit escape hatch for users who prefer the old destructive
+            # behavior. Normal realtime rebuilds are staged below, immediately
+            # before indexing, so extraction cannot invalidate the live index.
+            if force_full_rebuild and force_clear:
+                logger.warning("Force clearing semantic index before rebuild")
                 self.chroma_client.reset_collection()
 
             # Decide whether to use since-based incremental ingest.
@@ -2555,6 +2617,70 @@ class ZoteroSemanticSearch:
                         logger.warning(f"Local deletion pass failed: {e}")
                         target_sync_version = None
 
+                # API full scans (bootstrap, watermark recovery, and similar
+                # non-incremental runs) are authoritative too. Prune before
+                # embedding so removed records never wait behind a long queue.
+                if (
+                    not extract_fulltext
+                    and not force_full_rebuild
+                    and limit is None
+                ):
+                    try:
+                        deleted = self._delete_missing_index_items(
+                            {
+                                item.get("key", "")
+                                for item in all_items
+                                if item.get("key")
+                            }
+                        )
+                        if deleted:
+                            stats["deleted_items"] = deleted
+                            sys.stderr.write(
+                                f"\nDeleted {deleted} items no longer present "
+                                "in Zotero.\n"
+                            )
+                    except Exception as e:
+                        logger.warning("API full-scan deletion pass failed: %s", e)
+                        target_sync_version = None
+
+                # A forced scan also has an authoritative corpus view. Prune
+                # genuinely removed items from the live index before any
+                # replacement embeddings are staged. Deferred local items are
+                # retained because the complete indexable-key set includes
+                # them; unverifiable SQLite snapshots never prune.
+                force_prune_keys: set[str] | None = None
+                if (
+                    force_full_rebuild
+                    and not force_clear
+                    and limit is None
+                ):
+                    if extract_fulltext:
+                        if (
+                            local_snapshot_complete
+                            and self._last_scan_indexable_keys is not None
+                        ):
+                            force_prune_keys = self._last_scan_indexable_keys
+                    else:
+                        force_prune_keys = {
+                            item.get("key", "")
+                            for item in all_items
+                            if item.get("key")
+                        }
+                if force_prune_keys is not None:
+                    try:
+                        deleted = self._delete_missing_index_items(
+                            force_prune_keys
+                        )
+                        if deleted:
+                            stats["deleted_items"] = deleted
+                            sys.stderr.write(
+                                f"\nDeleted {deleted} items no longer present "
+                                "in the current Zotero corpus.\n"
+                            )
+                    except Exception as e:
+                        logger.warning("Forced deletion pass failed: %s", e)
+                        target_sync_version = None
+
             preserved_fulltext_items = 0
             if not extract_fulltext and not force_full_rebuild and all_items:
                 (
@@ -2576,8 +2702,41 @@ class ZoteroSemanticSearch:
                         "refreshed Zotero metadata only.\n"
                     )
 
+            metadata_refreshed_items, metadata_refreshed_records = (
+                self._refresh_bibliographic_metadata(all_items)
+            )
+            if metadata_refreshed_items:
+                stats["metadata_refreshed_items"] = metadata_refreshed_items
+                stats["metadata_refreshed_records"] = metadata_refreshed_records
+                sys.stderr.write(
+                    f"\nRefreshed bibliographic metadata for "
+                    f"{metadata_refreshed_items} existing item(s) before "
+                    "embedding.\n"
+                )
+
             stats["total_items"] = len(all_items) + preserved_fulltext_items
             logger.info(f"Found {stats['total_items']} items to process")
+
+            if (
+                force_full_rebuild
+                and not force_clear
+                and extract_fulltext
+                and limit is None
+                and not local_snapshot_complete
+            ):
+                message = (
+                    "Cannot stage a complete full-text rebuild because the local "
+                    "Zotero SQLite snapshot could not be verified as complete. "
+                    "The current index was left active; retry after Zotero "
+                    "checkpoints its WAL data."
+                )
+                logger.warning(message)
+                stats["errors"] += 1
+                stats["error"] = message
+                end_time = datetime.now()
+                stats["duration"] = str(end_time - start_time)
+                stats["end_time"] = end_time.isoformat()
+                return stats
 
             if use_openai_batch:
                 stats["batch_mode"] = True
@@ -2612,6 +2771,18 @@ class ZoteroSemanticSearch:
                 stats["duration"] = str(end_time - start_time)
                 stats["end_time"] = end_time.isoformat()
                 return stats
+
+            if force_full_rebuild and not force_clear:
+                self.chroma_client.begin_staged_rebuild()
+                staged_rebuild_active = True
+                try:
+                    sys.stderr.write(
+                        "\nBuilding the replacement index in staging; the current "
+                        "index remains searchable until the rebuild completes.\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
 
             # User-friendly progress reporting
             total = len(all_items)
@@ -2894,6 +3065,21 @@ class ZoteroSemanticSearch:
                     pass
 
             # Clear the progress line and show summary
+            if staged_rebuild_active:
+                if stats["errors"] == 0:
+                    self.chroma_client.commit_staged_rebuild()
+                    staged_rebuild_active = False
+                else:
+                    self.chroma_client.abort_staged_rebuild()
+                    staged_rebuild_active = False
+                    try:
+                        sys.stderr.write(
+                            "  Rebuild incomplete; discarded the staged index and "
+                            "left the previous index active.\n"
+                        )
+                    except Exception:
+                        pass
+
             try:
                 _clear_progress_line(sys.stderr)
                 summary = (
@@ -2953,6 +3139,11 @@ class ZoteroSemanticSearch:
             stats["duration"] = str(end_time - start_time)
             return stats
         finally:
+            if staged_rebuild_active:
+                try:
+                    self.chroma_client.abort_staged_rebuild()
+                except Exception as e:
+                    logger.warning("Could not discard staged rebuild: %s", e)
             # Release the update flock on every exit path. Paired with the
             # __enter__ call above; the "not acquired" branch releases
             # separately before its early return, so this finally only runs

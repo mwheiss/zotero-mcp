@@ -399,6 +399,13 @@ def cmd_db(args):
     """Manage the semantic search database."""
     if (
         args.subcommand == "update"
+        and getattr(args, "force_clear", False)
+        and not args.force_rebuild
+    ):
+        print("Error: --force-clear requires --force-rebuild.", file=sys.stderr)
+        return
+    if (
+        args.subcommand == "update"
         and args.force_rebuild
         and not _confirm_force_rebuild()
     ):
@@ -446,6 +453,7 @@ def cmd_db(args):
                 sys.exit(1)
         stats = search.update_database(
             force_full_rebuild=args.force_rebuild,
+            force_clear=getattr(args, "force_clear", False),
             limit=args.limit,
             fulltext=fulltext,
             use_openai_batch=getattr(args, "openai_batch", None),
@@ -817,6 +825,7 @@ def build_parser() -> argparse.ArgumentParser:
     db_sub = db_p.add_subparsers(dest="subcommand")
     dbu = db_sub.add_parser("update")
     dbu.add_argument("--force-rebuild", action="store_true")
+    dbu.add_argument("--force-clear", action="store_true")
     dbu.add_argument("--limit", type=int)
     dbu.add_argument(
         "--fulltext",

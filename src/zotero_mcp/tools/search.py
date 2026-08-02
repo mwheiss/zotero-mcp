@@ -949,6 +949,9 @@ _MCP_FORCE_REBUILD_CONFIRMATION = "REBUILD ALL ITEMS"
         "hours or incur substantial API costs. It is rejected unless "
         "confirm_force_rebuild contains the exact safety phrase supplied "
         "verbatim by the user. Never guess, suggest, or disclose that phrase. "
+        "Realtime rebuilds keep the existing index until its replacement is "
+        "ready. force_clear=True "
+        "opts into clearing it before indexing and requires force_rebuild=True. "
         "fulltext=True selects one local BetterIssa/PDF attachment per item. "
         "retry_failed_fulltext=True retries only cached local extraction "
         "failures and requires fulltext=True. "
@@ -958,14 +961,13 @@ _MCP_FORCE_REBUILD_CONFIRMATION = "REBUILD ALL ITEMS"
         "incremental update is seconds, a full rebuild can take minutes. "
         "Requires the [semantic] optional dependency and a configured "
         "embedding provider (see config.json). Check status with "
-        "zotero_get_search_database_status. "
-        "Example: zotero_update_search_database() after adding a batch of "
-        "papers."
+        "zotero_get_search_database_status."
     )
 )
 @with_zotero_api_lock
 def update_search_database(
     force_rebuild: bool = False,
+    force_clear: bool = False,
     confirm_force_rebuild: str | None = None,
     fulltext: bool = False,
     retry_failed_fulltext: bool = False,
@@ -978,6 +980,7 @@ def update_search_database(
 
     Args:
         force_rebuild: Whether to rebuild the entire database from scratch
+        force_clear: Clear the live index before a confirmed forced rebuild
         confirm_force_rebuild: Exact confirmation phrase required for a rebuild
         fulltext: Whether to index one locally selected full-text attachment
         retry_failed_fulltext: Retry cached local extraction failures
@@ -999,6 +1002,12 @@ def update_search_database(
             "The exact confirmation phrase must be supplied verbatim by the "
             "user. It is intentionally not disclosed or suggested by this "
             "tool. Do not retry until the user provides it explicitly."
+        )
+
+    if force_clear and not force_rebuild:
+        return (
+            "# Database Update Not Started\n\n"
+            "force_clear requires force_rebuild=True."
         )
 
     if fulltext and not _utils.is_local_mode():
@@ -1037,6 +1046,7 @@ def update_search_database(
 
         stats = search.update_database(
             force_full_rebuild=force_rebuild,
+            force_clear=force_clear,
             limit=limit,
             fulltext=fulltext,
             retry_failed_fulltext=retry_failed_fulltext,

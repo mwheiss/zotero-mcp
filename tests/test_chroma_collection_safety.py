@@ -99,6 +99,52 @@ def test_reset_stamps_embedding_identity(monkeypatch):
     assert created["metadata"]["hnsw:space"] == "cosine"
 
 
+def _staging_client(tmp_path):
+    raw_client = chroma_client.chromadb.PersistentClient(
+        path=str(tmp_path / "chroma-staging")
+    )
+    collection = raw_client.create_collection(
+        "zotero_library",
+        metadata={
+            "hnsw:space": "cosine",
+            "zotero_mcp_embedding_identity": "test:model",
+        },
+    )
+    collection.add(ids=["OLD"], embeddings=[[1.0, 0.0]])
+    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
+    client.client = raw_client
+    client.collection = collection
+    client.collection_name = "zotero_library"
+    client.embedding_function = None
+    client.embedding_identity = "test:model"
+    client._pending_embedding_mismatch = False
+    client._rebuild_original_collection = None
+    client._rebuild_staging_name = None
+    return client, raw_client
+
+
+def test_staged_rebuild_swaps_only_after_replacement_is_ready(tmp_path):
+    client, raw_client = _staging_client(tmp_path)
+
+    client.begin_staged_rebuild()
+    assert raw_client.get_collection("zotero_library").get()["ids"] == ["OLD"]
+    client.collection.add(ids=["NEW"], embeddings=[[0.0, 1.0]])
+
+    client.commit_staged_rebuild()
+
+    assert raw_client.get_collection("zotero_library").get()["ids"] == ["NEW"]
+
+
+def test_aborted_staged_rebuild_leaves_live_collection_untouched(tmp_path):
+    client, raw_client = _staging_client(tmp_path)
+
+    client.begin_staged_rebuild()
+    client.collection.add(ids=["PARTIAL"], embeddings=[[0.5, 0.5]])
+    client.abort_staged_rebuild()
+
+    assert raw_client.get_collection("zotero_library").get()["ids"] == ["OLD"]
+
+
 class _RecordCollection:
     def __init__(self, ids):
         self.ids = set(ids)

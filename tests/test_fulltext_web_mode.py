@@ -24,8 +24,13 @@ class FakeChromaClient:
         self.added = []  # list of (docs, metas, ids)
         self.deleted = []  # list of ids deleted
         self.reset_calls = 0
+        self.staged_rebuild_calls = 0
+        self.staged_commit_calls = 0
+        self.staged_abort_calls = 0
+        self.operation_events = []
         self.metadata_by_key = dict(preloaded_metadata or {})
         self.metadata_updates = []
+        self._pre_staging_ids = None
 
     def truncate_text(self, text, max_tokens=None):
         return text[:4000]
@@ -45,6 +50,7 @@ class FakeChromaClient:
     def update_item_metadata(self, item_key, updates):
         if item_key not in self._ids:
             return 0
+        self.operation_events.append("metadata")
         existing = dict(self.metadata_by_key.get(item_key, {}))
         existing.update(updates)
         self.metadata_by_key[item_key] = existing
@@ -52,6 +58,7 @@ class FakeChromaClient:
         return 1
 
     def upsert_documents(self, documents, metadatas, ids):
+        self.operation_events.append("upsert")
         self.added.append((list(documents), list(metadatas), list(ids)))
         for i in ids:
             self._ids.add(i)
@@ -60,6 +67,7 @@ class FakeChromaClient:
         self.upsert_documents(documents, metadatas, ids)
 
     def delete_documents(self, ids):
+        self.operation_events.append("delete")
         self.deleted.extend(list(ids))
         for i in ids:
             self._ids.discard(i)
@@ -67,6 +75,24 @@ class FakeChromaClient:
     def reset_collection(self):
         self.reset_calls += 1
         self._ids = set()
+
+    def begin_staged_rebuild(self):
+        self.operation_events.append("begin_staging")
+        self.staged_rebuild_calls += 1
+        self._pre_staging_ids = set(self._ids)
+        self._ids = set()
+
+    def commit_staged_rebuild(self):
+        self.operation_events.append("commit_staging")
+        self.staged_commit_calls += 1
+        self._pre_staging_ids = None
+
+    def abort_staged_rebuild(self):
+        self.operation_events.append("abort_staging")
+        self.staged_abort_calls += 1
+        if self._pre_staging_ids is not None:
+            self._ids = self._pre_staging_ids
+            self._pre_staging_ids = None
 
 
 class FakeZoteroClient:
@@ -656,20 +682,154 @@ def test_content_contract_change_warns_without_automatic_rebuild(
     )
 
 
-def test_update_database_force_rebuild_triggers_reset_and_full_scan(monkeypatch, tmp_path):
-    """force_full_rebuild should reset the collection and do a full scan."""
+def test_update_database_force_rebuild_stages_replacement_after_pruning(
+    monkeypatch, tmp_path
+):
+    """A force rebuild prunes first, then swaps in a staged full scan."""
     config_path = _write_config(tmp_path, extra={"last_sync_version": 100})
     zot = FakeZoteroClient()
     zot.load_scenario([_paper("A"), _paper("B")], library_version=120)
     zot.versions_state = {"A": 120, "B": 120}
-    chroma = FakeChromaClient(preloaded_ids=["STALE"])
+    chroma = FakeChromaClient(
+        preloaded_ids=["A", "STALE"],
+        preloaded_metadata={"A": {"title": "Old title"}},
+    )
     search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
 
     search.update_database(force_full_rebuild=True)
 
-    assert chroma.reset_calls == 1
+    assert chroma.reset_calls == 0
+    assert chroma.staged_rebuild_calls == 1
+    assert chroma.staged_commit_calls == 1
+    assert chroma.operation_events[:3] == [
+        "delete",
+        "metadata",
+        "begin_staging",
+    ]
     # No since-based fetch: full scan used items() not item_versions(since=...)
     assert not any(c[0] == "item_versions" and c[1] is not None for c in zot.calls)
+
+
+def test_force_clear_preserves_destructive_rebuild_escape_hatch(
+    monkeypatch, tmp_path
+):
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 100})
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("A")], library_version=120)
+    chroma = FakeChromaClient(preloaded_ids=["STALE"])
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    search.update_database(force_full_rebuild=True, force_clear=True)
+
+    assert chroma.reset_calls == 1
+    assert chroma.staged_rebuild_calls == 0
+
+
+def test_force_clear_requires_force_rebuild(monkeypatch, tmp_path):
+    search = _build_search(
+        monkeypatch,
+        FakeZoteroClient(),
+        FakeChromaClient(),
+        config_path=_write_config(tmp_path),
+    )
+
+    stats = search.update_database(force_clear=True)
+
+    assert stats["error"] == "force_clear requires force_full_rebuild"
+
+
+def test_force_clear_rejects_openai_batch_mode(monkeypatch, tmp_path):
+    chroma = FakeChromaClient()
+    chroma.embedding_model = "openai"
+    search = _build_search(
+        monkeypatch,
+        FakeZoteroClient(),
+        chroma,
+        config_path=_write_config(tmp_path),
+    )
+
+    stats = search.update_database(
+        force_full_rebuild=True,
+        force_clear=True,
+        use_openai_batch=True,
+    )
+
+    assert "cannot be combined with OpenAI Batch" in stats["error"]
+
+
+def test_failed_staged_rebuild_keeps_previous_records(monkeypatch, tmp_path):
+    class FailingChroma(FakeChromaClient):
+        def upsert_documents(self, documents, metadatas, ids):
+            self.operation_events.append("failed_upsert")
+            raise RuntimeError("encoder unavailable")
+
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 100})
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("A")], library_version=120)
+    chroma = FailingChroma(
+        preloaded_ids=["A"],
+        preloaded_metadata={"A": {"title": "Old title"}},
+    )
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    stats = search.update_database(force_full_rebuild=True)
+
+    assert stats["errors"] == 1
+    assert chroma.staged_commit_calls == 0
+    assert chroma.staged_abort_calls == 1
+    assert chroma._ids == {"A"}
+    assert chroma.metadata_by_key["A"]["title"] == "Paper"
+
+
+def test_unverified_local_snapshot_never_replaces_live_index(
+    monkeypatch, tmp_path
+):
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 100})
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("A")], library_version=120)
+    chroma = FakeChromaClient(preloaded_ids=["A"])
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+    monkeypatch.setattr(
+        search,
+        "_get_items_from_source",
+        lambda **_kwargs: [_paper("A")],
+    )
+    monkeypatch.setattr(
+        search,
+        "_verify_local_snapshot_version",
+        lambda _version: None,
+    )
+
+    stats = search.update_database(
+        force_full_rebuild=True,
+        fulltext=True,
+    )
+
+    assert "could not be verified as complete" in stats["error"]
+    assert chroma.staged_rebuild_calls == 0
+    assert chroma._ids == {"A"}
+
+
+def test_api_full_scan_prunes_before_upserting(monkeypatch, tmp_path):
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 0})
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("A")], library_version=120)
+    chroma = FakeChromaClient(
+        preloaded_ids=["A", "REMOVED"],
+        preloaded_metadata={"A": {"title": "Old title"}},
+    )
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    stats = search.update_database()
+
+    assert stats["deleted_items"] == 1
+    assert chroma.deleted == ["REMOVED"]
+    assert chroma.operation_events.index("delete") < chroma.operation_events.index(
+        "upsert"
+    )
+    assert chroma.operation_events.index("metadata") < chroma.operation_events.index(
+        "upsert"
+    )
 
 
 def test_update_database_force_rebuild_updates_last_sync_version(monkeypatch, tmp_path):
