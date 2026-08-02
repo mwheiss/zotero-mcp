@@ -187,6 +187,28 @@ def _warmup_reranker_in_background() -> None:
     threading.Thread(target=_run, daemon=True, name="zmcp-reranker-warmup").start()
 
 
+def _print_orphan_cleanup_stats(stats: dict) -> None:
+    if stats.get("orphan_segment_directories_pruned"):
+        count = stats["orphan_segment_directories_pruned"]
+        reclaimed_mib = stats.get("orphan_segment_bytes_pruned", 0) / (1024 * 1024)
+        print(
+            "- Reclaimed orphan vector storage: "
+            f"{count} {'directory' if count == 1 else 'directories'} "
+            f"({reclaimed_mib:.1f} MiB)"
+        )
+    if stats.get("orphan_segment_directories_deferred"):
+        count = stats["orphan_segment_directories_deferred"]
+        print(
+            "- Orphan vector storage awaiting grace period: "
+            f"{count} {'directory' if count == 1 else 'directories'}"
+        )
+    if stats.get("orphan_segment_cleanup_errors"):
+        print(
+            "- Orphan vector cleanup errors: "
+            f"{stats['orphan_segment_cleanup_errors']}"
+        )
+
+
 def _print_update_stats(stats: dict) -> None:
     is_batch = stats.get("batch_mode") or stats.get("batch_submitted")
     label = "OpenAI batch submission" if is_batch else "Database update"
@@ -206,6 +228,7 @@ def _print_update_stats(stats: dict) -> None:
         print(f"- Updated: {stats.get('updated_items', 0)}")
     if stats.get("reused_embeddings"):
         print(f"- Unchanged vectors reused: {stats['reused_embeddings']}")
+    _print_orphan_cleanup_stats(stats)
     print(f"- Skipped: {stats.get('skipped_items', 0)}")
     print(f"- Errors: {stats.get('errors', 0)}")
     print(f"- Duration: {stats.get('duration', 'Unknown')}")
@@ -251,6 +274,7 @@ def _print_batch_import(stats: dict) -> None:
     print(f"- Updated: {stats.get('updated_items', 0)}")
     print(f"- Failed rows: {stats.get('failed_items', 0)}")
     print(f"- Missing rows: {stats.get('missing_items', 0)}")
+    _print_orphan_cleanup_stats(stats)
     if stats.get("errors"):
         print("\nWarnings/errors:")
         for error in stats["errors"][:20]:

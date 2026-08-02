@@ -609,7 +609,9 @@ def audit_semantic_database(
                 "orphan_segments",
                 f"{len(orphan_directories)} unreferenced segment "
                 f"{'directory' if len(orphan_directories) == 1 else 'directories'} use "
-                f"{orphan_bytes / (1024 * 1024):.1f} MiB; no files were removed.",
+                f"{orphan_bytes / (1024 * 1024):.1f} MiB. A later update-db "
+                "reclaims them after they remain unreferenced for one hour; this "
+                "audit removed nothing.",
             )
         else:
             report.add("ok", "orphan_segments", "No unreferenced segment directories found.")

@@ -154,3 +154,7 @@ def test_update_database_stats_includes_recovered_items_field(monkeypatch):
 
     assert "recovered_items" in stats
     assert stats["recovered_items"] == 0
+    assert stats["orphan_segment_directories_pruned"] == 0
+    assert stats["orphan_segment_bytes_pruned"] == 0
+    assert stats["orphan_segment_directories_deferred"] == 0
+    assert stats["orphan_segment_cleanup_errors"] == 0

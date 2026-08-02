@@ -2441,6 +2441,27 @@ class ZoteroSemanticSearch:
         stats["estimated_added_items"] = len(ids) - len(existing_ids)
         return stats
 
+    def _run_orphan_segment_cleanup(self, stats: dict[str, Any]) -> None:
+        """Run lock-protected Chroma storage maintenance and record its result."""
+        prune_orphans = getattr(
+            self.chroma_client,
+            "prune_orphan_segment_directories",
+            None,
+        )
+        if not callable(prune_orphans):
+            return
+        cleanup = prune_orphans()
+        stats["orphan_segment_directories_pruned"] = int(
+            cleanup.get("removed_directories", 0)
+        )
+        stats["orphan_segment_bytes_pruned"] = int(
+            cleanup.get("removed_bytes", 0)
+        )
+        stats["orphan_segment_directories_deferred"] = int(
+            cleanup.get("deferred_directories", 0)
+        )
+        stats["orphan_segment_cleanup_errors"] = int(cleanup.get("errors", 0))
+
     def update_database(
         self,
         force_full_rebuild: bool = False,
@@ -2485,6 +2506,10 @@ class ZoteroSemanticSearch:
             "recovered_items": 0,
             "skipped_items": 0,
             "deleted_items": 0,
+            "orphan_segment_directories_pruned": 0,
+            "orphan_segment_bytes_pruned": 0,
+            "orphan_segment_directories_deferred": 0,
+            "orphan_segment_cleanup_errors": 0,
             "errors": 0,
             "start_time": start_time.isoformat(),
             "duration": None,
@@ -2524,6 +2549,7 @@ class ZoteroSemanticSearch:
             return stats
 
         try:
+            self._run_orphan_segment_cleanup(stats)
             if fulltext is None:
                 fulltext = self._load_fulltext_setting()
             if not isinstance(fulltext, bool):
@@ -4001,6 +4027,10 @@ class ZoteroSemanticSearch:
             "updated_items": 0,
             "failed_items": 0,
             "missing_items": 0,
+            "orphan_segment_directories_pruned": 0,
+            "orphan_segment_bytes_pruned": 0,
+            "orphan_segment_directories_deferred": 0,
+            "orphan_segment_cleanup_errors": 0,
             "errors": [],
         }
 
@@ -4013,6 +4043,7 @@ class ZoteroSemanticSearch:
 
         staged_batch_rebuild_active = False
         try:
+            self._run_orphan_segment_cleanup(stats)
             self._validate_openai_batch_source(manifest)
             self._validate_openai_batch_baseline(manifest)
             already_imported = any(batch.get("imported_at") for batch in all_batches)

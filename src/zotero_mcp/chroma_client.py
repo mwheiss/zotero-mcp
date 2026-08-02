@@ -9,6 +9,8 @@ import hashlib
 import json
 import logging
 import os
+import shutil
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -33,6 +35,8 @@ DEFAULT_QWEN_QUERY_INSTRUCTION = (
     "Given a scientific literature search query, retrieve relevant passages "
     "that identify papers addressing the query"
 )
+
+ORPHAN_SEGMENT_GRACE_SECONDS = 60 * 60
 
 
 def record_state_hash(
@@ -1180,6 +1184,135 @@ class ChromaClient:
         except Exception as e:
             logger.error(f"Error resetting collection: {e}")
             raise
+
+    def prune_orphan_segment_directories(
+        self,
+        *,
+        min_age_seconds: float = ORPHAN_SEGMENT_GRACE_SECONDS,
+    ) -> dict[str, int | str]:
+        """Remove retired HNSW directories after a conservative grace period.
+
+        Chroma removes deleted segment rows from SQLite but can leave their
+        UUID-named persistence directories behind. The caller must hold the
+        semantic update lock so no other updater can create a segment between
+        the reference scan and deletion.
+        """
+        result: dict[str, int | str] = {
+            "removed_directories": 0,
+            "removed_bytes": 0,
+            "deferred_directories": 0,
+            "errors": 0,
+        }
+        persist_directory = Path(self.persist_directory)
+        database_path = persist_directory / "chroma.sqlite3"
+        if self._rebuild_marker_path.exists():
+            result["skipped_reason"] = "collection_swap_in_progress"
+            return result
+        if not database_path.is_file():
+            result["skipped_reason"] = "database_missing"
+            return result
+
+        try:
+            connection = sqlite3.connect(
+                f"file:{database_path}?mode=ro",
+                uri=True,
+            )
+            try:
+                referenced_ids = {
+                    row[0] for row in connection.execute("SELECT id FROM segments")
+                }
+            finally:
+                connection.close()
+        except Exception as error:
+            logger.warning("Could not inspect Chroma segment storage: %s", error)
+            result["errors"] = 1
+            return result
+
+        state_path = persist_directory / ".zotero-mcp-orphan-segments.json"
+        try:
+            raw_state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_state, dict):
+                raise ValueError("ledger root must be an object")
+            first_seen = {
+                str(segment_id): float(timestamp)
+                for segment_id, timestamp in raw_state.items()
+            }
+        except FileNotFoundError:
+            first_seen = {}
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            logger.warning("Ignoring invalid orphan-segment ledger: %s", error)
+            first_seen = {}
+
+        orphan_paths: dict[str, Path] = {}
+        for path in persist_directory.iterdir():
+            if not path.is_dir() or path.is_symlink() or path.name in referenced_ids:
+                continue
+            try:
+                if str(uuid.UUID(path.name)) != path.name.lower():
+                    continue
+            except ValueError:
+                continue
+            orphan_paths[path.name] = path
+
+        now = time.time()
+        first_seen = {
+            segment_id: first_seen.get(segment_id, now)
+            for segment_id in orphan_paths
+        }
+
+        def save_ledger() -> None:
+            temporary = state_path.with_suffix(".tmp")
+            if first_seen:
+                temporary.write_text(
+                    json.dumps(first_seen, sort_keys=True),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, state_path)
+            else:
+                state_path.unlink(missing_ok=True)
+                temporary.unlink(missing_ok=True)
+
+        try:
+            # Persist first observation before any deletion. An interrupted run
+            # can therefore never shorten the required grace period.
+            save_ledger()
+        except OSError as error:
+            logger.warning("Could not save orphan-segment ledger: %s", error)
+            result["errors"] = 1
+            return result
+
+        for segment_id, path in orphan_paths.items():
+            if now - first_seen[segment_id] < min_age_seconds:
+                result["deferred_directories"] += 1
+                continue
+            try:
+                directory_bytes = 0
+                for entry in path.rglob("*"):
+                    if entry.is_file():
+                        directory_bytes += entry.stat().st_size
+                shutil.rmtree(path)
+                result["removed_directories"] += 1
+                result["removed_bytes"] += directory_bytes
+                first_seen.pop(segment_id, None)
+            except OSError as error:
+                result["errors"] += 1
+                logger.warning("Could not remove orphan Chroma segment %s: %s", path, error)
+
+        try:
+            save_ledger()
+        except OSError as error:
+            result["errors"] += 1
+            logger.warning("Could not update orphan-segment ledger: %s", error)
+
+        removed = int(result["removed_directories"])
+        if removed:
+            logger.info(
+                "Removed %s orphan Chroma segment director%s (%s bytes)",
+                removed,
+                "y" if removed == 1 else "ies",
+                result["removed_bytes"],
+            )
+        return result
 
     def begin_staged_rebuild(self) -> None:
         """Route rebuild writes to a new collection without touching the index."""

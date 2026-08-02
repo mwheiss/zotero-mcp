@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -139,6 +140,51 @@ def test_staged_rebuild_swaps_only_after_replacement_is_ready(tmp_path):
     client.commit_staged_rebuild()
 
     assert raw_client.get_collection("zotero_library").get()["ids"] == ["NEW"]
+
+
+def test_prune_orphan_segments_respects_references_and_grace_period(tmp_path):
+    client, raw_client = _staging_client(tmp_path)
+    persist_directory = tmp_path / "chroma-staging"
+    old_orphan = persist_directory / "44444444-4444-4444-4444-444444444444"
+    fresh_orphan = persist_directory / "55555555-5555-5555-5555-555555555555"
+    old_orphan.mkdir()
+    fresh_orphan.mkdir()
+    old_file = old_orphan / "index.bin"
+    old_file.write_bytes(b"retired")
+    (fresh_orphan / "index.bin").write_bytes(b"possibly in use")
+
+    first_result = client.prune_orphan_segment_directories(min_age_seconds=3600)
+    ledger_path = persist_directory / ".zotero-mcp-orphan-segments.json"
+    ledger = json.loads(ledger_path.read_text())
+    ledger[old_orphan.name] = time.time() - 7200
+    ledger_path.write_text(json.dumps(ledger))
+
+    result = client.prune_orphan_segment_directories(min_age_seconds=3600)
+
+    assert first_result["removed_directories"] == 0
+    assert first_result["deferred_directories"] == 2
+    assert result["removed_directories"] == 1
+    assert result["removed_bytes"] == len(b"retired")
+    assert result["deferred_directories"] == 1
+    assert not old_orphan.exists()
+    assert fresh_orphan.exists()
+    assert raw_client.get_collection("zotero_library").count() == 1
+
+
+def test_prune_orphan_segments_refuses_during_collection_swap(tmp_path):
+    client, _raw_client = _staging_client(tmp_path)
+    orphan = (
+        tmp_path
+        / "chroma-staging"
+        / "66666666-6666-6666-6666-666666666666"
+    )
+    orphan.mkdir()
+    client._rebuild_marker_path.write_text("{}")
+
+    result = client.prune_orphan_segment_directories(min_age_seconds=0)
+
+    assert result["skipped_reason"] == "collection_swap_in_progress"
+    assert orphan.exists()
 
 
 def test_aborted_staged_rebuild_leaves_live_collection_untouched(tmp_path):
