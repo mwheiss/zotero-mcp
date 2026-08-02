@@ -11,7 +11,6 @@ import logging
 import os
 import shutil
 import sqlite3
-import time
 import uuid
 from contextlib import contextmanager
 from functools import wraps
@@ -22,6 +21,7 @@ try:
     import chromadb
     from chromadb import Documents, EmbeddingFunction, Embeddings
     from chromadb.config import Settings
+    from chromadb.errors import NotFoundError
     from chromadb.utils.embedding_functions import register_embedding_function
 except ImportError as e:
     raise ImportError(
@@ -29,6 +29,7 @@ except ImportError as e:
         "Install it with: pip install 'zotero-mcp-server[semantic]'"
     ) from e
 
+from zotero_mcp._atomic_io import atomic_write_json, durable_unlink
 from zotero_mcp._file_lock import advisory_file_lock
 from zotero_mcp.utils import suppress_stdout
 
@@ -612,9 +613,8 @@ class ChromaClient:
             self.embedding_function = self._create_embedding_function()
 
             with index_lifecycle_lock(self.persist_directory, exclusive=True):
-                active_swap = self._recover_interrupted_rebuild()
-            if active_swap:
-                self._wait_for_collection_swap()
+                self._recover_interrupted_rebuild()
+                self._recover_unmarked_collection_gap()
 
             with index_lifecycle_lock(self.persist_directory, exclusive=False):
                 # Opening a collection must never delete it. A confirmed force
@@ -671,19 +671,9 @@ class ChromaClient:
         }
 
     def _wait_for_collection_swap(self) -> None:
-        """Wait for a live swap, recovering it if its owner terminates."""
-        deadline = time.monotonic() + 10.0
-        while self._rebuild_marker_path.exists():
-            with index_lifecycle_lock(self.persist_directory, exclusive=True):
-                active_swap = self._recover_interrupted_rebuild()
-            if not active_swap:
-                return
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    "Timed out waiting for an active semantic-index "
-                    "collection swap"
-                )
-            time.sleep(0.05)
+        """Wait for any active swap lock, then recover its stale marker."""
+        with index_lifecycle_lock(self.persist_directory, exclusive=True):
+            self._recover_interrupted_rebuild()
 
     def _ensure_live_collection(self) -> None:
         """Refresh a cross-process collection handle after a staged swap."""
@@ -703,6 +693,14 @@ class ChromaClient:
             name=self.collection_name,
             embedding_function=self.embedding_function,
         )
+
+    def _collection_for_read(self):
+        """Return the live collection, even while this client writes staging."""
+        original = getattr(self, "_rebuild_original_collection", None)
+        if original is not None:
+            return original
+        self._ensure_live_collection()
+        return self.collection
 
     def _stored_embedding_model(self) -> str | None:
         """Read Chroma's persisted embedding model without mutating it."""
@@ -954,9 +952,9 @@ class ChromaClient:
         """Return stored documents and metadata keyed by record id."""
         if not ids:
             return {}
-        self._ensure_live_collection()
+        collection = self._collection_for_read()
         try:
-            result = self.collection.get(
+            result = collection.get(
                 ids=ids,
                 include=["documents", "metadatas"],
             )
@@ -1052,7 +1050,7 @@ class ChromaClient:
         Returns:
             Search results from ChromaDB
         """
-        self._ensure_live_collection()
+        collection = self._collection_for_read()
         try:
             query_kwargs = {
                 "n_results": n_results,
@@ -1080,7 +1078,7 @@ class ChromaClient:
             else:
                 query_kwargs["query_texts"] = query_texts
 
-            results = self.collection.query(**query_kwargs)
+            results = collection.query(**query_kwargs)
             logger.info(f"Semantic search returned {len(results.get('ids', [[]])[0])} results")
             return results
         except Exception as e:
@@ -1128,9 +1126,9 @@ class ChromaClient:
     @_with_index_lifecycle_lock(exclusive=False)
     def get_item_chunk_ids(self, item_key: str) -> set[str]:
         """Return every passage id belonging to one parent item."""
-        self._ensure_live_collection()
+        collection = self._collection_for_read()
         try:
-            result = self.collection.get(
+            result = collection.get(
                 where={"parent_item_key": item_key},
                 include=[],
             )
@@ -1146,7 +1144,7 @@ class ChromaClient:
         ids.update(self.get_existing_ids([item_key]))
         if not ids:
             return {}
-        result = self.collection.get(
+        result = self._collection_for_read().get(
             ids=sorted(ids),
             include=["documents", "metadatas"],
         )
@@ -1176,7 +1174,7 @@ class ChromaClient:
         ids.update(self.get_existing_ids([item_key]))
         if not ids:
             return {}
-        result = self.collection.get(
+        result = self._collection_for_read().get(
             ids=sorted(ids),
             include=["documents", "metadatas"],
         )
@@ -1216,31 +1214,18 @@ class ChromaClient:
     @_with_index_lifecycle_lock(exclusive=False)
     def get_collection_info(self) -> dict[str, Any]:
         """Get information about the collection."""
-        self._ensure_live_collection()
-        try:
-            count = self.collection.count()
-            return {
-                "name": self.collection_name,
-                "count": count,
-                "embedding_model": self.embedding_model,
-                "persist_directory": self.persist_directory
-            }
-
-        except Exception as e:
-            logger.error(f"Error getting collection info: {e}")
-            return {
-                "name": self.collection_name,
-                "count": 0,
-                "embedding_model": self.embedding_model,
-                "persist_directory": self.persist_directory,
-                "error": str(e)
-            }
+        count = self._collection_for_read().count()
+        return {
+            "name": self.collection_name,
+            "count": count,
+            "embedding_model": self.embedding_model,
+            "persist_directory": self.persist_directory,
+        }
 
     @_with_index_lifecycle_lock(exclusive=False)
     def count_documents(self) -> int:
         """Return the number of vector records in the collection."""
-        self._ensure_live_collection()
-        return int(self.collection.count())
+        return int(self._collection_for_read().count())
 
     @_with_index_lifecycle_lock(exclusive=True)
     def reset_collection(self) -> None:
@@ -1254,6 +1239,7 @@ class ChromaClient:
                 metadata=self._new_collection_metadata(),
             )
             self._pending_embedding_mismatch = False
+            self._prune_orphan_segment_directories_unlocked()
             logger.info(f"Reset ChromaDB collection '{self.collection_name}'")
         except Exception as e:
             logger.error(f"Error resetting collection: {e}")
@@ -1261,6 +1247,14 @@ class ChromaClient:
 
     @_with_index_lifecycle_lock(exclusive=True)
     def prune_orphan_segment_directories(self) -> dict[str, int | str]:
+        """Remove HNSW directories unreferenced under the exclusive lock."""
+        return self._prune_orphan_segment_directories_unlocked()
+
+    def _prune_orphan_segment_directories_unlocked(
+        self,
+        *,
+        allow_during_swap: bool = False,
+    ) -> dict[str, int | str]:
         """Remove HNSW directories unreferenced under the exclusive lock.
 
         Chroma removes deleted segment rows from SQLite but can leave their
@@ -1275,7 +1269,7 @@ class ChromaClient:
         }
         persist_directory = Path(self.persist_directory)
         database_path = persist_directory / "chroma.sqlite3"
-        if self._rebuild_marker_path.exists():
+        if self._rebuild_marker_path.exists() and not allow_during_swap:
             result["skipped_reason"] = "collection_swap_in_progress"
             return result
         if not database_path.is_file():
@@ -1355,6 +1349,7 @@ class ChromaClient:
                     self.client.delete_collection(name=name)
         except Exception as e:
             logger.warning("Could not clean old rebuild collections: %s", e)
+        self._prune_orphan_segment_directories_unlocked()
 
         staging_name = f"{self.collection_name}__rebuild_{uuid.uuid4().hex}"
         original_collection = self.collection
@@ -1395,8 +1390,14 @@ class ChromaClient:
                 original_collection.modify(name=self.collection_name)
                 raise
         except Exception as e:
-            self.collection = original_collection
-            self._clear_rebuild_marker()
+            # The marker describes every possible partial rename state. Recover
+            # it while still holding the exclusive lock before reporting the
+            # activation failure, including when the rollback rename also failed.
+            self._recover_interrupted_rebuild()
+            self.collection = self.client.get_collection(
+                name=self.collection_name,
+                embedding_function=_NoEmbeddingFunction(),
+            )
             logger.error("Error activating staged rebuild collection: %s", e)
             raise
 
@@ -1404,9 +1405,13 @@ class ChromaClient:
         self._pending_embedding_mismatch = False
         self._rebuild_original_collection = None
         self._rebuild_staging_name = None
-        # Keep the uniquely named previous collection until the next rebuild.
-        # A long-lived MCP process may still have an in-flight query against
-        # its collection id while this cross-process handoff completes.
+        # The exclusive lifecycle lock drained every old-collection reader
+        # before the rename, so the retired collection can be reclaimed now.
+        try:
+            self.client.delete_collection(name=backup_name)
+        except Exception as e:
+            logger.warning("Could not remove replaced collection: %s", e)
+        self._prune_orphan_segment_directories_unlocked(allow_during_swap=True)
         self._clear_rebuild_marker()
         logger.info(
             "Activated rebuilt ChromaDB collection '%s'",
@@ -1421,15 +1426,23 @@ class ChromaClient:
         if original_collection is None or staging_name is None:
             return
 
-        if self._rebuild_marker_path.exists():
-            self._recover_interrupted_rebuild(force=True)
-        self.collection = original_collection
+        recovered_swap = self._rebuild_marker_path.exists()
+        if recovered_swap:
+            self._recover_interrupted_rebuild()
+        if recovered_swap:
+            self.collection = self.client.get_collection(
+                name=self.collection_name,
+                embedding_function=_NoEmbeddingFunction(),
+            )
+        else:
+            self.collection = original_collection
         self._rebuild_original_collection = None
         self._rebuild_staging_name = None
         try:
             self.client.delete_collection(name=staging_name)
         except Exception as e:
             logger.warning("Could not remove incomplete rebuild collection: %s", e)
+        self._prune_orphan_segment_directories_unlocked()
         logger.info(
             "Discarded incomplete rebuild; collection '%s' was left untouched",
             self.collection_name,
@@ -1446,36 +1459,56 @@ class ChromaClient:
             "staging_name": staging_name,
             "backup_name": backup_name,
         }
-        temporary = self._rebuild_marker_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(marker), encoding="utf-8")
-        os.replace(temporary, self._rebuild_marker_path)
+        atomic_write_json(self._rebuild_marker_path, marker)
 
     def _clear_rebuild_marker(self) -> None:
         try:
-            self._rebuild_marker_path.unlink(missing_ok=True)
+            durable_unlink(self._rebuild_marker_path)
         except OSError as e:
-            logger.warning("Could not clear rebuild recovery marker: %s", e)
+            logger.error("Could not clear rebuild recovery marker: %s", e)
+            raise
 
-    @staticmethod
-    def _process_is_alive(pid: int) -> bool:
-        if pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
+    def _recover_unmarked_collection_gap(self) -> None:
+        """Restore a lone backup if a power loss dropped the swap marker."""
+        names = {
+            getattr(collection, "name", collection)
+            for collection in self.client.list_collections()
+        }
+        if self.collection_name in names:
+            return
 
-    def _recover_interrupted_rebuild(self, *, force: bool = False) -> bool:
-        """Recover a collection swap left incomplete by a terminated process.
+        backup_prefix = f"{self.collection_name}__replaced_"
+        staging_prefix = f"{self.collection_name}__rebuild_"
+        backups = sorted(
+            name for name in names if isinstance(name, str) and name.startswith(backup_prefix)
+        )
+        stagings = sorted(
+            name for name in names if isinstance(name, str) and name.startswith(staging_prefix)
+        )
+        if len(backups) == 1:
+            backup = self.client.get_collection(
+                name=backups[0],
+                embedding_function=_NoEmbeddingFunction(),
+            )
+            backup.modify(name=self.collection_name)
+            for staging_name in stagings:
+                self.client.delete_collection(name=staging_name)
+            self._prune_orphan_segment_directories_unlocked()
+            logger.warning(
+                "Recovered unmarked semantic-index swap gap from backup '%s'",
+                backups[0],
+            )
+            return
+        if backups or stagings:
+            raise RuntimeError(
+                "Semantic-index collection is missing and leftover rebuild "
+                "collections are ambiguous; refusing to create an empty index"
+            )
 
-        Returns True when another live process owns the marker and callers
-        should wait for it to finish.
-        """
+    def _recover_interrupted_rebuild(self) -> None:
+        """Recover a collection swap after its exclusive lock was released."""
         if not self._rebuild_marker_path.exists():
-            return False
+            return
         try:
             marker = json.loads(
                 self._rebuild_marker_path.read_text(encoding="utf-8")
@@ -1490,13 +1523,9 @@ class ChromaClient:
                 expected_backup
             ):
                 raise ValueError("marker contains unsafe collection names")
-            owner_pid = int(marker.get("pid") or 0)
         except Exception as e:
             logger.error("Invalid rebuild recovery marker: %s", e)
             raise RuntimeError("Invalid semantic-index rebuild recovery marker") from e
-
-        if not force and self._process_is_alive(owner_pid):
-            return True
 
         names = {
             getattr(collection, "name", collection)
@@ -1508,6 +1537,8 @@ class ChromaClient:
         if live_exists:
             if staging_exists:
                 self.client.delete_collection(name=staging_name)
+            if backup_exists:
+                self.client.delete_collection(name=backup_name)
         elif backup_exists:
             backup = self.client.get_collection(
                 name=backup_name,
@@ -1526,22 +1557,18 @@ class ChromaClient:
             raise RuntimeError(
                 "Interrupted semantic-index swap has no recoverable collection"
             )
+        self._prune_orphan_segment_directories_unlocked(allow_during_swap=True)
         self._clear_rebuild_marker()
         logger.warning(
             "Recovered interrupted rebuild for collection '%s'",
             self.collection_name,
         )
-        return False
 
     @_with_index_lifecycle_lock(exclusive=False)
     def document_exists(self, doc_id: str) -> bool:
         """Check if a document exists in the collection."""
-        self._ensure_live_collection()
-        try:
-            result = self.collection.get(ids=[doc_id])
-            return len(result['ids']) > 0
-        except Exception:
-            return False
+        result = self._collection_for_read().get(ids=[doc_id])
+        return len(result["ids"]) > 0
 
     @_with_index_lifecycle_lock(exclusive=False)
     def get_document_metadata(self, doc_id: str) -> dict[str, Any] | None:
@@ -1560,23 +1587,22 @@ class ChromaClient:
         Returns:
             Metadata dictionary if the item is indexed, None otherwise
         """
-        self._ensure_live_collection()
-        try:
-            result = self.collection.get(ids=[doc_id, f"{doc_id}#0"], include=["metadatas"])
-            if result['ids'] and result['metadatas']:
-                return result['metadatas'][0]
-            return None
-        except Exception:
-            return None
+        result = self._collection_for_read().get(
+            ids=[doc_id, f"{doc_id}#0"],
+            include=["metadatas"],
+        )
+        if result["ids"] and result["metadatas"]:
+            return result["metadatas"][0]
+        return None
 
     @_with_index_lifecycle_lock(exclusive=False)
     def get_existing_ids(self, ids: list[str]) -> set[str]:
         """Return the subset of ids that already exist in the collection."""
         if not ids:
             return set()
-        self._ensure_live_collection()
+        collection = self._collection_for_read()
         try:
-            result = self.collection.get(ids=ids, include=[])
+            result = collection.get(ids=ids, include=[])
             return set(result.get("ids", []))
         except Exception as e:
             logger.error("Error checking collection ids: %s", e)
@@ -1589,9 +1615,9 @@ class ChromaClient:
         Used by incremental sync to compute deletions: items in the local
         collection but no longer present in the Zotero library.
         """
-        self._ensure_live_collection()
+        collection = self._collection_for_read()
         try:
-            result = self.collection.get(include=[])
+            result = collection.get(include=[])
             return set(result.get("ids", []))
         except Exception as e:
             logger.error(f"Error listing collection ids: {e}")
@@ -1788,7 +1814,7 @@ def read_collection_status(
                         name=collection_name,
                         embedding_function=_NoEmbeddingFunction(),
                     )
-                except Exception:
+                except NotFoundError:
                     # Collection does not exist yet — database not initialized.
                     return {**base, "count": 0, "initialized": False}
                 count = collection.count()

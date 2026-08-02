@@ -27,6 +27,9 @@ class _FakePersistentClient:
     def get_collection(self, **kwargs):
         return self.collection
 
+    def list_collections(self):
+        return [SimpleNamespace(name="zotero_library")]
+
     def delete_collection(self, **kwargs):
         self.deleted.append(kwargs["name"])
 
@@ -136,10 +139,14 @@ def test_staged_rebuild_swaps_only_after_replacement_is_ready(tmp_path):
     client.begin_staged_rebuild()
     assert raw_client.get_collection("zotero_library").get()["ids"] == ["OLD"]
     client.collection.add(ids=["NEW"], embeddings=[[0.0, 1.0]])
+    assert client.get_all_ids() == {"OLD"}
 
     client.commit_staged_rebuild()
 
     assert raw_client.get_collection("zotero_library").get()["ids"] == ["NEW"]
+    assert [collection.name for collection in raw_client.list_collections()] == [
+        "zotero_library"
+    ]
 
 
 def test_prune_orphan_segments_preserves_references_and_removes_orphans(tmp_path):
@@ -309,7 +316,7 @@ def test_interrupted_swap_restores_backup_before_opening(tmp_path):
     client._rebuild_marker_path.write_text(json.dumps(marker))
     client._rebuild_original_collection.modify(name=backup_name)
 
-    assert client._recover_interrupted_rebuild() is False
+    client._recover_interrupted_rebuild()
 
     assert set(raw_client.get_collection("zotero_library").get()["ids"]) == {"OLD"}
     names = {collection.name for collection in raw_client.list_collections()}
@@ -331,12 +338,28 @@ def test_interrupted_swap_keeps_activated_replacement(tmp_path):
     client._rebuild_original_collection.modify(name=backup_name)
     client.collection.modify(name="zotero_library")
 
-    assert client._recover_interrupted_rebuild() is False
+    client._recover_interrupted_rebuild()
 
     assert set(raw_client.get_collection("zotero_library").get()["ids"]) == {"NEW"}
     names = {collection.name for collection in raw_client.list_collections()}
-    assert backup_name in names
+    assert backup_name not in names
     assert not client._rebuild_marker_path.exists()
+
+
+def test_unmarked_swap_gap_restores_only_backup(tmp_path):
+    client, raw_client = _staging_client(tmp_path)
+    client.begin_staged_rebuild()
+    client.collection.add(ids=["PARTIAL"], embeddings=[[0.5, 0.5]])
+    staging_name = client._rebuild_staging_name
+    backup_name = "zotero_library__replaced_power_loss"
+    client._rebuild_original_collection.modify(name=backup_name)
+
+    client._recover_unmarked_collection_gap()
+
+    assert set(raw_client.get_collection("zotero_library").get()["ids"]) == {"OLD"}
+    names = {collection.name for collection in raw_client.list_collections()}
+    assert staging_name not in names
+    assert backup_name not in names
 
 
 class _RecordCollection:
@@ -391,6 +414,25 @@ def test_collection_id_read_errors_are_not_treated_as_empty():
 
     with pytest.raises(OSError, match="database unavailable"):
         client.get_all_ids()
+
+
+def test_metadata_and_status_read_errors_are_not_treated_as_missing():
+    class FailingCollection:
+        def get(self, **kwargs):
+            raise OSError("database unavailable")
+
+        def count(self):
+            raise OSError("database unavailable")
+
+    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
+    client.collection = FailingCollection()
+
+    with pytest.raises(OSError, match="database unavailable"):
+        client.document_exists("A")
+    with pytest.raises(OSError, match="database unavailable"):
+        client.get_document_metadata("A")
+    with pytest.raises(OSError, match="database unavailable"):
+        client.get_collection_info()
 
 
 def test_record_reads_and_metadata_only_updates_preserve_documents():

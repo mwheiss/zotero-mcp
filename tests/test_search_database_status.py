@@ -112,3 +112,24 @@ def test_read_collection_status_reports_populated_count():
         assert status["count"] == n
     finally:
         shutil.rmtree(persist_dir, ignore_errors=True)
+
+
+def test_read_collection_status_reports_database_errors(monkeypatch, tmp_path):
+    class FailingClient:
+        def get_collection(self, **kwargs):
+            raise OSError("database unavailable")
+
+    monkeypatch.setattr(
+        chroma_client.chromadb,
+        "PersistentClient",
+        lambda **kwargs: FailingClient(),
+    )
+
+    status = chroma_client.read_collection_status(
+        config_path=None,
+        persist_directory=str(tmp_path),
+    )
+
+    assert status["count"] == 0
+    assert "database unavailable" in status["error"]
+    assert "initialized" not in status
