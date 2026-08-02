@@ -299,10 +299,11 @@ def audit_semantic_database(
                 and all(row[0] == "segments" for row in foreign_key_rows)
                 and unowned_segments == 0
             )
-            level = "warning" if vendor_schema_only else "error"
+            level = "ok" if vendor_schema_only else "error"
             detail = (
                 "Chroma's segments table references the non-existent singular "
-                "table name 'collection'; segment ownership is checked separately."
+                "table name 'collection', but every segment belongs to an existing "
+                "collection. No repair is required."
                 if vendor_schema_only
                 else f"SQLite reports {len(foreign_key_rows)} foreign-key violation(s)."
             )

@@ -176,7 +176,7 @@ def test_health_audit_replays_queue_without_modifying_files(tmp_path):
     assert report.metrics["items"] == 2
     assert report.metrics["hnsw_replayed_operations"] == 1
     assert _finding(report, "vector_replay").level == "ok"
-    assert _finding(report, "foreign_keys").level == "warning"
+    assert _finding(report, "foreign_keys").level == "ok"
     after = [(path.stat().st_mtime_ns, path.read_bytes()) for path in tracked]
     assert after == before
 
