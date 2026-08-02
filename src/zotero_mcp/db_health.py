@@ -11,6 +11,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ._file_lock import acquire_file_lock
+from .chroma_client import index_lifecycle_lock
+
 
 @dataclass
 class HealthFinding:
@@ -67,7 +70,7 @@ def _read_config(config_path: Path) -> dict[str, Any]:
 
 def _read_only_connection(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(
-        f"file:{path}?mode=ro&immutable=1",
+        f"file:{path}?mode=ro",
         uri=True,
     )
     connection.row_factory = sqlite3.Row
@@ -76,21 +79,13 @@ def _read_only_connection(path: Path) -> sqlite3.Connection:
 
 def _acquire_shared_update_lock() -> tuple[Any, bool]:
     """Hold a shared flock so an update cannot mutate the audited snapshot."""
-    try:
-        import fcntl
-    except ImportError:
-        return None, True
-
     lock_path = Path.home() / ".config" / "zotero-mcp" / "update.lock"
-    if not lock_path.exists():
-        return None, True
-    lock_file = lock_path.open("r", encoding="utf-8")
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock_file.close()
-        return None, False
-    return lock_file, True
+    lock_file = acquire_file_lock(
+        lock_path,
+        exclusive=False,
+        blocking=False,
+    )
+    return lock_file, lock_file is not None
 
 
 def _table_names(connection: sqlite3.Connection) -> set[str]:
@@ -215,17 +210,30 @@ def audit_semantic_database(
         return report
     report.add("ok", "update_lock", "No update can start during this audit snapshot.")
 
+    lifecycle_lock = index_lifecycle_lock(persist_directory, exclusive=False)
+    try:
+        lifecycle_lock.__enter__()
+    except Exception as error:
+        if update_lock is not None:
+            update_lock.close()
+        report.add(
+            "error",
+            "lifecycle_lock",
+            f"Could not lock the Chroma lifecycle for auditing: {error}",
+        )
+        return report
+    report.add(
+        "ok",
+        "lifecycle_lock",
+        "Collection swaps and physical cleanup are blocked during the audit.",
+    )
+
     if not database_path.is_file():
         report.add("error", "database", f"Database does not exist: {database_path}")
+        lifecycle_lock.__exit__(None, None, None)
         if update_lock is not None:
             update_lock.close()
         return report
-    if database_path.with_name(database_path.name + "-wal").exists():
-        report.add(
-            "warning",
-            "database_snapshot",
-            "A Chroma WAL exists; immutable checks may not include its newest rows.",
-        )
 
     markers = sorted(persist_directory.glob(".zotero-mcp-rebuild-*.json"))
     if markers:
@@ -241,6 +249,7 @@ def audit_semantic_database(
         connection = _read_only_connection(database_path)
     except Exception as error:
         report.add("error", "database", f"Could not open database read-only: {error}")
+        lifecycle_lock.__exit__(None, None, None)
         if update_lock is not None:
             update_lock.close()
         return report
@@ -659,6 +668,7 @@ def audit_semantic_database(
         report.add("error", "audit", f"Health audit failed: {error}")
     finally:
         connection.close()
+        lifecycle_lock.__exit__(None, None, None)
         if update_lock is not None:
             update_lock.close()
 

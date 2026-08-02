@@ -29,6 +29,7 @@ except ImportError as e:
         "Install it with: pip install 'zotero-mcp-server[semantic]'"
     ) from e
 
+from zotero_mcp._file_lock import advisory_file_lock
 from zotero_mcp.utils import suppress_stdout
 
 logger = logging.getLogger(__name__)
@@ -48,22 +49,17 @@ def index_lifecycle_lock(
     exclusive: bool,
 ):
     """Coordinate Chroma access with collection swaps and physical cleanup."""
-    try:
-        import fcntl
-    except ImportError:
-        yield
-        return
-
     persist_path = Path(persist_directory)
     persist_path.mkdir(parents=True, exist_ok=True)
     lock_path = persist_path / INDEX_LIFECYCLE_LOCK_NAME
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        fcntl.flock(lock_file.fileno(), operation)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with advisory_file_lock(
+        lock_path,
+        exclusive=exclusive,
+        blocking=True,
+    ) as lock_file:
+        if lock_file is None:  # pragma: no cover - blocking acquisition
+            raise RuntimeError("Could not acquire semantic-index lifecycle lock")
+        yield
 
 
 def _with_index_lifecycle_lock(*, exclusive: bool):

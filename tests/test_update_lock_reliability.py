@@ -43,11 +43,13 @@ def test_read_lock_holder_dead_pid(tmp_path):
 
 
 @skip_on_ci
-def test_force_update_env_bypasses_lock(tmp_path, monkeypatch):
+def test_force_update_env_does_not_bypass_live_lock(tmp_path, monkeypatch):
     lock = tmp_path / "update.lock"
-    monkeypatch.setenv("ZOTERO_MCP_FORCE_UPDATE", "1")
-    with semantic_search._acquire_update_lock(lock) as acquired:
-        assert acquired is True
+    with semantic_search._acquire_update_lock(lock) as first_acquired:
+        assert first_acquired is True
+        monkeypatch.setenv("ZOTERO_MCP_FORCE_UPDATE", "1")
+        with semantic_search._acquire_update_lock(lock) as second_acquired:
+            assert second_acquired is False
 
 
 @skip_on_ci

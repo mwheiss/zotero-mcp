@@ -5,11 +5,15 @@ import json
 import pickle
 import sqlite3
 import sys
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from zotero_mcp import cli, db_health
+from zotero_mcp import cli, db_health, semantic_search
+
+_REAL_ACQUIRE_SHARED_UPDATE_LOCK = db_health._acquire_shared_update_lock
 
 
 @pytest.fixture(autouse=True)
@@ -309,6 +313,65 @@ def test_health_audit_refuses_snapshot_during_update(monkeypatch, tmp_path):
 
     assert report.healthy is False
     assert _finding(report, "update_lock").level == "error"
+
+
+def test_health_lock_is_created_and_blocks_first_updater(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    lock_file, available = _REAL_ACQUIRE_SHARED_UPDATE_LOCK()
+    try:
+        assert available is True
+        assert lock_file is not None
+        lock_path = tmp_path / ".config" / "zotero-mcp" / "update.lock"
+        assert lock_path.exists()
+        with semantic_search._acquire_update_lock(lock_path) as acquired:
+            assert acquired is False
+    finally:
+        if lock_file is not None:
+            lock_file.close()
+
+
+def test_health_audit_holds_lifecycle_lock(monkeypatch, tmp_path):
+    config_path, persist_directory = _create_fixture(tmp_path)
+    entered_audit = threading.Event()
+    release_audit = threading.Event()
+    exclusive_acquired = threading.Event()
+    original_table_names = db_health._table_names
+
+    def blocking_table_names(connection):
+        entered_audit.set()
+        assert release_audit.wait(timeout=5)
+        return original_table_names(connection)
+
+    monkeypatch.setattr(db_health, "_table_names", blocking_table_names)
+    audit = threading.Thread(
+        target=db_health.audit_semantic_database,
+        args=(config_path,),
+        kwargs={
+            "persist_directory": persist_directory,
+            "compare_zotero": False,
+        },
+    )
+
+    def acquire_exclusive():
+        with db_health.index_lifecycle_lock(
+            persist_directory,
+            exclusive=True,
+        ):
+            exclusive_acquired.set()
+
+    writer = threading.Thread(target=acquire_exclusive)
+    audit.start()
+    assert entered_audit.wait(timeout=2)
+    writer.start()
+    assert not exclusive_acquired.wait(timeout=0.1)
+    release_audit.set()
+    audit.join(timeout=2)
+    writer.join(timeout=2)
+
+    assert not audit.is_alive()
+    assert not writer.is_alive()
+    assert exclusive_acquired.is_set()
 
 
 def test_db_health_cli_returns_report_status(monkeypatch, capsys):

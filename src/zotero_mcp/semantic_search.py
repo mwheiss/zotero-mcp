@@ -37,6 +37,7 @@ except Exception:
 
 
 from . import openai_batch
+from ._file_lock import advisory_file_lock
 from .chroma_client import ChromaClient, create_chroma_client, record_state_hash
 from .client import get_zotero_client
 from .local_db import LocalZoteroReader
@@ -297,11 +298,6 @@ def read_lock_holder(lock_path: Path) -> tuple[int | None, bool]:
     return pid, _pid_is_alive(pid)
 
 
-def _force_update_requested() -> bool:
-    """Whether the user asked to bypass the cross-process update lock."""
-    return os.getenv("ZOTERO_MCP_FORCE_UPDATE", "").strip().lower() in {"1", "true", "yes"}
-
-
 @contextlib.contextmanager
 def _acquire_update_lock(lock_path: Path):
     """Non-blocking exclusive flock over an update-database run.
@@ -311,47 +307,26 @@ def _acquire_update_lock(lock_path: Path):
     MCP server's auto-update in ``server_lifespan`` from racing a manual
     ``zotero-mcp update-db`` invocation on the same ChromaDB collection.
 
-    Setting ``ZOTERO_MCP_FORCE_UPDATE=1`` bypasses the lock entirely — an
-    escape hatch for the rare case where a lock appears stuck (e.g. a crashed
-    holder on a filesystem with quirky flock semantics) and the user knowingly
-    accepts the small double-work risk.
-
-    Windows lacks ``fcntl``; on that platform the function degrades to a
-    no-op and yields True so behaviour matches pre-lock releases.
+    Kernel locks are released automatically when a process exits, so there is
+    deliberately no override that can admit a second live updater.
     """
-    if _force_update_requested():
-        yield True
-        return
-
-    try:
-        import fcntl
-    except ImportError:
-        yield True
-        return
-
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = None
-    try:
-        # Do not truncate before acquiring the flock: a losing contender must
-        # preserve the current holder's PID for diagnostics.
-        fd = open(lock_path, "a+")
-        try:
-            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with advisory_file_lock(
+        lock_path,
+        exclusive=True,
+        blocking=False,
+    ) as lock_file:
+        if lock_file is None:
             yield False
             return
         # Record our pid so a concurrent invocation can report the holder.
         try:
-            fd.seek(0)
-            fd.truncate()
-            fd.write(str(os.getpid()))
-            fd.flush()
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(str(os.getpid()).encode("ascii"))
+            lock_file.flush()
         except Exception:
             pass
         yield True
-    finally:
-        if fd is not None:
-            fd.close()
 
 
 def _truncate_to_tokens(text: str, max_tokens: int = 8000) -> str:
@@ -2526,8 +2501,8 @@ class ZoteroSemanticSearch:
             if holder_pid and not holder_alive:
                 logger.warning(
                     "Update lock at %s is held by dead pid %s (stale). "
-                    "flock should have released it; set ZOTERO_MCP_FORCE_UPDATE=1 "
-                    "to bypass if this persists.",
+                    "the kernel should have released it; check the filesystem "
+                    "if this persists.",
                     lock_path,
                     holder_pid,
                 )
@@ -2536,7 +2511,7 @@ class ZoteroSemanticSearch:
                     "Another semantic-search update is already running "
                     "(lock held at %s by pid %s); skipping this invocation. "
                     "This is expected when the MCP server's background sync is "
-                    "active. Set ZOTERO_MCP_FORCE_UPDATE=1 to override.",
+                    "active.",
                     lock_path,
                     holder_pid if holder_pid else "unknown",
                 )
