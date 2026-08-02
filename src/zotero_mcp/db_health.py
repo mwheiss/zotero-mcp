@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ._file_lock import acquire_file_lock
+from ._file_lock import acquire_file_lock, release_file_lock
 from .chroma_client import index_lifecycle_lock
 
 
@@ -215,7 +215,7 @@ def audit_semantic_database(
         lifecycle_lock.__enter__()
     except Exception as error:
         if update_lock is not None:
-            update_lock.close()
+            release_file_lock(update_lock)
         report.add(
             "error",
             "lifecycle_lock",
@@ -232,7 +232,7 @@ def audit_semantic_database(
         report.add("error", "database", f"Database does not exist: {database_path}")
         lifecycle_lock.__exit__(None, None, None)
         if update_lock is not None:
-            update_lock.close()
+            release_file_lock(update_lock)
         return report
 
     markers = sorted(persist_directory.glob(".zotero-mcp-rebuild-*.json"))
@@ -251,7 +251,7 @@ def audit_semantic_database(
         report.add("error", "database", f"Could not open database read-only: {error}")
         lifecycle_lock.__exit__(None, None, None)
         if update_lock is not None:
-            update_lock.close()
+            release_file_lock(update_lock)
         return report
 
     try:
@@ -670,7 +670,7 @@ def audit_semantic_database(
         connection.close()
         lifecycle_lock.__exit__(None, None, None)
         if update_lock is not None:
-            update_lock.close()
+            release_file_lock(update_lock)
 
     return report
 

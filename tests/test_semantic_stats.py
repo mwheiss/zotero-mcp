@@ -1,3 +1,4 @@
+import json
 import sys
 
 import pytest
@@ -9,6 +10,37 @@ if sys.version_info >= (3, 14):
     )
 
 from zotero_mcp import semantic_search
+
+
+def test_save_update_config_refuses_to_replace_invalid_json(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("not json")
+    search = semantic_search.ZoteroSemanticSearch.__new__(
+        semantic_search.ZoteroSemanticSearch
+    )
+    search.config_path = str(config_path)
+    search.update_config = {"batch_size": 25}
+
+    with pytest.raises(RuntimeError, match="unreadable configuration"):
+        search._save_update_config(last_sync_version=42)
+
+    assert config_path.read_text() == "not json"
+
+
+def test_save_update_config_preserves_existing_settings(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"zotero": {"library_id": "123"}}))
+    search = semantic_search.ZoteroSemanticSearch.__new__(
+        semantic_search.ZoteroSemanticSearch
+    )
+    search.config_path = str(config_path)
+    search.update_config = {"batch_size": 25}
+
+    search._save_update_config(last_sync_version=42)
+
+    saved = json.loads(config_path.read_text())
+    assert saved["zotero"] == {"library_id": "123"}
+    assert saved["semantic_search"]["last_sync_version"] == 42
 
 
 class FakeChromaClient:

@@ -37,6 +37,7 @@ except Exception:
 
 
 from . import openai_batch
+from ._atomic_io import atomic_write_json
 from ._file_lock import advisory_file_lock
 from .chroma_client import ChromaClient, create_chroma_client, record_state_hash
 from .client import get_zotero_client
@@ -881,14 +882,16 @@ class ZoteroSemanticSearch:
         config_dir = Path(self.config_path).parent
         config_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load existing config or create new one
+        # Never replace an unreadable config with a partial default document.
         full_config = {}
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path) as f:
                     full_config = json.load(f)
-            except Exception:
-                pass
+            except Exception as e:
+                raise RuntimeError(
+                    f"Cannot update unreadable configuration {self.config_path}: {e}"
+                ) from e
 
         # Update semantic search config
         if "semantic_search" not in full_config:
@@ -906,11 +909,7 @@ class ZoteroSemanticSearch:
                 indexed_content_signature
             )
 
-        try:
-            with open(self.config_path, "w") as f:
-                json.dump(full_config, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving update config: {e}")
+        atomic_write_json(self.config_path, full_config, indent=2)
 
     def _create_document_text(self, item: dict[str, Any]) -> str:
         """
@@ -2530,12 +2529,9 @@ class ZoteroSemanticSearch:
             stats["fulltext"] = fulltext
             indexed_fulltext = self._load_indexed_fulltext()
             indexed_content_signature = self._load_indexed_content_signature()
-            try:
-                collection_has_items = (
-                    int(self.chroma_client.get_collection_info().get("count", 0)) > 0
-                )
-            except Exception:
-                collection_has_items = False
+            collection_has_items = (
+                int(self.chroma_client.get_collection_info().get("count", 0)) > 0
+            )
             indexed_fulltext_state = (
                 fulltext
                 if force_full_rebuild or not collection_has_items

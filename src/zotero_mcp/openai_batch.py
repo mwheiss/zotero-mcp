@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ._atomic_io import atomic_write_json, atomic_write_lines
+
 OPENAI_BATCH_ENDPOINT = "/v1/embeddings"
 OPENAI_BATCH_COMPLETION_WINDOW = "24h"
 OPENAI_BATCH_MAX_REQUESTS = 50_000
@@ -137,10 +139,7 @@ def split_embedding_records(
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(_json_dumps(row) + "\n")
-    _private_chmod(path)
+    atomic_write_lines(path, (_json_dumps(row) + "\n" for row in rows))
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -154,10 +153,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def save_manifest(manifest: dict[str, Any]) -> None:
     manifest_path = Path(manifest["manifest_path"])
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-    _private_chmod(manifest_path)
+    atomic_write_json(manifest_path, manifest, indent=2)
 
 
 def load_manifest(path: Path) -> dict[str, Any]:

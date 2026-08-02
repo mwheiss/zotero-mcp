@@ -85,6 +85,9 @@ class FakeChroma:
     def reset_collection(self):
         raise AssertionError("reset_collection should not be called")
 
+    def get_collection_info(self):
+        return {"count": len(self.ids)}
+
     def get_all_ids(self):
         return set(self.ids)
 

@@ -73,6 +73,9 @@ class _ConcurrentChroma:
     def reset_collection(self):
         pass
 
+    def get_collection_info(self):
+        return {"count": sum(len(batch) for batch in self.upserted_batches)}
+
     def begin_staged_rebuild(self):
         pass
 
