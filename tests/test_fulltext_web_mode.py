@@ -635,6 +635,11 @@ def test_metadata_first_update_keeps_unchanged_fulltext(monkeypatch, tmp_path):
         chroma,
         config_path=_write_config(tmp_path),
     )
+    chroma.metadata_by_key["A"]["embedding_metadata_sha256"] = (
+        semantic_search._embedding_content_hash(
+            search._create_document_text(item).strip()
+        )
+    )
     reader = Reader()
     monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
     monkeypatch.setattr(
@@ -650,6 +655,86 @@ def test_metadata_first_update_keeps_unchanged_fulltext(monkeypatch, tmp_path):
     assert preserved_items == preserved_records == 1
     assert reader.extract_calls == 0
     assert chroma.metadata_by_key["A"]["title"] == "Updated metadata title"
+
+    chroma.metadata_by_key["A"]["embedding_metadata_sha256"] = "old-payload"
+    remaining, preserved_items, preserved_records, complete = (
+        search._maintain_existing_fulltext([item])
+    )
+
+    assert complete is True
+    assert preserved_items == preserved_records == 0
+    assert reader.extract_calls == 1
+    assert remaining[0]["data"]["fulltext"] == "should not be extracted"
+
+
+def test_local_refresh_runs_prune_and_metadata_before_extraction(
+    monkeypatch, tmp_path
+):
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 0})
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("A")], library_version=12)
+    chroma = FakeChromaClient(
+        preloaded_ids=["A", "REMOVED"],
+        preloaded_metadata={"A": {"title": "Old title"}},
+    )
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+    monkeypatch.setattr(search, "_verify_local_snapshot_version", lambda version: version)
+
+    def scan(**kwargs):
+        item = _paper("A", title="New title")
+        kwargs["pre_extraction_callback"]([item], {"A"}, {"A"})
+        chroma.operation_events.append("extract")
+        item["data"]["fulltext"] = "new body"
+        item["data"]["fulltextSource"] = "pdf"
+        search._last_scan_indexable_keys = {"A"}
+        return [item]
+
+    monkeypatch.setattr(search, "_get_items_from_source", scan)
+
+    stats = search.update_database(fulltext=True)
+
+    assert stats["errors"] == 0
+    assert chroma.operation_events.index("delete") < chroma.operation_events.index(
+        "extract"
+    )
+    assert chroma.operation_events.index("metadata") < chroma.operation_events.index(
+        "extract"
+    )
+    assert chroma.operation_events.index("extract") < chroma.operation_events.index(
+        "upsert"
+    )
+
+
+def test_collection_filter_uses_local_scan_without_fulltext(monkeypatch, tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        extra={"collection_keys": ["COLLECTION"]},
+    )
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("A")], library_version=12)
+    search = _build_search(
+        monkeypatch,
+        zot,
+        FakeChromaClient(),
+        config_path=config_path,
+    )
+    monkeypatch.setattr(search, "_verify_local_snapshot_version", lambda version: version)
+    captured = {}
+
+    def scan(**kwargs):
+        captured.update(kwargs)
+        search._last_scan_indexable_keys = {"A"}
+        kwargs["pre_extraction_callback"]([_paper("A")], {"A"}, {"A"})
+        return [_paper("A")]
+
+    monkeypatch.setattr(search, "_get_items_from_source", scan)
+
+    stats = search.update_database(fulltext=False)
+
+    assert stats["errors"] == 0
+    assert captured["fulltext"] is False
+    assert captured["local_scan"] is True
+    assert callable(captured["pre_extraction_callback"])
 
 
 def test_content_contract_change_warns_without_automatic_rebuild(
@@ -757,6 +842,23 @@ def test_force_clear_rejects_openai_batch_mode(monkeypatch, tmp_path):
     assert "cannot be combined with OpenAI Batch" in stats["error"]
 
 
+def test_force_rebuild_with_limit_never_mutates_collection(monkeypatch, tmp_path):
+    chroma = FakeChromaClient(preloaded_ids=["A"])
+    search = _build_search(
+        monkeypatch,
+        FakeZoteroClient(),
+        chroma,
+        config_path=_write_config(tmp_path),
+    )
+
+    stats = search.update_database(force_full_rebuild=True, limit=1)
+
+    assert "partial scan cannot replace" in stats["error"]
+    assert chroma._ids == {"A"}
+    assert chroma.reset_calls == 0
+    assert chroma.staged_rebuild_calls == 0
+
+
 def test_failed_staged_rebuild_keeps_previous_records(monkeypatch, tmp_path):
     class FailingChroma(FakeChromaClient):
         def upsert_documents(self, documents, metadatas, ids):
@@ -779,6 +881,33 @@ def test_failed_staged_rebuild_keeps_previous_records(monkeypatch, tmp_path):
     assert chroma.staged_abort_calls == 1
     assert chroma._ids == {"A"}
     assert chroma.metadata_by_key["A"]["title"] == "Paper"
+
+
+def test_failed_incremental_embedding_keeps_old_record_with_new_metadata(
+    monkeypatch, tmp_path
+):
+    class FailingChroma(FakeChromaClient):
+        def upsert_documents(self, documents, metadatas, ids):
+            self.operation_events.append("failed_upsert")
+            raise RuntimeError("encoder unavailable")
+
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 0})
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("A", title="New title")], library_version=120)
+    chroma = FailingChroma(
+        preloaded_ids=["A"],
+        preloaded_metadata={"A": {"title": "Old title"}},
+    )
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+    monkeypatch.setattr(semantic_search.time, "sleep", lambda _seconds: None)
+
+    stats = search.update_database()
+
+    assert stats["errors"] == 1
+    assert chroma._ids == {"A"}
+    assert chroma.metadata_by_key["A"]["title"] == "New title"
+    assert chroma.operation_events[0] == "metadata"
+    assert chroma.operation_events.count("failed_upsert") == 2
 
 
 def test_unverified_local_snapshot_never_replaces_live_index(
@@ -830,6 +959,28 @@ def test_api_full_scan_prunes_before_upserting(monkeypatch, tmp_path):
     assert chroma.operation_events.index("metadata") < chroma.operation_events.index(
         "upsert"
     )
+
+
+def test_prune_failure_stops_metadata_and_embedding_phases(monkeypatch, tmp_path):
+    class FailingDeleteChroma(FakeChromaClient):
+        def delete_documents(self, ids):
+            self.operation_events.append("failed_delete")
+            raise OSError("database unavailable")
+
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 0})
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("A")], library_version=120)
+    chroma = FailingDeleteChroma(
+        preloaded_ids=["A", "REMOVED"],
+        preloaded_metadata={"A": {"title": "Old title"}},
+    )
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    stats = search.update_database()
+
+    assert "later refresh phases were not started" in stats["error"]
+    assert chroma.operation_events == ["failed_delete"]
+    assert chroma._ids == {"A", "REMOVED"}
 
 
 def test_update_database_force_rebuild_updates_last_sync_version(monkeypatch, tmp_path):

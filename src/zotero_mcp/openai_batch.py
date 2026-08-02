@@ -195,6 +195,8 @@ def submit_embedding_batches(
     fulltext: bool | None = None,
     content_signature: str | None = None,
     expected_ids_by_item: dict[str, list[str]] | None = None,
+    baseline_embedding_hashes_by_item: dict[str, dict[str, str]] | None = None,
+    baseline_record_hashes_by_item: dict[str, dict[str, str]] | None = None,
     metadata_only_records: list[dict[str, Any]] | None = None,
     client: Any | None = None,
 ) -> dict[str, Any]:
@@ -210,7 +212,7 @@ def submit_embedding_batches(
     _private_chmod(run_dir)
 
     manifest: dict[str, Any] = {
-        "version": 1,
+        "version": 2,
         "run_id": run_id,
         "created_at": _utc_now(),
         "endpoint": OPENAI_BATCH_ENDPOINT,
@@ -218,9 +220,14 @@ def submit_embedding_batches(
         "model": model_name,
         "force_full_rebuild": bool(force_full_rebuild),
         "target_sync_version": target_sync_version,
+        "source_guard_version": 1,
         "fulltext": fulltext,
         "content_signature": content_signature,
         "expected_ids_by_item": expected_ids_by_item or {},
+        "baseline_embedding_hashes_by_item": (
+            baseline_embedding_hashes_by_item or {}
+        ),
+        "baseline_record_hashes_by_item": baseline_record_hashes_by_item or {},
         "manifest_path": str(run_dir / "manifest.json"),
         "batches": [],
     }

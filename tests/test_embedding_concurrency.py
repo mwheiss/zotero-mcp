@@ -56,6 +56,9 @@ class _ConcurrentChroma:
     def get_existing_ids(self, ids):
         return set()
 
+    def get_all_ids(self):
+        return set()
+
     def embed_documents(self, documents):
         with self._lock:
             self.active_embeddings += 1

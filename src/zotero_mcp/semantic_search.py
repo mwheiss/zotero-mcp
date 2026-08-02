@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import unicodedata
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -35,7 +36,7 @@ except Exception:
 
 
 from . import openai_batch
-from .chroma_client import ChromaClient, create_chroma_client
+from .chroma_client import ChromaClient, create_chroma_client, record_state_hash
 from .client import get_zotero_client
 from .local_db import LocalZoteroReader
 from .utils import format_creators, is_local_mode, suppress_stdout
@@ -961,6 +962,9 @@ class ZoteroSemanticSearch:
             "publication": data.get("publicationTitle", ""),
             "url": data.get("url", ""),
             "doi": data.get("DOI", ""),
+            "embedding_metadata_sha256": _embedding_content_hash(
+                self._create_document_text(item).strip()
+            ),
         }
         # If fulltext was extracted (or attempted), mark it so incremental
         # updates don't keep re-trying items that failed extraction
@@ -1044,9 +1048,14 @@ class ZoteroSemanticSearch:
         self,
         limit: int | None = None,
         fulltext: bool = False,
+        local_scan: bool = False,
         chroma_client: ChromaClient | None = None,
         force_rebuild: bool = False,
         retry_failed_fulltext: bool = False,
+        pre_extraction_callback: Callable[
+            [list[dict[str, Any]], set[str], set[str]], None
+        ]
+        | None = None,
     ) -> list[dict[str, Any]]:
         """
         Get canonical API metadata with optional local full text.
@@ -1057,6 +1066,7 @@ class ZoteroSemanticSearch:
         Args:
             limit: Optional limit on number of items
             fulltext: Whether to select and extract a local attachment
+            local_scan: Use the filtered local corpus without extracting text
             chroma_client: ChromaDB client to check for existing documents (None to skip checks)
             force_rebuild: Whether to force extraction even if item exists
 
@@ -1065,18 +1075,19 @@ class ZoteroSemanticSearch:
         """
         if not isinstance(fulltext, bool):
             raise ValueError("fulltext must be true or false")
-        if fulltext:
+        if fulltext or local_scan:
             if not is_local_mode():
                 raise RuntimeError(
-                    "Fulltext extraction requires local mode but ZOTERO_LOCAL is not enabled. "
+                    "Local semantic indexing requires local mode but ZOTERO_LOCAL is not enabled. "
                     "Set ZOTERO_LOCAL=true or run 'zotero-mcp setup' to enable local mode."
                 )
             return self._get_items_from_local_db(
                 limit,
-                extract_fulltext=True,
+                extract_fulltext=fulltext,
                 chroma_client=chroma_client,
                 force_rebuild=force_rebuild,
                 retry_failed_fulltext=retry_failed_fulltext,
+                pre_extraction_callback=pre_extraction_callback,
             )
         return self._get_items_from_api(limit)
 
@@ -1087,6 +1098,10 @@ class ZoteroSemanticSearch:
         chroma_client: ChromaClient | None = None,
         force_rebuild: bool = False,
         retry_failed_fulltext: bool = False,
+        pre_extraction_callback: Callable[
+            [list[dict[str, Any]], set[str], set[str]], None
+        ]
+        | None = None,
     ) -> list[dict[str, Any]]:
         """
         Get items from local Zotero database.
@@ -1106,12 +1121,14 @@ class ZoteroSemanticSearch:
 
         try:
             api_metadata_by_key: dict[str, dict[str, Any]] = {}
+            self._last_api_metadata_snapshot_complete = False
             try:
                 api_metadata_by_key = {
                     item.get("key", ""): item
                     for item in self._get_items_from_api()
                     if item.get("key")
                 }
+                self._last_api_metadata_snapshot_complete = True
             except Exception as e:
                 logger.warning(
                     "Could not load canonical Zotero API metadata for local "
@@ -1214,6 +1231,20 @@ class ZoteroSemanticSearch:
 
                 local_items = filtered_items
                 self._last_scan_indexable_keys = {it.key for it in local_items}
+                if pre_extraction_callback is not None:
+                    preview_items = [
+                        self._merge_local_fulltext_with_api_metadata(
+                            item,
+                            api_metadata_by_key.get(item.key),
+                            extract_fulltext=False,
+                        )
+                        for item in local_items
+                    ]
+                    pre_extraction_callback(
+                        preview_items,
+                        set(self._last_scan_indexable_keys),
+                        set(api_metadata_by_key),
+                    )
                 total_to_extract = len(local_items)
                 if total_to_extract != candidate_count:
                     try:
@@ -1990,9 +2021,13 @@ class ZoteroSemanticSearch:
 
         def preserve(item: dict[str, Any]) -> bool:
             nonlocal preserved_items, preserved_records
+            current = self._create_metadata(item)
             updated_records = update_item_metadata(
                 item.get("key", ""),
-                self._create_metadata(item),
+                {
+                    key: current.get(key, "")
+                    for key in _IMMEDIATE_METADATA_FIELDS
+                },
             )
             if not updated_records:
                 return False
@@ -2109,9 +2144,19 @@ class ZoteroSemanticSearch:
                     allowed_attachment_keys,
                 )
                 if existing.get("attachment_signature") == signature:
-                    if not preserve(item):
-                        remaining.append(item)
-                    continue
+                    current_metadata_hash = _embedding_content_hash(
+                        self._create_document_text(item).strip()
+                    )
+                    metadata_payload_changed = (
+                        existing.get("fulltext_source")
+                        not in _SELF_CONTAINED_FULLTEXT_SOURCES
+                        and existing.get("embedding_metadata_sha256")
+                        != current_metadata_hash
+                    )
+                    if not metadata_payload_changed:
+                        if not preserve(item):
+                            remaining.append(item)
+                        continue
 
                 extracted = reader.extract_fulltext_for_item(
                     local_item.item_id,
@@ -2248,6 +2293,28 @@ class ZoteroSemanticSearch:
             parent: sorted(ids)
             for parent, ids in expected_ids_by_item.items()
         }
+        get_item_hashes = getattr(
+            self.chroma_client, "get_item_embedding_hashes", None
+        )
+        baseline_embedding_hashes_by_item = (
+            {
+                parent: get_item_hashes(parent)
+                for parent in expected_ids_by_item
+            }
+            if callable(get_item_hashes)
+            else {}
+        )
+        get_item_record_hashes = getattr(
+            self.chroma_client, "get_item_record_hashes", None
+        )
+        baseline_record_hashes_by_item = (
+            {
+                parent: get_item_record_hashes(parent)
+                for parent in expected_ids_by_item
+            }
+            if callable(get_item_record_hashes)
+            else {}
+        )
 
         if not records:
             if prepared.metadata_only_ids:
@@ -2284,6 +2351,11 @@ class ZoteroSemanticSearch:
 
         ids = [record["id"] for record in records]
         existing_ids = self.chroma_client.get_existing_ids(ids) if ids and not force_full_rebuild else set()
+        if target_sync_version is None:
+            raise RuntimeError(
+                "OpenAI Batch submission requires a verified Zotero library "
+                "version so delayed imports cannot overwrite newer source data"
+            )
         model_name = self.chroma_client.embedding_config.get("model_name", "text-embedding-3-small")
         manifest = openai_batch.submit_embedding_batches(
             records=records,
@@ -2295,6 +2367,10 @@ class ZoteroSemanticSearch:
             fulltext=indexed_fulltext_state,
             content_signature=_CONTENT_CONTRACT_SIGNATURE,
             expected_ids_by_item=expected_ids_by_item,
+            baseline_embedding_hashes_by_item=(
+                baseline_embedding_hashes_by_item
+            ),
+            baseline_record_hashes_by_item=baseline_record_hashes_by_item,
             metadata_only_records=[
                 {"id": doc_id, "metadata": metadata}
                 for doc_id, metadata in zip(
@@ -2430,8 +2506,25 @@ class ZoteroSemanticSearch:
                     "force rebuild to migrate the complete index.\n"
                 )
             use_openai_batch = self._resolve_openai_batch_enabled(use_openai_batch)
+            configured_collection_keys = None
+            try:
+                if self.config_path and os.path.exists(self.config_path):
+                    with open(self.config_path) as config_file:
+                        configured_collection_keys = (
+                            json.load(config_file)
+                            .get("semantic_search", {})
+                            .get("collection_keys")
+                        )
+            except Exception:
+                pass
+            use_local_source = bool(extract_fulltext or configured_collection_keys)
             if force_clear and not force_full_rebuild:
                 raise ValueError("force_clear requires force_full_rebuild")
+            if force_full_rebuild and limit is not None:
+                raise ValueError(
+                    "limit cannot be combined with force_full_rebuild because "
+                    "a partial scan cannot replace the complete index"
+                )
             if force_clear and use_openai_batch:
                 raise ValueError(
                     "force_clear cannot be combined with OpenAI Batch mode; "
@@ -2469,35 +2562,10 @@ class ZoteroSemanticSearch:
             last_sync_version = self._load_last_sync_version() if not force_full_rebuild else 0
             use_incremental = (
                 not force_full_rebuild
-                and not extract_fulltext
+                and not use_local_source
                 and limit is None
                 and last_sync_version > 0
             )
-
-            # When a collection filter is configured, skip the API-based
-            # incremental path: it fetches changed items from the WHOLE
-            # library and its deletion pass compares against all library
-            # keys, both of which would bypass the filter. The local
-            # full-scan path applies collection_keys and skips
-            # already-indexed items, so filtered updates stay cheap.
-            configured_collection_keys = None
-            try:
-                if self.config_path and os.path.exists(self.config_path):
-                    with open(self.config_path) as _f:
-                        configured_collection_keys = (
-                            json.load(_f).get("semantic_search", {}).get("collection_keys")
-                        )
-            except Exception:
-                pass
-            if configured_collection_keys and use_incremental:
-                use_incremental = False
-                try:
-                    sys.stderr.write(
-                        f"Collection filter active ({configured_collection_keys}); "
-                        "using local full scan instead of API incremental update.\n"
-                    )
-                except Exception:
-                    pass
 
             target_sync_version: int | None = None
             all_items: list[dict[str, Any]] = []
@@ -2555,8 +2623,10 @@ class ZoteroSemanticSearch:
                             except Exception:
                                 pass
                     except Exception as e:
-                        logger.warning(f"Deletion pass failed: {e}")
-                        target_sync_version = None
+                        raise RuntimeError(
+                            "Pruning removed semantic-index items failed; "
+                            "later refresh phases were not started"
+                        ) from e
             else:
                 # Full scan: bootstrap or forced rebuild.
                 # Capture the library version BEFORE scanning so any changes
@@ -2571,19 +2641,78 @@ class ZoteroSemanticSearch:
                 except Exception as e:
                     logger.warning(f"last_modified_version() failed: {e}")
                     target_sync_version = None
-                if extract_fulltext:
+                if use_local_source:
                     self._last_scan_indexable_keys = None
+                local_prephase_complete = False
+
+                def run_local_prephase(
+                    preview_items: list[dict[str, Any]],
+                    indexable_keys: set[str],
+                    api_item_keys: set[str],
+                ) -> None:
+                    nonlocal local_prephase_complete
+                    prune_keys: set[str] | None = None
+                    if (
+                        limit is None
+                        and target_sync_version is not None
+                        and self._verify_local_snapshot_version(
+                            target_sync_version
+                        )
+                        is not None
+                    ):
+                        prune_keys = indexable_keys
+                    elif getattr(
+                        self, "_last_api_metadata_snapshot_complete", False
+                    ):
+                        # Even when SQLite lags, the complete API parent-key
+                        # set safely identifies true Zotero deletions. It does
+                        # not enforce local collection/dedup filters until the
+                        # local snapshot itself is verified.
+                        prune_keys = api_item_keys
+
+                    if prune_keys is not None and not force_clear:
+                        deleted = self._delete_missing_index_items(prune_keys)
+                        if deleted:
+                            stats["deleted_items"] += deleted
+                            sys.stderr.write(
+                                f"\nDeleted {deleted} items no longer present "
+                                "in the current Zotero corpus.\n"
+                            )
+
+                    refreshed_items, refreshed_records = (
+                        self._refresh_bibliographic_metadata(preview_items)
+                    )
+                    if refreshed_items:
+                        stats["metadata_refreshed_items"] = (
+                            stats.get("metadata_refreshed_items", 0)
+                            + refreshed_items
+                        )
+                        stats["metadata_refreshed_records"] = (
+                            stats.get("metadata_refreshed_records", 0)
+                            + refreshed_records
+                        )
+                        sys.stderr.write(
+                            f"\nRefreshed bibliographic metadata for "
+                            f"{refreshed_items} existing item(s) before "
+                            "full-text extraction.\n"
+                        )
+                    local_prephase_complete = True
+
                 all_items = self._get_items_from_source(
                     limit=limit,
                     fulltext=fulltext,
+                    local_scan=bool(configured_collection_keys),
                     chroma_client=self.chroma_client if not force_full_rebuild else None,
                     force_rebuild=force_full_rebuild,
                     retry_failed_fulltext=retry_failed_fulltext,
+                    pre_extraction_callback=(
+                        run_local_prephase if use_local_source else None
+                    ),
                 )
                 # The local-extraction scan may lag behind the API version
                 # captured above (immutable sqlite reads skip WAL contents);
                 # only promote the watermark if the snapshot was complete.
-                if extract_fulltext and target_sync_version is not None:
+                if use_local_source and target_sync_version is not None:
                     verified_sync_version = self._verify_local_snapshot_version(
                         target_sync_version
                     )
@@ -2595,11 +2724,12 @@ class ZoteroSemanticSearch:
                 # set captured before that filtering. Never prune a partial,
                 # stale, or unverifiable sqlite snapshot.
                 if (
-                    extract_fulltext
+                    use_local_source
                     and not force_full_rebuild
                     and limit is None
                     and local_snapshot_complete
                     and self._last_scan_indexable_keys is not None
+                    and not local_prephase_complete
                 ):
                     try:
                         deleted = self._delete_missing_index_items(
@@ -2621,7 +2751,7 @@ class ZoteroSemanticSearch:
                 # non-incremental runs) are authoritative too. Prune before
                 # embedding so removed records never wait behind a long queue.
                 if (
-                    not extract_fulltext
+                    not use_local_source
                     and not force_full_rebuild
                     and limit is None
                 ):
@@ -2640,8 +2770,10 @@ class ZoteroSemanticSearch:
                                 "in Zotero.\n"
                             )
                     except Exception as e:
-                        logger.warning("API full-scan deletion pass failed: %s", e)
-                        target_sync_version = None
+                        raise RuntimeError(
+                            "Pruning removed semantic-index items failed; "
+                            "later refresh phases were not started"
+                        ) from e
 
                 # A forced scan also has an authoritative corpus view. Prune
                 # genuinely removed items from the live index before any
@@ -2654,10 +2786,11 @@ class ZoteroSemanticSearch:
                     and not force_clear
                     and limit is None
                 ):
-                    if extract_fulltext:
+                    if use_local_source:
                         if (
                             local_snapshot_complete
                             and self._last_scan_indexable_keys is not None
+                            and not local_prephase_complete
                         ):
                             force_prune_keys = self._last_scan_indexable_keys
                     else:
@@ -2678,8 +2811,10 @@ class ZoteroSemanticSearch:
                                 "in the current Zotero corpus.\n"
                             )
                     except Exception as e:
-                        logger.warning("Forced deletion pass failed: %s", e)
-                        target_sync_version = None
+                        raise RuntimeError(
+                            "Pruning removed semantic-index items failed; "
+                            "later refresh phases were not started"
+                        ) from e
 
             preserved_fulltext_items = 0
             if not extract_fulltext and not force_full_rebuild and all_items:
@@ -2706,8 +2841,14 @@ class ZoteroSemanticSearch:
                 self._refresh_bibliographic_metadata(all_items)
             )
             if metadata_refreshed_items:
-                stats["metadata_refreshed_items"] = metadata_refreshed_items
-                stats["metadata_refreshed_records"] = metadata_refreshed_records
+                stats["metadata_refreshed_items"] = (
+                    stats.get("metadata_refreshed_items", 0)
+                    + metadata_refreshed_items
+                )
+                stats["metadata_refreshed_records"] = (
+                    stats.get("metadata_refreshed_records", 0)
+                    + metadata_refreshed_records
+                )
                 sys.stderr.write(
                     f"\nRefreshed bibliographic metadata for "
                     f"{metadata_refreshed_items} existing item(s) before "
@@ -2720,7 +2861,7 @@ class ZoteroSemanticSearch:
             if (
                 force_full_rebuild
                 and not force_clear
-                and extract_fulltext
+                and use_local_source
                 and limit is None
                 and not local_snapshot_complete
             ):
@@ -3134,6 +3275,7 @@ class ZoteroSemanticSearch:
 
         except Exception as e:
             logger.error(f"Error updating database: {e}")
+            stats["errors"] += 1
             stats["error"] = str(e)
             end_time = datetime.now()
             stats["duration"] = str(end_time - start_time)
@@ -3487,6 +3629,233 @@ class ZoteroSemanticSearch:
             "batches": batches,
         }
 
+    def _openai_batch_submitted_hashes(
+        self,
+        manifest: dict[str, Any],
+    ) -> dict[str, dict[str, str]]:
+        """Load submitted payload hashes grouped by parent item."""
+        hashes: dict[str, dict[str, str]] = {}
+        paths = [
+            Path(batch["records_path"])
+            for batch in manifest.get("batches", [])
+        ]
+        metadata_only_path = manifest.get("metadata_only_records_path")
+        if metadata_only_path:
+            paths.append(Path(metadata_only_path))
+        for path in paths:
+            for record in openai_batch.read_jsonl(path):
+                doc_id = record["id"]
+                metadata = record.get("metadata") or {}
+                parent = metadata.get("parent_item_key") or doc_id.split(
+                    "#", 1
+                )[0]
+                content_hash = metadata.get("embedding_content_sha256")
+                if content_hash:
+                    hashes.setdefault(parent, {})[doc_id] = str(content_hash)
+        return hashes
+
+    def _openai_batch_submitted_record_hashes(
+        self,
+        manifest: dict[str, Any],
+    ) -> dict[str, dict[str, str]]:
+        """Load submitted complete-record identities grouped by parent item."""
+        hashes: dict[str, dict[str, str]] = {}
+        paths = [Path(batch["records_path"]) for batch in manifest.get("batches", [])]
+        metadata_only_path = manifest.get("metadata_only_records_path")
+        if metadata_only_path:
+            paths.append(Path(metadata_only_path))
+        for path in paths:
+            for record in openai_batch.read_jsonl(path):
+                doc_id = record["id"]
+                metadata = record.get("metadata") or {}
+                parent = metadata.get("parent_item_key") or doc_id.split("#", 1)[0]
+                hashes.setdefault(parent, {})[doc_id] = record_state_hash(
+                    record.get("document"),
+                    metadata,
+                )
+        return hashes
+
+    def _validate_openai_batch_baseline(
+        self,
+        manifest: dict[str, Any],
+    ) -> None:
+        """Reject a batch that would overwrite vectors changed after submission."""
+        if "baseline_embedding_hashes_by_item" not in manifest:
+            logger.warning(
+                "OpenAI batch manifest predates stale-write protection; "
+                "importing without a baseline comparison."
+            )
+            return
+        get_item_hashes = getattr(
+            self.chroma_client, "get_item_embedding_hashes", None
+        )
+        if not callable(get_item_hashes):
+            raise RuntimeError(
+                "The Chroma client cannot validate this batch against the "
+                "current index"
+            )
+
+        baseline = manifest.get("baseline_embedding_hashes_by_item") or {}
+        submitted = self._openai_batch_submitted_hashes(manifest)
+        expected = manifest.get("expected_ids_by_item") or {}
+        conflicts = []
+        for parent in sorted(set(baseline) | set(submitted) | set(expected)):
+            baseline_hashes = baseline.get(parent) or {}
+            submitted_hashes = submitted.get(parent) or {}
+            current_hashes = get_item_hashes(parent)
+            expected_ids = set(expected.get(parent) or submitted_hashes)
+            submitted_complete = bool(expected_ids) and expected_ids.issubset(
+                current_hashes
+            ) and all(
+                current_hashes.get(doc_id) == submitted_hashes.get(doc_id)
+                for doc_id in expected_ids
+            )
+
+            if set(baseline_hashes) - set(current_hashes) and not submitted_complete:
+                conflicts.append(parent)
+                continue
+            allowed_ids = set(baseline_hashes) | set(submitted_hashes)
+            if set(current_hashes) - allowed_ids:
+                conflicts.append(parent)
+                continue
+            for doc_id, current_hash in current_hashes.items():
+                allowed_hashes = {
+                    value
+                    for value in (
+                        baseline_hashes.get(doc_id),
+                        submitted_hashes.get(doc_id),
+                    )
+                    if value
+                }
+                if allowed_hashes and current_hash not in allowed_hashes:
+                    conflicts.append(parent)
+                    break
+
+        if conflicts:
+            sample = ", ".join(conflicts[:10])
+            suffix = "" if len(conflicts) <= 10 else f" and {len(conflicts) - 10} more"
+            raise RuntimeError(
+                "OpenAI batch import is stale for item(s) changed after "
+                f"submission: {sample}{suffix}. Run a new update instead."
+            )
+
+        if "baseline_record_hashes_by_item" not in manifest:
+            logger.warning(
+                "OpenAI batch manifest predates metadata stale-write "
+                "protection; importing after payload-only validation."
+            )
+            return
+        get_item_record_hashes = getattr(
+            self.chroma_client, "get_item_record_hashes", None
+        )
+        if not callable(get_item_record_hashes):
+            raise RuntimeError(
+                "The Chroma client cannot validate batch metadata against "
+                "the current index"
+            )
+
+        baseline_records = manifest.get("baseline_record_hashes_by_item") or {}
+        submitted_records = self._openai_batch_submitted_record_hashes(manifest)
+        record_conflicts = []
+        for parent in sorted(set(baseline_records) | set(submitted_records)):
+            baseline_hashes = baseline_records.get(parent) or {}
+            submitted_hashes = submitted_records.get(parent) or {}
+            current_hashes = get_item_record_hashes(parent)
+            for doc_id, current_hash in current_hashes.items():
+                allowed_hashes = {
+                    value
+                    for value in (
+                        baseline_hashes.get(doc_id),
+                        submitted_hashes.get(doc_id),
+                    )
+                    if value
+                }
+                if allowed_hashes and current_hash not in allowed_hashes:
+                    record_conflicts.append(parent)
+                    break
+
+        if record_conflicts:
+            sample = ", ".join(record_conflicts[:10])
+            suffix = (
+                ""
+                if len(record_conflicts) <= 10
+                else f" and {len(record_conflicts) - 10} more"
+            )
+            raise RuntimeError(
+                "OpenAI batch import is stale for item metadata changed after "
+                f"submission: {sample}{suffix}. Run a new update instead."
+            )
+
+    def _validate_openai_batch_source(self, manifest: dict[str, Any]) -> None:
+        """Reject delayed results when their Zotero source items changed."""
+        if not manifest.get("source_guard_version"):
+            logger.warning(
+                "OpenAI batch manifest predates Zotero source-version "
+                "validation; importing against the index baseline only."
+            )
+            return
+        target_version = manifest.get("target_sync_version")
+        if target_version is None:
+            raise RuntimeError(
+                "OpenAI batch manifest has no verified Zotero source version"
+            )
+        try:
+            current_version = self.zotero_client.last_modified_version()
+        except Exception as e:
+            raise RuntimeError(
+                "Could not verify Zotero source state before OpenAI batch import"
+            ) from e
+        if int(current_version) <= int(target_version):
+            return
+        if manifest.get("force_full_rebuild"):
+            raise RuntimeError(
+                "Zotero changed after this force-rebuild batch was submitted; "
+                "submit a new rebuild so the replacement corpus is complete"
+            )
+
+        changed_items, current_keys = self._get_changed_items_from_api(
+            int(target_version)
+        )
+        if current_keys is None:
+            raise RuntimeError(
+                "Could not completely verify Zotero changes before OpenAI "
+                "batch import"
+            )
+        expected_parents = set(
+            (manifest.get("expected_ids_by_item") or {}).keys()
+        )
+        changed_parents = {
+            item.get("key", "") for item in changed_items if item.get("key")
+        }
+        deleted_method = getattr(self.zotero_client, "deleted", None)
+        deleted_keys: set[str] = set()
+        if callable(deleted_method):
+            try:
+                deleted_keys = set(
+                    (deleted_method(since=int(target_version)) or {}).get(
+                        "items", []
+                    )
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    "Could not verify Zotero deletions before OpenAI batch import"
+                ) from e
+        affected = (expected_parents - current_keys) | (
+            expected_parents & changed_parents
+        )
+        if affected or deleted_keys:
+            sample_keys = sorted(affected or deleted_keys)
+            sample = ", ".join(sample_keys[:10])
+            suffix = (
+                ""
+                if len(sample_keys) <= 10
+                else f" and {len(sample_keys) - 10} more"
+            )
+            raise RuntimeError(
+                "Zotero source data changed after OpenAI batch submission "
+                f"({sample}{suffix}); run a new update instead"
+            )
+
     def import_openai_batch(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
         """Import completed OpenAI Batch API embeddings into ChromaDB."""
         selected_ids = set(batch_ids or [])
@@ -3545,8 +3914,20 @@ class ZoteroSemanticSearch:
             lock_cm.__exit__(None, None, None)
             raise RuntimeError(f"Another semantic-search update is already running (lock held at {lock_path})")
 
+        staged_batch_rebuild_active = False
         try:
+            self._validate_openai_batch_source(manifest)
+            self._validate_openai_batch_baseline(manifest)
             already_imported = any(batch.get("imported_at") for batch in all_batches)
+            if (
+                manifest.get("force_full_rebuild")
+                and already_imported
+                and not all(batch.get("imported_at") for batch in all_batches)
+            ):
+                raise RuntimeError(
+                    "Cannot safely resume a partially imported legacy force "
+                    "rebuild; submit a new force rebuild"
+                )
             client = openai_batch.create_openai_client(self.chroma_client.embedding_config)
             prepared_imports = []
             for batch in batches:
@@ -3630,7 +4011,8 @@ class ZoteroSemanticSearch:
                 and not already_imported
                 and prepared_imports
             ):
-                self.chroma_client.reset_collection()
+                self.chroma_client.begin_staged_rebuild()
+                staged_batch_rebuild_active = True
 
             for batch, records, ids, embeddings_by_id in prepared_imports:
                 if ids:
@@ -3650,6 +4032,10 @@ class ZoteroSemanticSearch:
                 batch.pop("import_error_at", None)
                 batch.pop("import_error_count", None)
                 stats["batches_imported"] += 1
+
+            if staged_batch_rebuild_active:
+                self.chroma_client.commit_staged_rebuild()
+                staged_batch_rebuild_active = False
 
             openai_batch.save_manifest(manifest)
             if all(batch.get("imported_at") for batch in all_batches):
@@ -3704,6 +4090,14 @@ class ZoteroSemanticSearch:
                 )
             return stats
         finally:
+            if staged_batch_rebuild_active:
+                try:
+                    self.chroma_client.abort_staged_rebuild()
+                except Exception as e:
+                    logger.warning(
+                        "Could not discard staged OpenAI batch rebuild: %s",
+                        e,
+                    )
             lock_cm.__exit__(None, None, None)
 
     def search(self,

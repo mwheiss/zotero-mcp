@@ -662,3 +662,288 @@ def test_complete_batch_reconciles_before_advancing_watermark(tmp_path, monkeypa
         "indexed_fulltext": True,
         "indexed_content_signature": "contract-v2",
     }]
+
+
+def test_batch_baseline_rejects_item_changed_after_submission(
+    tmp_path, monkeypatch
+):
+    records_path = tmp_path / "records.jsonl"
+    openai_batch.write_jsonl(
+        records_path,
+        [{
+            "id": "A#0",
+            "document": "submitted",
+            "metadata": {
+                "parent_item_key": "A",
+                "embedding_content_sha256": "submitted-hash",
+            },
+        }],
+    )
+    manifest = {
+        "baseline_embedding_hashes_by_item": {"A": {"A#0": "old-hash"}},
+        "expected_ids_by_item": {"A": ["A#0"]},
+        "batches": [{"records_path": str(records_path)}],
+    }
+
+    class Client(FakeChromaClient):
+        def get_item_embedding_hashes(self, item_key):
+            assert item_key == "A"
+            return {"A#0": "newer-hash"}
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=Client())
+
+    with pytest.raises(RuntimeError, match="changed after submission"):
+        search._validate_openai_batch_baseline(manifest)
+
+
+def test_batch_baseline_rejects_metadata_changed_after_submission(
+    tmp_path, monkeypatch
+):
+    submitted_metadata = {
+        "parent_item_key": "A",
+        "embedding_content_sha256": "same-content",
+        "title": "Submitted title",
+    }
+    records_path = tmp_path / "records.jsonl"
+    openai_batch.write_jsonl(
+        records_path,
+        [{
+            "id": "A#0",
+            "document": "same document",
+            "metadata": submitted_metadata,
+        }],
+    )
+    baseline_metadata = dict(submitted_metadata, title="Old title")
+    current_metadata = dict(submitted_metadata, title="Newer title")
+    manifest = {
+        "baseline_embedding_hashes_by_item": {
+            "A": {"A#0": "same-content"}
+        },
+        "baseline_record_hashes_by_item": {
+            "A": {
+                "A#0": semantic_search.record_state_hash(
+                    "same document", baseline_metadata
+                )
+            }
+        },
+        "expected_ids_by_item": {"A": ["A#0"]},
+        "batches": [{"records_path": str(records_path)}],
+    }
+
+    class Client(FakeChromaClient):
+        def get_item_embedding_hashes(self, item_key):
+            return {"A#0": "same-content"}
+
+        def get_item_record_hashes(self, item_key):
+            return {
+                "A#0": semantic_search.record_state_hash(
+                    "same document", current_metadata
+                )
+            }
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=Client())
+
+    with pytest.raises(RuntimeError, match="metadata changed after submission"):
+        search._validate_openai_batch_baseline(manifest)
+
+
+def test_force_batch_write_failure_discards_staging(tmp_path, monkeypatch):
+    records_path = tmp_path / "records.jsonl"
+    record = {
+        "id": "A#0",
+        "document": "replacement",
+        "metadata": {"parent_item_key": "A"},
+    }
+    openai_batch.write_jsonl(records_path, [record])
+    records_path.with_name("records-output.jsonl").write_text(
+        json.dumps({
+            "custom_id": "A#0",
+            "response": {
+                "status_code": 200,
+                "body": {"data": [{"embedding": [0.1]}]},
+            },
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "run_id": "force-failure",
+        "manifest_path": str(tmp_path / "manifest.json"),
+        "force_full_rebuild": True,
+        "batches": [{
+            "batch_id": "batch-1",
+            "status": "completed",
+            "output_file_id": "file-1",
+            "records_path": str(records_path),
+            "imported_at": None,
+        }],
+    }
+
+    class Client(FakeChromaClient):
+        def __init__(self):
+            super().__init__()
+            self.live = {"OLD"}
+            self.staging = None
+            self.commits = 0
+            self.aborts = 0
+
+        def begin_staged_rebuild(self):
+            self.staging = set()
+
+        def upsert_embeddings(self, documents, metadatas, ids, embeddings):
+            raise RuntimeError("disk write failed")
+
+        def abort_staged_rebuild(self):
+            self.staging = None
+            self.aborts += 1
+
+        def commit_staged_rebuild(self):
+            self.commits += 1
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(semantic_search.openai_batch, "find_manifest", lambda **kwargs: manifest)
+    monkeypatch.setattr(semantic_search.openai_batch, "refresh_manifest_status", lambda value, **kwargs: value)
+    monkeypatch.setattr(semantic_search.openai_batch, "create_openai_client", lambda config: object())
+    client = Client()
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=client)
+
+    with pytest.raises(RuntimeError, match="disk write failed"):
+        search.import_openai_batch()
+
+    assert client.live == {"OLD"}
+    assert client.staging is None
+    assert client.commits == 0
+    assert client.aborts == 1
+    assert manifest["batches"][0]["imported_at"] is None
+
+
+def test_complete_force_batch_activates_staged_replacement(tmp_path, monkeypatch):
+    records_path = tmp_path / "records.jsonl"
+    record = {
+        "id": "A#0",
+        "document": "replacement",
+        "metadata": {"parent_item_key": "A"},
+    }
+    openai_batch.write_jsonl(records_path, [record])
+    records_path.with_name("records-output.jsonl").write_text(
+        json.dumps({
+            "custom_id": "A#0",
+            "response": {
+                "status_code": 200,
+                "body": {"data": [{"embedding": [0.1]}]},
+            },
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "run_id": "force-complete",
+        "manifest_path": str(tmp_path / "manifest.json"),
+        "force_full_rebuild": True,
+        "batches": [{
+            "batch_id": "batch-1",
+            "status": "completed",
+            "output_file_id": "file-1",
+            "records_path": str(records_path),
+            "imported_at": None,
+        }],
+    }
+
+    class Client(FakeChromaClient):
+        def __init__(self):
+            super().__init__()
+            self.live = {"OLD"}
+            self.staging = None
+
+        def begin_staged_rebuild(self):
+            self.staging = set()
+
+        def upsert_embeddings(self, documents, metadatas, ids, embeddings):
+            self.staging.update(ids)
+
+        def commit_staged_rebuild(self):
+            self.live = self.staging
+            self.staging = None
+
+        def abort_staged_rebuild(self):
+            self.staging = None
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(semantic_search.openai_batch, "find_manifest", lambda **kwargs: manifest)
+    monkeypatch.setattr(semantic_search.openai_batch, "refresh_manifest_status", lambda value, **kwargs: value)
+    monkeypatch.setattr(semantic_search.openai_batch, "create_openai_client", lambda config: object())
+    client = Client()
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=client)
+
+    stats = search.import_openai_batch()
+
+    assert stats["batches_imported"] == 1
+    assert client.live == {"A#0"}
+    assert client.staging is None
+
+
+def test_batch_source_guard_rejects_changed_target_item(monkeypatch):
+    class Zotero:
+        def last_modified_version(self):
+            return 6
+
+        def item_versions(self, **kwargs):
+            if kwargs.get("since") is not None:
+                return {"A": 6}
+            return {"A": 6}
+
+        def item(self, key):
+            return {
+                "key": key,
+                "data": {"itemType": "journalArticle", "title": "Changed"},
+            }
+
+        def deleted(self, **kwargs):
+            return {"items": []}
+
+    zotero = Zotero()
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: zotero)
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
+    manifest = {
+        "source_guard_version": 1,
+        "target_sync_version": 5,
+        "force_full_rebuild": False,
+        "expected_ids_by_item": {"A": ["A#0"]},
+    }
+
+    with pytest.raises(RuntimeError, match="changed after OpenAI batch"):
+        search._validate_openai_batch_source(manifest)
+
+
+def test_batch_source_guard_allows_unrelated_item_change(monkeypatch):
+    class Zotero:
+        def last_modified_version(self):
+            return 6
+
+        def item_versions(self, **kwargs):
+            if kwargs.get("since") is not None:
+                return {"B": 6}
+            return {"A": 5, "B": 6}
+
+        def item(self, key):
+            return {
+                "key": key,
+                "data": {"itemType": "journalArticle", "title": "Unrelated"},
+            }
+
+        def deleted(self, **kwargs):
+            return {"items": []}
+
+    zotero = Zotero()
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: zotero)
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
+    manifest = {
+        "source_guard_version": 1,
+        "target_sync_version": 5,
+        "force_full_rebuild": False,
+        "expected_ids_by_item": {"A": ["A#0"]},
+    }
+
+    search._validate_openai_batch_source(manifest)
