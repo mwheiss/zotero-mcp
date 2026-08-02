@@ -89,6 +89,27 @@ def test_cli_force_clear_requires_force_rebuild(monkeypatch, capsys):
     assert "requires --force-rebuild" in capsys.readouterr().err
 
 
+def test_cli_rejects_force_rebuild_with_limit_before_confirmation(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["zotero-mcp", "update-db", "--force-rebuild", "--limit", "1"],
+    )
+    monkeypatch.setattr(
+        cli,
+        "_confirm_force_rebuild",
+        lambda: pytest.fail("invalid flags must not prompt"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
+    assert "cannot be combined" in capsys.readouterr().err
+
+
 def test_standalone_cli_cancellation_happens_before_setup(
     monkeypatch, capsys
 ):
@@ -220,3 +241,20 @@ def test_mcp_force_clear_requires_force_rebuild(monkeypatch):
     )
 
     assert "force_clear requires force_rebuild=True" in result
+
+
+def test_mcp_rejects_force_rebuild_with_limit_before_backend(monkeypatch):
+    monkeypatch.setattr(
+        semantic_search,
+        "create_semantic_search",
+        lambda *_args, **_kwargs: pytest.fail("backend must not be created"),
+    )
+
+    result = search_tools.update_search_database(
+        force_rebuild=True,
+        limit=1,
+        confirm_force_rebuild="REBUILD ALL ITEMS",
+        ctx=_Context(),
+    )
+
+    assert "limit cannot be combined" in result

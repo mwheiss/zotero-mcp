@@ -399,6 +399,16 @@ def cmd_db(args):
     """Manage the semantic search database."""
     if (
         args.subcommand == "update"
+        and args.force_rebuild
+        and getattr(args, "limit", None) is not None
+    ):
+        print(
+            "Error: --limit cannot be combined with --force-rebuild.",
+            file=sys.stderr,
+        )
+        return
+    if (
+        args.subcommand == "update"
         and getattr(args, "force_clear", False)
         and not args.force_rebuild
     ):

@@ -566,6 +566,12 @@ def main():
         sys.exit(setup_main(args))
 
     elif args.command == "update-db":
+        if args.force_rebuild and args.limit is not None:
+            print(
+                "Error: --limit cannot be combined with --force-rebuild.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         if args.force_clear and not args.force_rebuild:
             print(
                 "Error: --force-clear requires --force-rebuild.",

@@ -1009,6 +1009,12 @@ def update_search_database(
             "# Database Update Not Started\n\n"
             "force_clear requires force_rebuild=True."
         )
+    if force_rebuild and limit is not None:
+        return (
+            "# Database Update Not Started\n\n"
+            "limit cannot be combined with force_rebuild because a partial "
+            "scan cannot replace the complete index."
+        )
 
     if fulltext and not _utils.is_local_mode():
         return (
