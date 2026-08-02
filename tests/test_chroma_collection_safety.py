@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-import time
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -142,7 +142,7 @@ def test_staged_rebuild_swaps_only_after_replacement_is_ready(tmp_path):
     assert raw_client.get_collection("zotero_library").get()["ids"] == ["NEW"]
 
 
-def test_prune_orphan_segments_respects_references_and_grace_period(tmp_path):
+def test_prune_orphan_segments_preserves_references_and_removes_orphans(tmp_path):
     client, raw_client = _staging_client(tmp_path)
     persist_directory = tmp_path / "chroma-staging"
     old_orphan = persist_directory / "44444444-4444-4444-4444-444444444444"
@@ -152,22 +152,16 @@ def test_prune_orphan_segments_respects_references_and_grace_period(tmp_path):
     old_file = old_orphan / "index.bin"
     old_file.write_bytes(b"retired")
     (fresh_orphan / "index.bin").write_bytes(b"possibly in use")
-
-    first_result = client.prune_orphan_segment_directories(min_age_seconds=3600)
     ledger_path = persist_directory / ".zotero-mcp-orphan-segments.json"
-    ledger = json.loads(ledger_path.read_text())
-    ledger[old_orphan.name] = time.time() - 7200
-    ledger_path.write_text(json.dumps(ledger))
+    ledger_path.write_text(json.dumps({old_orphan.name: 0}))
 
-    result = client.prune_orphan_segment_directories(min_age_seconds=3600)
+    result = client.prune_orphan_segment_directories()
 
-    assert first_result["removed_directories"] == 0
-    assert first_result["deferred_directories"] == 2
-    assert result["removed_directories"] == 1
-    assert result["removed_bytes"] == len(b"retired")
-    assert result["deferred_directories"] == 1
+    assert result["removed_directories"] == 2
+    assert result["removed_bytes"] == len(b"retiredpossibly in use")
     assert not old_orphan.exists()
-    assert fresh_orphan.exists()
+    assert not fresh_orphan.exists()
+    assert not ledger_path.exists()
     assert raw_client.get_collection("zotero_library").count() == 1
 
 
@@ -179,12 +173,103 @@ def test_prune_orphan_segments_refuses_during_collection_swap(tmp_path):
         / "66666666-6666-6666-6666-666666666666"
     )
     orphan.mkdir()
+    client._rebuild_original_collection = client.collection
     client._rebuild_marker_path.write_text("{}")
 
-    result = client.prune_orphan_segment_directories(min_age_seconds=0)
+    result = client.prune_orphan_segment_directories()
 
     assert result["skipped_reason"] == "collection_swap_in_progress"
     assert orphan.exists()
+
+
+def test_exclusive_lifecycle_lock_waits_for_active_reader(tmp_path):
+    persist_directory = tmp_path / "lifecycle-lock"
+    reader_started = threading.Event()
+    release_reader = threading.Event()
+    writer_acquired = threading.Event()
+    errors = []
+
+    class BlockingCollection:
+        def count(self):
+            reader_started.set()
+            if not release_reader.wait(timeout=5):
+                raise TimeoutError("reader was not released")
+            return 1
+
+    client = chroma_client.ChromaClient.__new__(chroma_client.ChromaClient)
+    client.persist_directory = str(persist_directory)
+    client.collection = BlockingCollection()
+
+    def read():
+        try:
+            assert client.count_documents() == 1
+        except Exception as error:
+            errors.append(error)
+
+    def write():
+        try:
+            with chroma_client.index_lifecycle_lock(
+                persist_directory,
+                exclusive=True,
+            ):
+                writer_acquired.set()
+        except Exception as error:
+            errors.append(error)
+
+    reader = threading.Thread(target=read)
+    writer = threading.Thread(target=write)
+    reader.start()
+    assert reader_started.wait(timeout=2)
+    writer.start()
+    assert not writer_acquired.wait(timeout=0.1)
+
+    release_reader.set()
+    reader.join(timeout=2)
+    writer.join(timeout=2)
+
+    assert not reader.is_alive()
+    assert not writer.is_alive()
+    assert writer_acquired.is_set()
+    assert errors == []
+
+
+def test_chroma_operations_declare_lifecycle_lock_mode():
+    shared = {
+        "add_documents",
+        "upsert_documents",
+        "upsert_embeddings",
+        "get_records",
+        "update_metadatas",
+        "update_item_metadata",
+        "search",
+        "delete_documents",
+        "delete_item_chunks",
+        "get_item_chunk_ids",
+        "get_item_embedding_hashes",
+        "get_item_record_hashes",
+        "reconcile_item_records",
+        "delete_item_records",
+        "get_collection_info",
+        "count_documents",
+        "document_exists",
+        "get_document_metadata",
+        "get_existing_ids",
+        "get_all_ids",
+    }
+    exclusive = {
+        "reset_collection",
+        "prune_orphan_segment_directories",
+        "begin_staged_rebuild",
+        "commit_staged_rebuild",
+        "abort_staged_rebuild",
+    }
+
+    for method_name in shared:
+        method = getattr(chroma_client.ChromaClient, method_name)
+        assert method._zotero_mcp_lifecycle_exclusive is False
+    for method_name in exclusive:
+        method = getattr(chroma_client.ChromaClient, method_name)
+        assert method._zotero_mcp_lifecycle_exclusive is True
 
 
 def test_aborted_staged_rebuild_leaves_live_collection_untouched(tmp_path):

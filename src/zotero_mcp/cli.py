@@ -196,12 +196,6 @@ def _print_orphan_cleanup_stats(stats: dict) -> None:
             f"{count} {'directory' if count == 1 else 'directories'} "
             f"({reclaimed_mib:.1f} MiB)"
         )
-    if stats.get("orphan_segment_directories_deferred"):
-        count = stats["orphan_segment_directories_deferred"]
-        print(
-            "- Orphan vector storage awaiting grace period: "
-            f"{count} {'directory' if count == 1 else 'directories'}"
-        )
     if stats.get("orphan_segment_cleanup_errors"):
         print(
             "- Orphan vector cleanup errors: "

@@ -2457,9 +2457,6 @@ class ZoteroSemanticSearch:
         stats["orphan_segment_bytes_pruned"] = int(
             cleanup.get("removed_bytes", 0)
         )
-        stats["orphan_segment_directories_deferred"] = int(
-            cleanup.get("deferred_directories", 0)
-        )
         stats["orphan_segment_cleanup_errors"] = int(cleanup.get("errors", 0))
 
     def update_database(
@@ -2508,7 +2505,6 @@ class ZoteroSemanticSearch:
             "deleted_items": 0,
             "orphan_segment_directories_pruned": 0,
             "orphan_segment_bytes_pruned": 0,
-            "orphan_segment_directories_deferred": 0,
             "orphan_segment_cleanup_errors": 0,
             "errors": 0,
             "start_time": start_time.isoformat(),
@@ -4029,7 +4025,6 @@ class ZoteroSemanticSearch:
             "missing_items": 0,
             "orphan_segment_directories_pruned": 0,
             "orphan_segment_bytes_pruned": 0,
-            "orphan_segment_directories_deferred": 0,
             "orphan_segment_cleanup_errors": 0,
             "errors": [],
         }

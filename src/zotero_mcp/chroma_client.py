@@ -13,6 +13,8 @@ import shutil
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +38,60 @@ DEFAULT_QWEN_QUERY_INSTRUCTION = (
     "that identify papers addressing the query"
 )
 
-ORPHAN_SEGMENT_GRACE_SECONDS = 60 * 60
+INDEX_LIFECYCLE_LOCK_NAME = ".zotero-mcp-index-lifecycle.lock"
+
+
+@contextmanager
+def index_lifecycle_lock(
+    persist_directory: str | Path,
+    *,
+    exclusive: bool,
+):
+    """Coordinate Chroma access with collection swaps and physical cleanup."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+
+    persist_path = Path(persist_directory)
+    persist_path.mkdir(parents=True, exist_ok=True)
+    lock_path = persist_path / INDEX_LIFECYCLE_LOCK_NAME
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(lock_file.fileno(), operation)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _with_index_lifecycle_lock(*, exclusive: bool):
+    """Wrap one complete Chroma operation in the lifecycle lock."""
+
+    def decorator(method):
+        @wraps(method)
+        def wrapped(self, *args, **kwargs):
+            persist_directory = getattr(self, "persist_directory", None)
+            if persist_directory is None:
+                # Lightweight unit-test clients do not open persistent Chroma.
+                return method(self, *args, **kwargs)
+            if (
+                getattr(self, "_rebuild_original_collection", None) is None
+                and getattr(self, "_rebuild_marker_path", None) is not None
+                and self._rebuild_marker_path.exists()
+            ):
+                self._wait_for_collection_swap()
+            with index_lifecycle_lock(
+                persist_directory,
+                exclusive=exclusive,
+            ):
+                return method(self, *args, **kwargs)
+
+        wrapped._zotero_mcp_lifecycle_exclusive = exclusive
+        return wrapped
+
+    return decorator
 
 
 def record_state_hash(
@@ -547,58 +602,63 @@ class ChromaClient:
             / f".zotero-mcp-rebuild-{marker_token}.json"
         )
 
-        # Initialize ChromaDB client with stdout suppression
+        # Model construction can involve network or local model loading, so it
+        # deliberately happens outside the short-lived persistence lock.
         with suppress_stdout():
-            self.client = chromadb.PersistentClient(
-                path=self.persist_directory,
-                settings=Settings(
-                    anonymized_telemetry=False,
-                    allow_reset=True
+            with index_lifecycle_lock(self.persist_directory, exclusive=False):
+                self.client = chromadb.PersistentClient(
+                    path=self.persist_directory,
+                    settings=Settings(
+                        anonymized_telemetry=False,
+                        allow_reset=True
+                    )
                 )
-            )
-
-            # Set up embedding function
             self.embedding_function = self._create_embedding_function()
 
-            active_swap = self._recover_interrupted_rebuild()
+            with index_lifecycle_lock(self.persist_directory, exclusive=True):
+                active_swap = self._recover_interrupted_rebuild()
             if active_swap:
                 self._wait_for_collection_swap()
 
-            # Opening a collection must never delete it. A confirmed force
-            # rebuild can opt into opening an incompatible collection solely so
-            # update_database() can replace it after the user's confirmation.
-            try:
-                self.collection = self.client.get_or_create_collection(
-                    name=self.collection_name,
-                    embedding_function=self.embedding_function,
-                    metadata=self._new_collection_metadata(),
-                )
-            except Exception as e:
-                if "embedding function conflict" in str(e).lower():
-                    self._handle_embedding_mismatch(str(e), allow_embedding_mismatch)
-                else:
-                    raise
+            with index_lifecycle_lock(self.persist_directory, exclusive=False):
+                # Opening a collection must never delete it. A confirmed force
+                # rebuild can open an incompatible collection only so the
+                # confirmed update can replace it later.
+                try:
+                    self.collection = self.client.get_or_create_collection(
+                        name=self.collection_name,
+                        embedding_function=self.embedding_function,
+                        metadata=self._new_collection_metadata(),
+                    )
+                except Exception as e:
+                    if "embedding function conflict" in str(e).lower():
+                        self._handle_embedding_mismatch(
+                            str(e),
+                            allow_embedding_mismatch,
+                        )
+                    else:
+                        raise
 
-            stored_model = self._stored_embedding_model()
-            configured_model = getattr(self.embedding_function, "model_name", None)
-            if stored_model and configured_model and stored_model != configured_model:
-                self._handle_embedding_mismatch(
-                    f"stored model '{stored_model}' differs from configured "
-                    f"model '{configured_model}'",
-                    allow_embedding_mismatch,
-                )
+                stored_model = self._stored_embedding_model()
+                configured_model = getattr(self.embedding_function, "model_name", None)
+                if stored_model and configured_model and stored_model != configured_model:
+                    self._handle_embedding_mismatch(
+                        f"stored model '{stored_model}' differs from configured "
+                        f"model '{configured_model}'",
+                        allow_embedding_mismatch,
+                    )
 
-            stored_identity = (getattr(self.collection, "metadata", {}) or {}).get(
-                "zotero_mcp_embedding_identity"
-            )
-            if stored_identity and stored_identity != self.embedding_identity:
-                self._handle_embedding_mismatch(
-                    f"stored identity '{stored_identity}' differs from configured "
-                    f"identity '{self.embedding_identity}'",
-                    allow_embedding_mismatch,
+                stored_identity = (getattr(self.collection, "metadata", {}) or {}).get(
+                    "zotero_mcp_embedding_identity"
                 )
+                if stored_identity and stored_identity != self.embedding_identity:
+                    self._handle_embedding_mismatch(
+                        f"stored identity '{stored_identity}' differs from configured "
+                        f"identity '{self.embedding_identity}'",
+                        allow_embedding_mismatch,
+                    )
 
-            self._require_cosine_collection(allow_embedding_mismatch)
+                self._require_cosine_collection(allow_embedding_mismatch)
 
     def _configured_embedding_identity(self) -> str:
         """Stable user-visible identity for vectors behind a provider alias."""
@@ -618,7 +678,9 @@ class ChromaClient:
         """Wait for a live swap, recovering it if its owner terminates."""
         deadline = time.monotonic() + 10.0
         while self._rebuild_marker_path.exists():
-            if not self._recover_interrupted_rebuild():
+            with index_lifecycle_lock(self.persist_directory, exclusive=True):
+                active_swap = self._recover_interrupted_rebuild()
+            if not active_swap:
                 return
             if time.monotonic() >= deadline:
                 raise RuntimeError(
@@ -641,7 +703,6 @@ class ChromaClient:
             )
         ):
             return
-        self._wait_for_collection_swap()
         self.collection = self.client.get_collection(
             name=self.collection_name,
             embedding_function=self.embedding_function,
@@ -786,6 +847,7 @@ class ChromaClient:
                 text = text[:max_chars]
         return text
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def add_documents(self,
                      documents: list[str],
                      metadatas: list[dict[str, Any]],
@@ -810,6 +872,7 @@ class ChromaClient:
             logger.error(f"Error adding documents to ChromaDB: {e}")
             raise
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def upsert_documents(self,
                         documents: list[str],
                         metadatas: list[dict[str, Any]],
@@ -860,6 +923,7 @@ class ChromaClient:
         self._embedding_cancel_event = event
         setattr(self.embedding_function, "_zotero_mcp_cancel_event", event)
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def upsert_embeddings(self,
                          documents: list[str],
                          metadatas: list[dict[str, Any]],
@@ -889,6 +953,7 @@ class ChromaClient:
             logger.error(f"Error upserting precomputed embeddings to ChromaDB: {e}")
             raise
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def get_records(self, ids: list[str]) -> dict[str, dict[str, Any]]:
         """Return stored documents and metadata keyed by record id."""
         if not ids:
@@ -913,6 +978,7 @@ class ChromaClient:
             logger.error("Error reading collection records: %s", e)
             raise
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def update_metadatas(
         self,
         ids: list[str],
@@ -939,6 +1005,7 @@ class ChromaClient:
             logger.error("Error updating document metadata: %s", e)
             raise
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def update_item_metadata(
         self,
         item_key: str,
@@ -971,6 +1038,7 @@ class ChromaClient:
         self.update_metadatas(update_ids, merged_metadatas)
         return len(update_ids)
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def search(self,
                query_texts: list[str],
                n_results: int = 10,
@@ -1028,6 +1096,7 @@ class ChromaClient:
         similarity = 1.0 - float(distance)
         return max(-1.0, min(1.0, similarity))
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def delete_documents(self, ids: list[str]) -> None:
         """
         Delete documents from the collection.
@@ -1043,6 +1112,7 @@ class ChromaClient:
             logger.error(f"Error deleting documents from ChromaDB: {e}")
             raise
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def delete_item_chunks(self, item_key: str) -> None:
         """Delete all passage chunks belonging to one item (chunked collections).
 
@@ -1059,6 +1129,7 @@ class ChromaClient:
             logger.error("Error deleting chunks for %s: %s", item_key, e)
             raise
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def get_item_chunk_ids(self, item_key: str) -> set[str]:
         """Return every passage id belonging to one parent item."""
         self._ensure_live_collection()
@@ -1072,6 +1143,7 @@ class ChromaClient:
             logger.error("Error listing chunks for %s: %s", item_key, e)
             raise
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def get_item_embedding_hashes(self, item_key: str) -> dict[str, str]:
         """Return stable embedding-payload identities for one indexed item."""
         ids = self.get_item_chunk_ids(item_key)
@@ -1101,6 +1173,7 @@ class ChromaClient:
             ).hexdigest()
         return identities
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def get_item_record_hashes(self, item_key: str) -> dict[str, str]:
         """Return complete document/metadata identities for one indexed item."""
         ids = self.get_item_chunk_ids(item_key)
@@ -1121,6 +1194,7 @@ class ChromaClient:
             for index, doc_id in enumerate(result.get("ids", []))
         }
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def reconcile_item_records(
         self,
         item_key: str,
@@ -1135,6 +1209,7 @@ class ChromaClient:
         if stale_ids:
             self.delete_documents(sorted(stale_ids))
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def delete_item_records(self, item_key: str) -> None:
         """Delete both bare and chunked representations of an item."""
         ids = self.get_item_chunk_ids(item_key)
@@ -1142,6 +1217,7 @@ class ChromaClient:
         if ids:
             self.delete_documents(sorted(ids))
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def get_collection_info(self) -> dict[str, Any]:
         """Get information about the collection."""
         self._ensure_live_collection()
@@ -1164,11 +1240,13 @@ class ChromaClient:
                 "error": str(e)
             }
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def count_documents(self) -> int:
         """Return the number of vector records in the collection."""
         self._ensure_live_collection()
         return int(self.collection.count())
 
+    @_with_index_lifecycle_lock(exclusive=True)
     def reset_collection(self) -> None:
         """Reset (clear) the collection."""
         self._ensure_live_collection()
@@ -1185,22 +1263,18 @@ class ChromaClient:
             logger.error(f"Error resetting collection: {e}")
             raise
 
-    def prune_orphan_segment_directories(
-        self,
-        *,
-        min_age_seconds: float = ORPHAN_SEGMENT_GRACE_SECONDS,
-    ) -> dict[str, int | str]:
-        """Remove retired HNSW directories after a conservative grace period.
+    @_with_index_lifecycle_lock(exclusive=True)
+    def prune_orphan_segment_directories(self) -> dict[str, int | str]:
+        """Remove HNSW directories unreferenced under the exclusive lock.
 
         Chroma removes deleted segment rows from SQLite but can leave their
-        UUID-named persistence directories behind. The caller must hold the
-        semantic update lock so no other updater can create a segment between
-        the reference scan and deletion.
+        UUID-named persistence directories behind. The lifecycle lock waits
+        for active Chroma calls, blocks new ones, and prevents a collection
+        transition between the authoritative reference scan and deletion.
         """
         result: dict[str, int | str] = {
             "removed_directories": 0,
             "removed_bytes": 0,
-            "deferred_directories": 0,
             "errors": 0,
         }
         persist_directory = Path(self.persist_directory)
@@ -1228,22 +1302,6 @@ class ChromaClient:
             result["errors"] = 1
             return result
 
-        state_path = persist_directory / ".zotero-mcp-orphan-segments.json"
-        try:
-            raw_state = json.loads(state_path.read_text(encoding="utf-8"))
-            if not isinstance(raw_state, dict):
-                raise ValueError("ledger root must be an object")
-            first_seen = {
-                str(segment_id): float(timestamp)
-                for segment_id, timestamp in raw_state.items()
-            }
-        except FileNotFoundError:
-            first_seen = {}
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-            logger.warning("Ignoring invalid orphan-segment ledger: %s", error)
-            first_seen = {}
-
-        orphan_paths: dict[str, Path] = {}
         for path in persist_directory.iterdir():
             if not path.is_dir() or path.is_symlink() or path.name in referenced_ids:
                 continue
@@ -1251,39 +1309,6 @@ class ChromaClient:
                 if str(uuid.UUID(path.name)) != path.name.lower():
                     continue
             except ValueError:
-                continue
-            orphan_paths[path.name] = path
-
-        now = time.time()
-        first_seen = {
-            segment_id: first_seen.get(segment_id, now)
-            for segment_id in orphan_paths
-        }
-
-        def save_ledger() -> None:
-            temporary = state_path.with_suffix(".tmp")
-            if first_seen:
-                temporary.write_text(
-                    json.dumps(first_seen, sort_keys=True),
-                    encoding="utf-8",
-                )
-                os.replace(temporary, state_path)
-            else:
-                state_path.unlink(missing_ok=True)
-                temporary.unlink(missing_ok=True)
-
-        try:
-            # Persist first observation before any deletion. An interrupted run
-            # can therefore never shorten the required grace period.
-            save_ledger()
-        except OSError as error:
-            logger.warning("Could not save orphan-segment ledger: %s", error)
-            result["errors"] = 1
-            return result
-
-        for segment_id, path in orphan_paths.items():
-            if now - first_seen[segment_id] < min_age_seconds:
-                result["deferred_directories"] += 1
                 continue
             try:
                 directory_bytes = 0
@@ -1293,16 +1318,17 @@ class ChromaClient:
                 shutil.rmtree(path)
                 result["removed_directories"] += 1
                 result["removed_bytes"] += directory_bytes
-                first_seen.pop(segment_id, None)
             except OSError as error:
                 result["errors"] += 1
                 logger.warning("Could not remove orphan Chroma segment %s: %s", path, error)
 
         try:
-            save_ledger()
+            (persist_directory / ".zotero-mcp-orphan-segments.json").unlink(
+                missing_ok=True
+            )
         except OSError as error:
             result["errors"] += 1
-            logger.warning("Could not update orphan-segment ledger: %s", error)
+            logger.warning("Could not remove obsolete orphan-segment ledger: %s", error)
 
         removed = int(result["removed_directories"])
         if removed:
@@ -1314,6 +1340,7 @@ class ChromaClient:
             )
         return result
 
+    @_with_index_lifecycle_lock(exclusive=True)
     def begin_staged_rebuild(self) -> None:
         """Route rebuild writes to a new collection without touching the index."""
         if self._rebuild_original_collection is not None:
@@ -1353,6 +1380,7 @@ class ChromaClient:
             self.collection_name,
         )
 
+    @_with_index_lifecycle_lock(exclusive=True)
     def commit_staged_rebuild(self) -> None:
         """Replace the live collection after its staged replacement is complete."""
         original_collection = self._rebuild_original_collection
@@ -1389,6 +1417,7 @@ class ChromaClient:
             self.collection_name,
         )
 
+    @_with_index_lifecycle_lock(exclusive=True)
     def abort_staged_rebuild(self) -> None:
         """Discard an incomplete staged rebuild and restore the live handle."""
         original_collection = self._rebuild_original_collection
@@ -1508,6 +1537,7 @@ class ChromaClient:
         )
         return False
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def document_exists(self, doc_id: str) -> bool:
         """Check if a document exists in the collection."""
         self._ensure_live_collection()
@@ -1517,6 +1547,7 @@ class ChromaClient:
         except Exception:
             return False
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def get_document_metadata(self, doc_id: str) -> dict[str, Any] | None:
         """
         Get metadata for an item if it is indexed.
@@ -1542,6 +1573,7 @@ class ChromaClient:
         except Exception:
             return None
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def get_existing_ids(self, ids: list[str]) -> set[str]:
         """Return the subset of ids that already exist in the collection."""
         if not ids:
@@ -1554,6 +1586,7 @@ class ChromaClient:
             logger.error("Error checking collection ids: %s", e)
             raise
 
+    @_with_index_lifecycle_lock(exclusive=False)
     def get_all_ids(self) -> set[str]:
         """Return every id currently stored in the collection.
 
@@ -1748,20 +1781,21 @@ def read_collection_status(
     }
 
     try:
-        with suppress_stdout():
-            client = chromadb.PersistentClient(
-                path=persist_directory,
-                settings=Settings(anonymized_telemetry=False, allow_reset=True),
-            )
-            try:
-                collection = client.get_collection(
-                    name=collection_name,
-                    embedding_function=_NoEmbeddingFunction(),
+        with index_lifecycle_lock(persist_directory, exclusive=False):
+            with suppress_stdout():
+                client = chromadb.PersistentClient(
+                    path=persist_directory,
+                    settings=Settings(anonymized_telemetry=False, allow_reset=True),
                 )
-            except Exception:
-                # Collection does not exist yet — database not initialized.
-                return {**base, "count": 0, "initialized": False}
-            count = collection.count()
+                try:
+                    collection = client.get_collection(
+                        name=collection_name,
+                        embedding_function=_NoEmbeddingFunction(),
+                    )
+                except Exception:
+                    # Collection does not exist yet — database not initialized.
+                    return {**base, "count": 0, "initialized": False}
+                count = collection.count()
         return {**base, "count": count, "initialized": True}
     except Exception as e:
         logger.error(f"Error reading collection status: {e}")
