@@ -242,6 +242,32 @@ def test_health_audit_does_not_call_other_collection_segments_orphans(tmp_path):
     assert _finding(report, "orphan_segments").level == "ok"
 
 
+def test_health_audit_reports_genuinely_unowned_segments(tmp_path):
+    config_path, persist_directory = _create_fixture(tmp_path)
+    connection = sqlite3.connect(persist_directory / "chroma.sqlite3")
+    connection.execute(
+        "INSERT INTO segments VALUES (?, ?, ?, ?)",
+        (
+            "77777777-7777-7777-7777-777777777777",
+            "vector",
+            "VECTOR",
+            "88888888-8888-8888-8888-888888888888",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    report = db_health.audit_semantic_database(
+        config_path,
+        persist_directory=persist_directory,
+        compare_zotero=False,
+        full_integrity=False,
+    )
+
+    assert report.healthy is False
+    assert _finding(report, "foreign_keys").level == "error"
+
+
 def test_zotero_key_deduplication_matches_update_type_priority():
     unknown = SimpleNamespace(
         key="UNKNOWN",
