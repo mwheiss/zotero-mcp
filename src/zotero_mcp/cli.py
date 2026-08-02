@@ -415,6 +415,35 @@ def main():
     db_status_parser.add_argument("--config-path",
                                  help="Path to semantic search configuration file")
 
+    # Strictly read-only integrity and coverage audit
+    db_health_parser = subparsers.add_parser(
+        "db-health",
+        help="Audit semantic search database integrity without modifying it",
+    )
+    db_health_parser.add_argument(
+        "--config-path",
+        help="Path to semantic search configuration file",
+    )
+    db_health_parser.add_argument(
+        "--db-path",
+        help="Path to Zotero database for item-key coverage comparison",
+    )
+    db_health_parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Skip the slower full SQLite integrity check",
+    )
+    db_health_parser.add_argument(
+        "--no-zotero-compare",
+        action="store_true",
+        help="Skip comparison with the local Zotero item set",
+    )
+    db_health_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+
     # DB inspect command (sample and filter indexed docs; also supports stats)
     inspect_parser = subparsers.add_parser("db-inspect", help="Inspect indexed documents or show aggregate stats for the semantic DB")
     inspect_parser.add_argument("--limit", type=int, default=20, help="How many records to show (default: 20)")
@@ -684,6 +713,26 @@ def main():
         except Exception as e:
             print(f"Error importing OpenAI batch: {e}")
             sys.exit(1)
+
+    elif args.command == "db-health":
+        setup_zotero_environment()
+
+        from zotero_mcp.db_health import (
+            audit_semantic_database,
+            format_health_report,
+        )
+
+        report = audit_semantic_database(
+            _semantic_config_path(args.config_path),
+            zotero_db_path=args.db_path,
+            full_integrity=not args.quick,
+            compare_zotero=not args.no_zotero_compare,
+        )
+        if args.json:
+            print(json.dumps(report.to_dict(), indent=2))
+        else:
+            print(format_health_report(report))
+        sys.exit(0 if report.healthy else 1)
 
     elif args.command == "db-status":
         # Setup Zotero environment variables

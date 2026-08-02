@@ -31,6 +31,19 @@ def test_update_db_help_mentions_embedding_concurrency(monkeypatch, capsys):
     assert "--embedding-concurrency N" in capsys.readouterr().out
 
 
+def test_main_help_lists_read_only_database_health_command(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["zotero-mcp", "db-health", "--help"])
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "--quick" in output
+    assert "--no-zotero-compare" in output
+    assert "--json" in output
+
+
 def test_update_db_help_documents_fulltext_switch(monkeypatch, capsys):
     monkeypatch.setattr(
         "sys.argv",
