@@ -1,5 +1,7 @@
 """Regression tests for non-destructive embedding-model mismatches."""
 
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -100,9 +102,8 @@ def test_reset_stamps_embedding_identity(monkeypatch):
 
 
 def _staging_client(tmp_path):
-    raw_client = chroma_client.chromadb.PersistentClient(
-        path=str(tmp_path / "chroma-staging")
-    )
+    persist_directory = tmp_path / "chroma-staging"
+    raw_client = chroma_client.chromadb.PersistentClient(path=str(persist_directory))
     collection = raw_client.create_collection(
         "zotero_library",
         metadata={
@@ -117,6 +118,11 @@ def _staging_client(tmp_path):
     client.collection_name = "zotero_library"
     client.embedding_function = None
     client.embedding_identity = "test:model"
+    client.persist_directory = str(persist_directory)
+    marker_token = hashlib.sha256(b"zotero_library").hexdigest()[:16]
+    client._rebuild_marker_path = (
+        persist_directory / f".zotero-mcp-rebuild-{marker_token}.json"
+    )
     client._pending_embedding_mismatch = False
     client._rebuild_original_collection = None
     client._rebuild_staging_name = None
@@ -143,6 +149,63 @@ def test_aborted_staged_rebuild_leaves_live_collection_untouched(tmp_path):
     client.abort_staged_rebuild()
 
     assert raw_client.get_collection("zotero_library").get()["ids"] == ["OLD"]
+
+
+def test_existing_client_refreshes_handle_after_cross_process_swap(tmp_path):
+    persist_directory = str(tmp_path / "cross-process")
+    reader = chroma_client.ChromaClient(persist_directory=persist_directory)
+    reader.upsert_embeddings(["old"], [{"title": "Old"}], ["OLD"], [[1.0, 0.0]])
+    updater = chroma_client.ChromaClient(persist_directory=persist_directory)
+
+    updater.begin_staged_rebuild()
+    updater.upsert_embeddings(
+        ["new"], [{"title": "New"}], ["NEW"], [[0.0, 1.0]]
+    )
+    updater.commit_staged_rebuild()
+
+    assert reader.get_all_ids() == {"NEW"}
+
+
+def test_interrupted_swap_restores_backup_before_opening(tmp_path):
+    client, raw_client = _staging_client(tmp_path)
+    client.begin_staged_rebuild()
+    client.collection.add(ids=["PARTIAL"], embeddings=[[0.5, 0.5]])
+    staging_name = client._rebuild_staging_name
+    backup_name = "zotero_library__replaced_interrupted"
+    client._write_rebuild_marker(staging_name, backup_name)
+    marker = json.loads(client._rebuild_marker_path.read_text())
+    marker["pid"] = 999_999_999
+    client._rebuild_marker_path.write_text(json.dumps(marker))
+    client._rebuild_original_collection.modify(name=backup_name)
+
+    assert client._recover_interrupted_rebuild() is False
+
+    assert set(raw_client.get_collection("zotero_library").get()["ids"]) == {"OLD"}
+    names = {collection.name for collection in raw_client.list_collections()}
+    assert "zotero_library" in names
+    assert staging_name not in names
+    assert not client._rebuild_marker_path.exists()
+
+
+def test_interrupted_swap_keeps_activated_replacement(tmp_path):
+    client, raw_client = _staging_client(tmp_path)
+    client.begin_staged_rebuild()
+    client.collection.add(ids=["NEW"], embeddings=[[0.0, 1.0]])
+    staging_name = client._rebuild_staging_name
+    backup_name = "zotero_library__replaced_interrupted"
+    client._write_rebuild_marker(staging_name, backup_name)
+    marker = json.loads(client._rebuild_marker_path.read_text())
+    marker["pid"] = 999_999_999
+    client._rebuild_marker_path.write_text(json.dumps(marker))
+    client._rebuild_original_collection.modify(name=backup_name)
+    client.collection.modify(name="zotero_library")
+
+    assert client._recover_interrupted_rebuild() is False
+
+    assert set(raw_client.get_collection("zotero_library").get()["ids"]) == {"NEW"}
+    names = {collection.name for collection in raw_client.list_collections()}
+    assert backup_name in names
+    assert not client._rebuild_marker_path.exists()
 
 
 class _RecordCollection:
