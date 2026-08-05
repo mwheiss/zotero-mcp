@@ -5,11 +5,9 @@ Each test prevents a specific bug from reappearing.
 
 import json
 
-import pytest
-
 from conftest import DummyContext, FakeZotero, _FakeResponse
-from zotero_mcp import server
 
+from zotero_mcp import server
 
 # ---------------------------------------------------------------------------
 # Bug 1: manage_collections passed [item_dict] (list) instead of item_dict
@@ -163,42 +161,26 @@ class TestFindDuplicatesNoPicle:
 
 
 # ---------------------------------------------------------------------------
-# Bug 4: PDF outline tried to import _get_storage_dir as standalone function
-# and used a broken local mode path. Now uses zot.dump() for all modes.
+# Bug 4: PDF outline uses the shared parent/attachment PDF resolver.
 # ---------------------------------------------------------------------------
 
 class TestPdfOutlineDownloadMethod:
-    """PDF outline always uses zot.dump(), not direct file path access."""
+    """PDF outline and page reading share deterministic attachment selection."""
 
-    def test_dump_called_not_direct_path(self, monkeypatch):
+    def test_shared_pdf_resolver_is_used(self, monkeypatch, tmp_path):
         import sys
         import types
 
-        dump_called = []
+        pdf_path = tmp_path / "paper.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4 fake")
+        resolver_calls = []
 
-        class FakeZotDump(FakeZotero):
-            def children(self, key, **kw):
-                return [{
-                    "key": "ATT01",
-                    "data": {
-                        "itemType": "attachment",
-                        "contentType": "application/pdf",
-                        "filename": "paper.pdf",
-                        "parentItem": key,
-                    },
-                }]
+        def resolve(key, _ctx):
+            resolver_calls.append(key)
+            return str(pdf_path), "Paper", "ATT01"
 
-            def dump(self, key, filename=None, path=None):
-                dump_called.append({"key": key, "filename": filename, "path": path})
-                # Create a dummy file
-                import os
-                if path and filename:
-                    with open(os.path.join(path, filename), "wb") as f:
-                        f.write(b"%PDF-1.4 fake")
-
-        fake = FakeZotDump()
-        monkeypatch.setattr("zotero_mcp.client.get_zotero_client", lambda: fake)
-        monkeypatch.setattr("zotero_mcp.utils.is_local_mode", lambda: True)
+        monkeypatch.setattr("zotero_mcp.tools.read_pdf._get_pdf_path", resolve)
+        monkeypatch.setattr("zotero_mcp.tools.read_pdf._cleanup_path", lambda _path: None)
 
         # Mock fitz
         class FakeDoc:
@@ -214,7 +196,8 @@ class TestPdfOutlineDownloadMethod:
         ctx = DummyContext()
         result = server.get_pdf_outline(item_key="PARENT01", ctx=ctx)
 
-        assert len(dump_called) == 1, "dump() should be called even in local mode"
+        assert resolver_calls == ["PARENT01"]
+        assert "ATT01" in result
         assert "Intro" in result
 
 

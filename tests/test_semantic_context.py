@@ -237,3 +237,33 @@ def test_semantic_search_formats_retrievable_chunk_references(monkeypatch):
     assert f"**Chunk Hash:** `{'a' * 64}`" in result
     assert f"`PAPER001#7`: `{'b' * 64}`" in result
     assert "supporting evidence" in result
+
+
+def test_semantic_search_combines_item_key_with_exact_filters(monkeypatch):
+    captured = {}
+
+    class _Search:
+        def search(self, **kwargs):
+            captured.update(kwargs)
+            return {"results": []}
+
+    monkeypatch.setattr(
+        semantic_module,
+        "create_semantic_search",
+        lambda _config_path: _Search(),
+    )
+    monkeypatch.setattr(search_tools, "_maybe_fire_presearch_sync", lambda _search: None)
+
+    search_tools.semantic_search(
+        query="capture probability",
+        item_key="PAPER001",
+        filters={"itemType": "journalArticle"},
+        ctx=DummyContext(),
+    )
+
+    assert captured["filters"] == {
+        "$and": [
+            {"item_type": {"$eq": "journalArticle"}},
+            {"item_key": {"$eq": "PAPER001"}},
+        ]
+    }

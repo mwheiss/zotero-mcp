@@ -26,6 +26,23 @@ _PRESEARCH_SYNC_MIN_INTERVAL = 60.0
 _last_presearch_sync_ts: float = 0.0
 _presearch_sync_lock = _threading.Lock()
 
+_SEMANTIC_FILTER_FIELDS = {
+    "item_key",
+    "item_type",
+    "title",
+    "date",
+    "creators",
+    "publication",
+    "doi",
+    "tags",
+    "citation_key",
+    "has_fulltext",
+    "fulltext_source",
+    "library_identity",
+    "library_id",
+    "library_type",
+}
+
 
 def _maybe_fire_presearch_sync(search) -> None:
     """Schedule a background semantic-search DB update if auto-update is due.
@@ -119,11 +136,14 @@ def _search_with_variants(zot, query: str, qmode: str, limit: int,
         "NARROWS the match, so adding topic words usually returns fewer "
         "results, not more. For topic discovery, use zotero_semantic_search "
         "instead; for tag filtering use zotero_search_by_tag. "
-        "If a query finds nothing, this tool automatically falls back to "
-        "simplified queries and then semantic search. "
+        "A miss returns no results by default. Set fallback_mode='relaxed' "
+        "to try simpler metadata/full-text queries, or 'semantic' to also "
+        "try the semantic index. Fallback results preserve item_type and tag "
+        "constraints and are explicitly labeled. "
         "query: required substring. qmode: 'titleCreatorYear' (default) "
-        "matches only title/authors/year; 'everything' also searches "
-        "abstract. item_type: '-attachment' (default) excludes attachments; "
+        "matches only title/authors/year; 'everything' uses Zotero's indexed "
+        "all-fields/full-text search while still returning metadata. "
+        "item_type: '-attachment' (default) excludes attachments; "
         "pass 'journalArticle', 'book', etc. to filter. tag: optional list "
         "of tag conditions (ANDed). limit: max results (default 10). "
         "collection_key: 8-char key to restrict to a collection (bypasses "
@@ -140,6 +160,7 @@ def search_items(
     limit: int | str | None = 10,
     tag: list[str] | list[dict] | str | None = None,
     collection_key: str | None = None,
+    fallback_mode: Literal["none", "relaxed", "semantic"] = "none",
     *,
     ctx: Context
 ) -> str:
@@ -214,7 +235,7 @@ def search_items(
                     ctx.info("Search took too long — returning best results found so far")
                 return _timed_out
 
-            if not items and query.strip():
+            if not items and query.strip() and fallback_mode != "none":
                 ctx.info("No results with original query, trying fallback strategies...")
                 words = query.strip().split()
 
@@ -269,7 +290,11 @@ def search_items(
                         fallback_strategy = "full-text search"
 
                 # Strategy 4: Semantic search (if database exists)
-                if not _check_cascade_timeout() and not items:
+                if (
+                    fallback_mode == "semantic"
+                    and not _check_cascade_timeout()
+                    and not items
+                ):
                     try:
                         from zotero_mcp.semantic_search import create_semantic_search
                         config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
@@ -279,14 +304,33 @@ def search_items(
                             sem_search = create_semantic_search(str(config_path))
                             _search_logger.debug(f"[CASCADE] semantic init: {_time.monotonic() - t0:.2f}s")
                             t0 = _time.monotonic()
-                            sem_results = sem_search.search(query=query, limit=limit or 10)
+                            semantic_filters = {}
+                            if item_type and not item_type.startswith("-"):
+                                semantic_filters["item_type"] = item_type
+                            sem_results = sem_search.search(
+                                query=query,
+                                limit=max((limit or 10) * 4, limit or 10),
+                                filters=semantic_filters or None,
+                            )
                             _search_logger.debug(f"[CASCADE] semantic query: {_time.monotonic() - t0:.2f}s")
                             if sem_results and sem_results.get("results"):
                                 seen_keys: set[str] = set()
                                 for sr in sem_results["results"]:
                                     zot_item = sr.get("zotero_item", {})
                                     key = sr.get("item_key", zot_item.get("key", ""))
-                                    if key and key not in seen_keys:
+                                    item_data = zot_item.get("data", {})
+                                    item_tags = {
+                                        value.get("tag", "")
+                                        for value in item_data.get("tags", [])
+                                        if isinstance(value, dict)
+                                    }
+                                    if tag and not all(value in item_tags for value in tag):
+                                        continue
+                                    if (
+                                        key
+                                        and key not in seen_keys
+                                        and len(items) < limit
+                                    ):
                                         seen_keys.add(key)
                                         if "key" not in zot_item:
                                             zot_item["key"] = key
@@ -525,7 +569,7 @@ def search_by_citation_key(
 )
 @with_zotero_api_lock
 def advanced_search(
-    conditions: list[dict[str, str]],
+    conditions: list[dict[str, str]] | str,
     join_mode: Literal["all", "any"] = "all",
     sort_by: str | None = None,
     sort_direction: Literal["asc", "desc"] = "asc",
@@ -643,6 +687,10 @@ def advanced_search(
             if field_lower == "year":
                 date_value = str(data.get("date", "")).strip()
                 return [date_value[:4]] if len(date_value) >= 4 else []
+
+            if field_lower in {"collection", "collections"}:
+                collections = data.get("collections", []) or []
+                return [str(value).strip() for value in collections if value]
 
             field_aliases = {
                 "itemtype": "itemType",
@@ -784,9 +832,13 @@ def advanced_search(
         "the user requests whole-paper reading or the task genuinely needs "
         "information spread across the document; never load every search "
         "result in full. query: natural-language topic, claim, or question. "
-        "limit: maximum paper-level results, default 10. filters: optional "
-        "metadata constraints as a dict or JSON string, for example "
-        "{'itemType': 'journalArticle'}. Requires a populated "
+        "limit: maximum paper-level results, default 10. item_key: optional "
+        "exact parent item key, useful for finding the best indexed passage "
+        "inside one known paper. filters: optional exact-match Chroma metadata "
+        "constraints as a dict or JSON string. Supported indexed fields include "
+        "item_key, item_type, title, date, creators, publication, doi, tags, "
+        "citation_key, has_fulltext, fulltext_source, library_identity, "
+        "library_id, and library_type. Requires a populated "
         "semantic database; check zotero_get_search_database_status when "
         "readiness is uncertain. Example: "
         "zotero_semantic_search(query='negative muon capture in helium', "
@@ -797,7 +849,8 @@ def advanced_search(
 def semantic_search(
     query: str,
     limit: int = 10,
-    filters: dict[str, str] | str | None = None,
+    filters: dict[str, object] | str | None = None,
+    item_key: str | None = None,
     *,
     ctx: Context
 ) -> str:
@@ -831,14 +884,39 @@ def semantic_search(
             if not isinstance(filters, dict):
                 return "Error: filters parameter must be a dictionary or JSON string. Example: {\"item_type\": \"note\"}"
 
+            filters = dict(filters)
+
             # Automatically translate common field names
             if "itemType" in filters:
                 filters["item_type"] = filters.pop("itemType")
                 ctx.info(f"Automatically translated 'itemType' to 'item_type': {filters}")
 
-            # Additional field name translations can be added here
-            # Example: if "creatorType" in filters:
-            #     filters["creator_type"] = filters.pop("creatorType")
+        if item_key:
+            normalized_key = item_key.strip()
+            if not normalized_key:
+                return "Error: item_key cannot be blank"
+            filters = dict(filters or {})
+            existing_key = filters.get("item_key")
+            if existing_key is not None and existing_key != normalized_key:
+                return "Error: item_key conflicts with filters['item_key']"
+            filters["item_key"] = normalized_key
+
+        if filters:
+            unsupported = sorted(set(filters) - _SEMANTIC_FILTER_FIELDS)
+            if unsupported:
+                return (
+                    "Error: unsupported semantic filter field(s): "
+                    + ", ".join(unsupported)
+                )
+            if any(isinstance(value, (dict, list)) for value in filters.values()):
+                return "Error: semantic filter values must be exact scalar values"
+            if len(filters) > 1:
+                filters = {
+                    "$and": [
+                        {field: {"$eq": value}}
+                        for field, value in filters.items()
+                    ]
+                }
 
         ctx.info(f"Performing semantic search for: '{query}'")
 

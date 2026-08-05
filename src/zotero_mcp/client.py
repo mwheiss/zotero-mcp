@@ -4,6 +4,7 @@ Zotero client wrapper for MCP server.
 
 import functools
 import os
+import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -650,6 +651,70 @@ def get_attachment_details(zot: zotero.Zotero, item: dict[str, Any]) -> Attachme
         pass
 
     return None
+
+
+def get_pdf_attachment_details(
+    zot: zotero.Zotero,
+    item: dict[str, Any],
+) -> AttachmentDetails | None:
+    """Resolve one PDF deterministically from a parent or attachment item.
+
+    An explicitly supplied PDF attachment always wins. For a parent item,
+    OCR-labeled PDFs are preferred, then full-text-labeled PDFs, then other
+    PDFs. Recency and item key provide stable tie breakers.
+    """
+    data = item.get("data", {})
+    if data.get("itemType") == "attachment":
+        content_type = data.get("contentType", "")
+        filename = data.get("filename", "")
+        if content_type != "application/pdf" and not filename.lower().endswith(
+            ".pdf"
+        ):
+            return None
+        return AttachmentDetails(
+            key=item.get("key") or data.get("key", ""),
+            title=data.get("title", "Untitled"),
+            filename=filename,
+            content_type=content_type,
+        )
+
+    candidates = []
+    for child in zot.children(item.get("key") or data.get("key", "")):
+        child_data = child.get("data", {})
+        content_type = child_data.get("contentType", "")
+        filename = child_data.get("filename", "")
+        if child_data.get("itemType") != "attachment":
+            continue
+        if content_type != "application/pdf" and not filename.lower().endswith(
+            ".pdf"
+        ):
+            continue
+        label = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            f"{child_data.get('title', '')} {filename}".casefold(),
+        ).strip()
+        words = set(label.split())
+        preference = 2 if "ocr" in words else 1 if (
+            "fulltext" in words or {"full", "text"} <= words
+        ) else 0
+        candidates.append(
+            (
+                preference,
+                child_data.get("dateModified", ""),
+                child.get("key", ""),
+                child_data,
+            )
+        )
+    if not candidates:
+        return None
+    _, _, key, selected = max(candidates, key=lambda value: value[:3])
+    return AttachmentDetails(
+        key=key,
+        title=selected.get("title", "Untitled"),
+        filename=selected.get("filename", ""),
+        content_type=selected.get("contentType", ""),
+    )
 
 
 def download_attachment_file(

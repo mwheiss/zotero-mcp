@@ -98,6 +98,18 @@ def test_synthesize_annotations_empty(monkeypatch):
     assert "No annotations or notes found" in out
 
 
+def test_synthesize_annotations_keeps_same_title_papers_separate(monkeypatch):
+    fake = _DigestZotero()
+    fake._title_map["PAPER002"] = "Attention Is All You Need"
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
+
+    out = synthesis.synthesize_annotations(ctx=DummyContext())
+
+    assert "2 papers" in out
+    assert "`PAPER001`" in out
+    assert "`PAPER002`" in out
+
+
 # ---------------------------------------------------------------------------
 # export_bibliography
 # ---------------------------------------------------------------------------

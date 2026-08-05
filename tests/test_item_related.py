@@ -1,10 +1,9 @@
 """Tests for item related/relation functionality."""
 
-import pytest
 
-from zotero_mcp import server
 from conftest import DummyContext, FakeZotero, _FakeResponse
 
+from zotero_mcp import server
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -51,6 +50,14 @@ class FakeZoteroForRelations(FakeZotero):
         if key in self._items:
             self._items[key] = item
         return _FakeResponse(204)
+
+
+class FailingSecondRelationWrite(FakeZoteroForRelations):
+    def update_item(self, item, **kwargs):
+        if len(self.update_calls) == 1:
+            self.update_calls.append(item)
+            return _FakeResponse(500)
+        return super().update_item(item, **kwargs)
 
 
 # -----------------------------------------------------------------------------
@@ -186,6 +193,25 @@ class TestAddItemRelation:
 
         assert "already related" in result.lower()
 
+    def test_reverse_failure_rolls_back_both_items(self, monkeypatch):
+        item1 = _make_item(key="ITEM0001")
+        item2 = _make_item(key="ITEM0002")
+        fake = FailingSecondRelationWrite(items=[item1, item2])
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client",
+            lambda ctx: (fake, fake),
+        )
+
+        result = server.add_item_relation(
+            item_key="ITEM0001",
+            related_item_key="ITEM0002",
+            ctx=DummyContext(),
+        )
+
+        assert "restored" in result.lower()
+        assert fake._items["ITEM0001"]["data"]["relations"] == {}
+        assert fake._items["ITEM0002"]["data"]["relations"] == {}
+
 
 # -----------------------------------------------------------------------------
 # Remove Relation Tests
@@ -250,3 +276,36 @@ class TestRemoveItemRelation:
         )
 
         assert "no relations" in result.lower()
+
+    def test_reverse_failure_rolls_back_removed_relation(self, monkeypatch):
+        item1 = _make_item(
+            key="ITEM0001",
+            relations={
+                "dc:relation": [
+                    "http://zotero.org/users/12345/items/ITEM0002"
+                ]
+            },
+        )
+        item2 = _make_item(
+            key="ITEM0002",
+            relations={
+                "dc:relation": [
+                    "http://zotero.org/users/12345/items/ITEM0001"
+                ]
+            },
+        )
+        fake = FailingSecondRelationWrite(items=[item1, item2])
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client",
+            lambda ctx: (fake, fake),
+        )
+
+        result = server.remove_item_relation(
+            item_key="ITEM0001",
+            related_item_key="ITEM0002",
+            ctx=DummyContext(),
+        )
+
+        assert "restored" in result.lower()
+        assert fake._items["ITEM0001"]["data"]["relations"]["dc:relation"]
+        assert fake._items["ITEM0002"]["data"]["relations"]["dc:relation"]

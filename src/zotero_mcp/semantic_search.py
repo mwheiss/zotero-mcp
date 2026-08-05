@@ -2046,9 +2046,27 @@ class ZoteroSemanticSearch:
                 pdf_timeout=pdf_timeout,
             ) as reader,
         ):
+            library, _, _ = self._library_scope()
+            resolve_library_id = getattr(reader, "resolve_library_id", None)
+            sqlite_library_id = (
+                resolve_library_id(
+                    library.get("library_id", ""),
+                    library.get("library_type", "user"),
+                )
+                if callable(resolve_library_id)
+                else None
+            )
+            if callable(resolve_library_id) and sqlite_library_id is None:
+                return remaining, preserved_items, preserved_records, False
             for item, existing in fulltext_items:
                 item_key = item.get("key", "")
-                local_item = reader.get_item_by_key(item_key)
+                local_item = (
+                    reader.get_item_by_key(
+                        item_key, library_id=sqlite_library_id
+                    )
+                    if sqlite_library_id is not None
+                    else reader.get_item_by_key(item_key)
+                )
                 if local_item is None:
                     snapshot_complete = False
                     if not preserve(item):

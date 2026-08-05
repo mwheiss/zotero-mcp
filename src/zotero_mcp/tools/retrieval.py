@@ -101,8 +101,10 @@ def get_item_metadata(
         "semantic hit, normally call zotero_get_semantic_context with its "
         "Chunk ID. Avoid loading several complete papers unless the user "
         "explicitly requests cross-paper full reading. item_key: copy the "
-        "8-character parent Item Key from a search or metadata result, not an "
-        "attachment key, DOI, or title. Returns item metadata and the selected "
+        "8-character parent Item Key from a search or metadata result, not a "
+        "DOI or title. attachment_key: optional exact child attachment key; "
+        "use this when the caller wants a specific artifact. Returns item "
+        "metadata, the selected attachment/source, and the selected "
         "model-facing document text. In local mode that may be a preferred "
         "BetterIssa, structured-text, HTML, or PDF artifact; otherwise it "
         "uses Zotero indexed text and download conversion fallbacks. Direct "
@@ -112,7 +114,12 @@ def get_item_metadata(
     ),
 )
 @with_zotero_api_lock
-def get_item_fulltext(item_key: str, *, ctx: Context) -> str:
+def get_item_fulltext(
+    item_key: str,
+    attachment_key: str | None = None,
+    *,
+    ctx: Context,
+) -> str:
     """
     Get the full text content of a Zotero item.
 
@@ -131,6 +138,19 @@ def get_item_fulltext(item_key: str, *, ctx: Context) -> str:
         item = zot.item(item_key)
         if not item:
             return f"No item found with key: {item_key}"
+
+        selected_attachment = None
+        if attachment_key:
+            selected_item = zot.item(attachment_key)
+            selected_data = selected_item.get("data", {})
+            if selected_data.get("itemType") != "attachment":
+                return f"Error: `{attachment_key}` is not an attachment item."
+            if selected_data.get("parentItem") != item_key:
+                return (
+                    f"Error: attachment `{attachment_key}` is not a child of "
+                    f"item `{item_key}`."
+                )
+            selected_attachment = _client.get_attachment_details(zot, selected_item)
 
         # Get item metadata in markdown format
         metadata = _client.format_item_metadata(item, include_abstract=True)
@@ -160,9 +180,24 @@ def get_item_fulltext(item_key: str, *, ctx: Context) -> str:
                     pdf_max_pages = DEFAULT_FULLTEXT_DISPLAY_MAX
 
                 with LocalZoteroReader(db_path=zotero_db_path, pdf_max_pages=pdf_max_pages) as reader:
-                    local_item = reader.get_item_by_key(item_key)
+                    library = _client.get_current_library()
+                    sqlite_library_id = reader.resolve_library_id(
+                        library.get("library_id", ""),
+                        library.get("library_type", "user"),
+                    )
+                    local_item = (
+                        reader.get_item_by_key(
+                            item_key, library_id=sqlite_library_id
+                        )
+                        if sqlite_library_id is not None
+                        else None
+                    )
                     if local_item:
-                        extracted = reader.extract_fulltext_for_item(local_item.item_id)
+                        allowed_keys = {attachment_key} if attachment_key else None
+                        extracted = reader.extract_fulltext_for_item(
+                            local_item.item_id,
+                            allowed_attachment_keys=allowed_keys,
+                        )
                         if extracted and extracted[0]:
                             # Skip timeout sentinel — don't show "__EXTRACTION_TIMEOUT__" as content
                             if isinstance(extracted, tuple) and len(extracted) >= 2 and extracted[1] == "timeout":
@@ -170,8 +205,12 @@ def get_item_fulltext(item_key: str, *, ctx: Context) -> str:
                             else:
                                 source = extracted[1] if len(extracted) > 1 else "file"
                                 ctx.info(f"Retrieved full text from local storage ({source})")
+                                source_line = f"**Selected source:** {source}"
+                                if attachment_key:
+                                    source_line += f" (`{attachment_key}`)"
                                 return _helpers._prepend_size_warning(
-                                    f"{metadata}\n\n---\n\n## Full Text\n\n{extracted[0]}",
+                                    f"{metadata}\n\n---\n\n## Full Text\n\n"
+                                    f"{source_line}\n\n{extracted[0]}",
                                     "Consider using zotero_semantic_search to find specific content instead of reading full papers.",
                                 )
         except Exception as local_extract_error:
@@ -179,7 +218,7 @@ def get_item_fulltext(item_key: str, *, ctx: Context) -> str:
             ctx.info(f"Local extraction fallback not available: {str(local_extract_error)}")
 
         # Try to get attachment details
-        attachment = _client.get_attachment_details(zot, item)
+        attachment = selected_attachment or _client.get_attachment_details(zot, item)
         if not attachment:
             return f"{metadata}\n\n---\n\nNo suitable attachment found for this item."
 
@@ -191,7 +230,9 @@ def get_item_fulltext(item_key: str, *, ctx: Context) -> str:
             if full_text_data and "content" in full_text_data and full_text_data["content"]:
                 ctx.info("Successfully retrieved full text from Zotero's index")
                 return _helpers._prepend_size_warning(
-                    f"{metadata}\n\n---\n\n## Full Text\n\n{full_text_data['content']}",
+                    f"{metadata}\n\n---\n\n## Full Text\n\n"
+                    f"**Selected attachment:** `{attachment.key}` (Zotero indexed text)\n\n"
+                    f"{full_text_data['content']}",
                     "Consider using zotero_semantic_search to find specific content instead of reading full papers.",
                 )
         except Exception as fulltext_error:
@@ -214,7 +255,9 @@ def get_item_fulltext(item_key: str, *, ctx: Context) -> str:
                     ctx.info(f"Downloaded file via {download.source} to {download.path}, converting to markdown")
                     converted_text = _client.convert_to_markdown(download.path)
                     return _helpers._prepend_size_warning(
-                        f"{metadata}\n\n---\n\n## Full Text\n\n{converted_text}",
+                        f"{metadata}\n\n---\n\n## Full Text\n\n"
+                        f"**Selected attachment:** `{attachment.key}` ({download.source})\n\n"
+                        f"{converted_text}",
                         "Consider using zotero_semantic_search to find specific content instead of reading full papers.",
                     )
 
@@ -261,7 +304,16 @@ def get_attachment_path(item_key: str, *, ctx: Context) -> str:
         zotero_db_path = _helpers._load_zotero_mcp_config().get("semantic_search", {}).get("zotero_db_path")
 
         with LocalZoteroReader(db_path=zotero_db_path) as reader:
-            attachments = reader.get_attachment_paths(item_key)
+            library = _client.get_current_library()
+            sqlite_library_id = reader.resolve_library_id(
+                library.get("library_id", ""),
+                library.get("library_type", "user"),
+            )
+            if sqlite_library_id is None:
+                return "Error: active library is not present in the local Zotero snapshot."
+            attachments = reader.get_attachment_paths(
+                item_key, library_id=sqlite_library_id
+            )
 
         if not attachments:
             return f"No attachments found for item `{item_key}`."
@@ -584,14 +636,15 @@ def get_collection_items(
 @mcp.tool(
     name="zotero_get_item_children",
     description=(
-        "List the child items (attachments, notes, and annotations that are "
-        "direct children of the attachment) of ONE parent Zotero item. "
+        "List the direct child items (normally attachments and notes) of ONE "
+        "parent Zotero item. This does not recursively fetch annotations under "
+        "an attachment; pass the attachment key in a separate call if needed. "
         "Use this to find an item's PDF/EPUB attachment key before calling "
-        "zotero_create_annotation, zotero_create_area_annotation, or "
-        "zotero_get_pdf_outline — all of which take an attachment key, NOT "
-        "the parent item key. "
+        "zotero_create_annotation or zotero_create_area_annotation. PDF read "
+        "and outline tools accept either the attachment or parent key. "
         "If you need children for several items at once, use "
-        "zotero_get_items_children (one batched API call instead of N). "
+        "zotero_get_items_children (one convenience call; it still performs "
+        "one Zotero children request per parent). "
         "item_key: the parent item's 8-character key. "
         "Returns parent-child structure as markdown: each attachment with "
         "its content type and filename, each note with its title. "
@@ -710,11 +763,11 @@ def get_item_children(item_key: str, *, ctx: Context) -> str:
 @mcp.tool(
     name="zotero_get_items_children",
     description=(
-        "Batch variant of zotero_get_item_children: fetch child items "
-        "(attachments, notes, annotations) for MULTIPLE parent items in a "
-        "single API round trip. "
-        "Much cheaper than calling zotero_get_item_children N times — use "
-        "this whenever you have 2+ item keys in hand. "
+        "Multi-item convenience variant of zotero_get_item_children: fetch "
+        "direct child items (normally attachments and notes) for MULTIPLE "
+        "parents. It performs one Zotero children request per parent; its "
+        "benefit is one MCP call and consolidated error handling, not a single "
+        "backend round trip. It does not recursively fetch annotations. "
         "item_keys: list of 8-character parent item keys (also accepts a "
         "JSON-encoded list string). Pass as an ARRAY, not a single "
         "concatenated string. "

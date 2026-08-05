@@ -7,6 +7,7 @@ import pytest
 from conftest import DummyContext, FakeZotero
 
 from zotero_mcp import server
+from zotero_mcp.client import get_pdf_attachment_details
 
 # ---------------------------------------------------------------------------
 # Helpers: fake fitz module and document
@@ -233,3 +234,63 @@ class TestEdgeCases:
 
         assert "[No extractable text on this page]" in result
         assert "has text" in result
+
+
+class TestPdfSelection:
+    def test_parent_prefers_ocr_then_fulltext_then_other(self):
+        zot = FakeZotero()
+        zot._children["PARENT"] = [
+            {
+                "key": "PLAIN",
+                "data": {
+                    "itemType": "attachment",
+                    "contentType": "application/pdf",
+                    "title": "Publisher PDF",
+                    "filename": "paper.pdf",
+                    "dateModified": "2026-08-05",
+                },
+            },
+            {
+                "key": "FULLTEXT",
+                "data": {
+                    "itemType": "attachment",
+                    "contentType": "application/pdf",
+                    "title": "Full Text PDF",
+                    "filename": "fulltext.pdf",
+                    "dateModified": "2026-08-04",
+                },
+            },
+            {
+                "key": "OCRPDF",
+                "data": {
+                    "itemType": "attachment",
+                    "contentType": "application/pdf",
+                    "title": "OCR PDF",
+                    "filename": "ocr.pdf",
+                    "dateModified": "2026-08-03",
+                },
+            },
+        ]
+
+        selected = get_pdf_attachment_details(
+            zot,
+            {"key": "PARENT", "data": {"itemType": "journalArticle"}},
+        )
+
+        assert selected.key == "OCRPDF"
+
+    def test_explicit_pdf_attachment_is_never_replaced(self):
+        zot = FakeZotero()
+        selected = get_pdf_attachment_details(
+            zot,
+            {
+                "key": "EXPLICIT",
+                "data": {
+                    "itemType": "attachment",
+                    "contentType": "application/pdf",
+                    "filename": "chosen.pdf",
+                },
+            },
+        )
+
+        assert selected.key == "EXPLICIT"

@@ -16,8 +16,12 @@ from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
 
 
-def _resolve_paper_title(zot, parent_key: str, cache: dict[str, str]) -> str:
-    """Resolve an annotation/note parent key to its paper title.
+def _resolve_paper_identity(
+    zot,
+    parent_key: str,
+    cache: dict[str, tuple[str, str]],
+) -> tuple[str, str]:
+    """Resolve an annotation/note parent key to (paper key, title).
 
     Annotations are children of PDF/EPUB attachments, which are children of
     the paper (two hops: annotation.parentItem -> attachment ->
@@ -28,12 +32,14 @@ def _resolve_paper_title(zot, parent_key: str, cache: dict[str, str]) -> str:
     if parent_key in cache:
         return cache[parent_key]
 
+    paper_key = parent_key
     title = parent_key
     try:
         parent = zot.item(parent_key)
         data = parent.get("data", {}) if parent else {}
         if data.get("itemType") == "attachment" and data.get("parentItem"):
             gp_key = data["parentItem"]
+            paper_key = gp_key
             try:
                 grandparent = zot.item(gp_key)
                 gp_data = grandparent.get("data", {}) if grandparent else {}
@@ -45,8 +51,9 @@ def _resolve_paper_title(zot, parent_key: str, cache: dict[str, str]) -> str:
     except Exception:
         title = parent_key
 
-    cache[parent_key] = title
-    return title
+    identity = (paper_key, title)
+    cache[parent_key] = identity
+    return identity
 
 
 @mcp.tool(
@@ -63,7 +70,8 @@ def _resolve_paper_title(zot, parent_key: str, cache: dict[str, str]) -> str:
         "scanned (capped by limit). "
         "tag: optional tag or list of tags to filter items by (accepts a "
         "string, a JSON list, or a list). "
-        "limit: cap on annotations/notes scanned (default 200) to keep the "
+        "limit: combined cap on annotations plus notes processed (default 200) "
+        "to keep the "
         "call tractable. "
         "Output: markdown grouped by paper — each paper heading followed by "
         "its highlights (with attached comments) and any note excerpts — "
@@ -130,16 +138,33 @@ def synthesize_annotations(
             ctx.warning(f"Note fetch failed: {e}")
             notes = []
 
+        combined = [("annotation", item) for item in annotations]
+        combined.extend(("note", item) for item in notes)
+        combined.sort(
+            key=lambda pair: (
+                pair[1].get("data", {}).get("dateModified", ""),
+                pair[1].get("data", {}).get("dateAdded", ""),
+                pair[1].get("key", ""),
+            ),
+            reverse=True,
+        )
+        combined = combined[:limit]
+        annotations = [item for kind, item in combined if kind == "annotation"]
+        notes = [item for kind, item in combined if kind == "note"]
+
         if not annotations and not notes:
             scope = f" in collection {collection_key}" if collection_key else ""
             return f"No annotations or notes found{scope}."
 
-        # Group by resolved paper title.
-        title_cache: dict[str, str] = {}
+        # Group by stable paper key; distinct papers may share a title.
+        title_cache: dict[str, tuple[str, str]] = {}
         papers: dict[str, dict] = {}
 
-        def _bucket(title: str) -> dict:
-            return papers.setdefault(title, {"highlights": [], "notes": []})
+        def _bucket(paper_key: str, title: str) -> dict:
+            return papers.setdefault(
+                paper_key,
+                {"title": title, "highlights": [], "notes": []},
+            )
 
         def _in_scope(parent_key: str) -> bool:
             if allowed_keys is None:
@@ -167,8 +192,12 @@ def synthesize_annotations(
                 continue
             if parent_key and not _in_scope(parent_key):
                 continue
-            title = _resolve_paper_title(zot, parent_key, title_cache) if parent_key else "(unknown source)"
-            _bucket(title)["highlights"].append((text, comment))
+            paper_key, title = (
+                _resolve_paper_identity(zot, parent_key, title_cache)
+                if parent_key
+                else ("unknown", "(unknown source)")
+            )
+            _bucket(paper_key, title)["highlights"].append((text, comment))
             highlight_count += 1
 
         note_count = 0
@@ -181,10 +210,14 @@ def synthesize_annotations(
                 continue
             if parent_key and not _in_scope(parent_key):
                 continue
-            title = _resolve_paper_title(zot, parent_key, title_cache) if parent_key else "(standalone note)"
+            paper_key, title = (
+                _resolve_paper_identity(zot, parent_key, title_cache)
+                if parent_key
+                else (note.get("key", "standalone"), "(standalone note)")
+            )
             if len(text) > 400:
                 text = text[:400] + "..."
-            _bucket(title)["notes"].append(text)
+            _bucket(paper_key, title)["notes"].append(text)
             note_count += 1
 
         if not papers:
@@ -198,9 +231,10 @@ def synthesize_annotations(
             "",
         ]
 
-        for title in sorted(papers):
-            bucket = papers[title]
-            output.append(f"## {title}")
+        for paper_key, bucket in sorted(
+            papers.items(), key=lambda entry: (entry[1]["title"], entry[0])
+        ):
+            output.append(f"## {bucket['title']} (`{paper_key}`)")
             if bucket["highlights"]:
                 output.append("**Highlights:**")
                 for text, comment in bucket["highlights"]:

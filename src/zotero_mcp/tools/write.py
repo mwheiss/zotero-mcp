@@ -1,5 +1,6 @@
 """Write / mutation tool functions for the Zotero MCP server."""
 
+import copy
 import json
 import os
 import re
@@ -2413,12 +2414,13 @@ def merge_duplicates(
         "attachment, returned as a hierarchical markdown list with each "
         "entry's page number. "
         "Use this to orient in a paper before calling "
-        "zotero_get_item_fulltext — the outline is typically < 200 "
-        "tokens versus 10K+ for the full text. If the PDF has no "
+        "zotero_read_pdf_pages; the outline is typically < 200 tokens. "
+        "If the PDF has no "
         "embedded outline, returns a short 'no outline' message rather "
         "than failing. "
         "item_key: the PDF ATTACHMENT key OR the parent item key — both "
-        "are accepted; attachment-to-parent resolution is automatic. "
+        "are accepted. An exact attachment key is used as-is; a parent uses "
+        "the same deterministic PDF selection as zotero_read_pdf_pages. "
         "Find the right key with zotero_get_item_children if unsure. "
         "Scope: PDFs only (EPUBs have no outline extraction here). "
         "Requires PyMuPDF (pip install zotero-mcp-server[pdf]). "
@@ -2433,42 +2435,38 @@ def get_pdf_outline(
     ctx: Context
 ) -> str:
     try:
-        zot = _client.get_zotero_client()
         ctx.info(f"Getting PDF outline for item {item_key}")
-
-        # Find PDF attachment
-        children = zot.children(item_key)
-        pdf_child = None
-        for child in children:
-            if child.get("data", {}).get("contentType") == "application/pdf":
-                pdf_child = child
-                break
-
-        if not pdf_child:
-            return f"No PDF attachment found for item `{item_key}`."
 
         try:
             import fitz
         except ImportError:
             return "Error: PyMuPDF (fitz) is required for PDF outline extraction."
 
-        attachment_key = pdf_child["key"]
-        filename = pdf_child.get("data", {}).get("filename", "document.pdf")
+        from zotero_mcp.tools.read_pdf import _cleanup_path, _get_pdf_path
 
-        # Download PDF (works for both local/WebDAV/web storage)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            zot.dump(attachment_key, filename=filename, path=tmpdir)
-            pdf_path = os.path.join(tmpdir, filename)
-            if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
-                return f"Could not download PDF for attachment `{attachment_key}`."
+        resolved = _get_pdf_path(item_key, ctx)
+        if resolved is None:
+            return f"No PDF attachment found for item `{item_key}`."
+        pdf_path, title, attachment_key = resolved
+        try:
             doc = fitz.open(pdf_path)
             toc = doc.get_toc()
             doc.close()
+        finally:
+            _cleanup_path(pdf_path)
 
         if not toc:
-            return "This PDF does not contain a table of contents/outline."
+            return (
+                f"PDF attachment `{attachment_key}` ({title}) does not contain "
+                "a table of contents/outline."
+            )
 
-        lines = [f"# PDF Outline for item `{item_key}`", ""]
+        lines = [
+            f"# PDF Outline for {title}",
+            f"**Requested Item Key:** `{item_key}`",
+            f"**Selected PDF Attachment:** `{attachment_key}`",
+            "",
+        ]
         for level, title, page in toc:
             indent = "  " * (level - 1)
             lines.append(f"{indent}- {title} (p. {page})")
@@ -2705,14 +2703,38 @@ def _find_matching_uri(rel_list: list, library_id: str, item_key: str) -> str | 
     return None
 
 
+def _restore_relation_items(write_zot, originals: list[dict], ctx: Context) -> bool:
+    """Best-effort rollback for a failed multi-item relation mutation."""
+    restored = True
+    for original in originals:
+        try:
+            candidate = copy.deepcopy(original)
+            _helpers._strip_unwritable_fields(candidate)
+            response = write_zot.update_item(candidate)
+            restored = _helpers._handle_write_response(response, ctx) and restored
+        except Exception as exc:
+            restored = False
+            ctx.warning(
+                f"Could not restore relation state for `{original.get('key', '')}`: {exc}"
+            )
+    return restored
+
+
 @mcp.tool(
     name="zotero_add_item_relation",
-    description="Add a related item relationship to a Zotero item. Creates a bidirectional link between two items."
+    description=(
+        "Create a bidirectional relation between two existing items in the "
+        "active library. Both writes are verified; if either fails, the tool "
+        "attempts to restore both original records and reports whether rollback "
+        "was confirmed. relation_type supports 'dc:relation' (default) or "
+        "'owl:sameAs'. Repeating an existing relation is a no-op."
+    )
 )
+@with_zotero_api_lock
 def add_item_relation(
     item_key: str,
     related_item_key: str,
-    relation_type: str = "dc:relation",
+    relation_type: Literal["dc:relation", "owl:sameAs"] = "dc:relation",
     *,
     ctx: Context
 ) -> str:
@@ -2754,6 +2776,8 @@ def add_item_relation(
 
         data = item.get("data", {})
         related_data = related_item.get("data", {})
+        original_item = copy.deepcopy(item)
+        original_related_item = copy.deepcopy(related_item)
 
         # Get current relations or initialize empty dict
         relations = data.get("relations", {})
@@ -2784,7 +2808,8 @@ def add_item_relation(
         if not _helpers._handle_write_response(resp, ctx):
             return f"Failed to add relation to item '{item_key}'."
 
-        # Also add reverse relation (bidirectional)
+        # Also add reverse relation (bidirectional). Failure of either side
+        # restores both original records so success always means two-way.
         try:
             # Re-fetch to get latest version
             item = write_zot.item(item_key)
@@ -2805,9 +2830,25 @@ def add_item_relation(
                 reverse_relations[relation_type].append(item_uri)
                 related_data["relations"] = reverse_relations
                 _helpers._strip_unwritable_fields(related_item)
-                write_zot.update_item(related_item)
+                reverse_response = write_zot.update_item(related_item)
+                if not _helpers._handle_write_response(reverse_response, ctx):
+                    raise RuntimeError("the reverse Zotero update was rejected")
         except Exception as e:
-            ctx.warn(f"Could not add reverse relation: {e}")
+            restored = _restore_relation_items(
+                write_zot,
+                [original_item, original_related_item],
+                ctx,
+            )
+            if restored:
+                return (
+                    "Error: Could not create the bidirectional relation; both "
+                    f"items were restored to their original state ({e})."
+                )
+            return (
+                "Partial failure: the bidirectional relation could not be "
+                "completed and rollback could not be confirmed. Inspect both "
+                f"`{item_key}` and `{related_item_key}` in Zotero ({e})."
+            )
 
         item_title = data.get("title", "Untitled")
         related_title = related_data.get("title", "Untitled")
@@ -2826,12 +2867,18 @@ def add_item_relation(
 
 @mcp.tool(
     name="zotero_remove_item_relation",
-    description="Remove a related item relationship from a Zotero item."
+    description=(
+        "Remove a relation between two items. remove_bidirectional=True "
+        "(default) verifies both writes and attempts to restore both original "
+        "records if either write fails. Set it false only to remove one side "
+        "deliberately. relation_type supports 'dc:relation' or 'owl:sameAs'."
+    )
 )
+@with_zotero_api_lock
 def remove_item_relation(
     item_key: str,
     related_item_key: str,
-    relation_type: str = "dc:relation",
+    relation_type: Literal["dc:relation", "owl:sameAs"] = "dc:relation",
     remove_bidirectional: bool = True,
     *,
     ctx: Context
@@ -2864,6 +2911,7 @@ def remove_item_relation(
             return f"Error: Item '{item_key}' not found."
 
         data = item.get("data", {})
+        original_item = copy.deepcopy(item)
         relations = data.get("relations", {})
 
         if not isinstance(relations, dict):
@@ -2903,6 +2951,7 @@ def remove_item_relation(
         if remove_bidirectional:
             try:
                 related_item = write_zot.item(related_item_key)
+                original_related_item = copy.deepcopy(related_item)
                 related_data = related_item.get("data", {})
                 reverse_relations = related_data.get("relations", {})
 
@@ -2920,9 +2969,28 @@ def remove_item_relation(
                             reverse_relations[relation_type] = reverse_list
                         related_data["relations"] = reverse_relations
                         _helpers._strip_unwritable_fields(related_item)
-                        write_zot.update_item(related_item)
+                        reverse_response = write_zot.update_item(related_item)
+                        if not _helpers._handle_write_response(
+                            reverse_response, ctx
+                        ):
+                            raise RuntimeError(
+                                "the reverse Zotero update was rejected"
+                            )
             except Exception as e:
-                ctx.warn(f"Could not remove reverse relation: {e}")
+                originals = [original_item]
+                if "original_related_item" in locals():
+                    originals.append(original_related_item)
+                restored = _restore_relation_items(write_zot, originals, ctx)
+                if restored:
+                    return (
+                        "Error: Could not remove the bidirectional relation; "
+                        f"both items were restored to their original state ({e})."
+                    )
+                return (
+                    "Partial failure: bidirectional removal did not complete "
+                    "and rollback could not be confirmed. Inspect both "
+                    f"`{item_key}` and `{related_item_key}` in Zotero ({e})."
+                )
 
         return (
             f"Successfully removed relation:\n\n"

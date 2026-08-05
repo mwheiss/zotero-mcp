@@ -1,12 +1,11 @@
 """Tests for search improvements: normalization, variant generation, fallback cascade."""
 
-import pytest
-from unittest.mock import MagicMock, patch
-from conftest import DummyContext, FakeZotero, skip_on_ci
+from unittest.mock import MagicMock
+
+from conftest import DummyContext, skip_on_ci
 
 from zotero_mcp import utils as _utils
 from zotero_mcp.tools import search as search_module
-
 
 # ---------------------------------------------------------------------------
 # TestNormalization
@@ -200,11 +199,22 @@ class TestFallbackCascade:
 
         ctx = DummyContext()
         result = search_module.search_items(
-            query="Brewer 2011 DMN default mode network", ctx=ctx
+            query="Brewer 2011 DMN default mode network",
+            fallback_mode="relaxed",
+            ctx=ctx,
         )
 
         assert "Simplified Find" in result
         assert "Note:" in result  # fallback note present
+
+    def test_default_does_not_silently_broaden_query(self, monkeypatch):
+        items = [{"key": "X2", "data": {"title": "Broader Match"}}]
+        self._setup(monkeypatch, {"Brewer": items})
+
+        result = search_module.search_items(query="Brewer 2011", ctx=DummyContext())
+
+        assert "No items found" in result
+        assert "Broader Match" not in result
 
     def test_finds_via_author_only(self, monkeypatch):
         items = [{"key": "X3", "data": {"title": "Author Find", "itemType": "journalArticle",
@@ -212,7 +222,9 @@ class TestFallbackCascade:
         self._setup(monkeypatch, {"Brewer": items})
 
         ctx = DummyContext()
-        result = search_module.search_items(query="Brewer 2011", ctx=ctx)
+        result = search_module.search_items(
+            query="Brewer 2011", fallback_mode="relaxed", ctx=ctx
+        )
 
         assert "Author Find" in result
         assert "Note:" in result
@@ -236,7 +248,9 @@ class TestFallbackCascade:
         self._setup(monkeypatch, {"Brewer": items})
 
         ctx = DummyContext()
-        result = search_module.search_items(query="Brewer 2011", ctx=ctx)
+        result = search_module.search_items(
+            query="Brewer 2011", fallback_mode="relaxed", ctx=ctx
+        )
 
         assert "verify" in result.lower()
         assert "title, authors, journal, and year" in result
@@ -359,7 +373,9 @@ class TestCascadeSimplification:
         self._setup(monkeypatch, {"Lynch 2003": items})
         ctx = DummyContext()
         result = search_module.search_items(
-            query="Lynch 2003 dialectical behavior therapy depressed older adults", ctx=ctx
+            query="Lynch 2003 dialectical behavior therapy depressed older adults",
+            fallback_mode="relaxed",
+            ctx=ctx,
         )
         assert "Lynch Paper" in result
 
@@ -369,7 +385,9 @@ class TestCascadeSimplification:
         self._setup(monkeypatch, {"Lynch": items})
         ctx = DummyContext()
         result = search_module.search_items(
-            query="Lynch dialectical behavior therapy", ctx=ctx
+            query="Lynch dialectical behavior therapy",
+            fallback_mode="relaxed",
+            ctx=ctx,
         )
         assert "Lynch No Year" in result
 
@@ -380,7 +398,9 @@ class TestCascadeSimplification:
         # Only Strategy 2 (author only) should fire for 2-word queries
         self._setup(monkeypatch, {"Lynch": items})
         ctx = DummyContext()
-        result = search_module.search_items(query="Lynch 2003", ctx=ctx)
+        result = search_module.search_items(
+            query="Lynch 2003", fallback_mode="relaxed", ctx=ctx
+        )
         assert "Two Words" in result
 
     def test_strategy1_year_first_reordered(self, monkeypatch):
@@ -390,7 +410,7 @@ class TestCascadeSimplification:
         self._setup(monkeypatch, {"Lynch 2003": items})
         ctx = DummyContext()
         result = search_module.search_items(
-            query="2003 Lynch therapy", ctx=ctx
+            query="2003 Lynch therapy", fallback_mode="relaxed", ctx=ctx
         )
         assert "Year First" in result
 
@@ -400,7 +420,7 @@ class TestCascadeSimplification:
         self._setup(monkeypatch, {"Lynch 2003": items})
         ctx = DummyContext()
         result = search_module.search_items(
-            query="Lynch 2003 2005 therapy", ctx=ctx
+            query="Lynch 2003 2005 therapy", fallback_mode="relaxed", ctx=ctx
         )
         assert "Multi Year" in result
 
@@ -429,7 +449,9 @@ class TestVerificationGuidance:
                                          "creators": [], "date": "2020", "tags": []}}]
         self._setup(monkeypatch, {"Brewer": items})
         ctx = DummyContext()
-        result = search_module.search_items(query="Brewer 2011", ctx=ctx)
+        result = search_module.search_items(
+            query="Brewer 2011", fallback_mode="relaxed", ctx=ctx
+        )
         assert "Brewer 2011" in result  # Original query in the note
 
     @skip_on_ci
@@ -466,7 +488,9 @@ class TestVerificationGuidance:
         )
 
         ctx = DummyContext()
-        result = search_module.search_items(query="Nonexistent Paper 2099", ctx=ctx)
+        result = search_module.search_items(
+            query="Nonexistent Paper 2099", fallback_mode="semantic", ctx=ctx
+        )
 
         assert "may NOT be" in result or "semantic" in result.lower()
 
@@ -495,7 +519,9 @@ class TestCascadeTimeout:
 
         ctx = DummyContext()
         result = search_module.search_items(
-            query="Lynch 2003 dialectical behavior therapy", ctx=ctx
+            query="Lynch 2003 dialectical behavior therapy",
+            fallback_mode="relaxed",
+            ctx=ctx,
         )
 
         # Should return "no items found" without trying all strategies
