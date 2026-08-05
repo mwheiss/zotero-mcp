@@ -135,9 +135,17 @@ class ToolContractMiddleware(Middleware):
         if context.message.name in CONNECTOR_TOOLS:
             return result
         text = _result_text(result)
+        meta = copy.deepcopy(result.meta) if result.meta else {}
+        # The underlying string-returning function is marked as a wrapped
+        # FastMCP result. We replace that payload with our envelope, so clients
+        # must validate the envelope itself rather than look for a nonexistent
+        # ``structuredContent.result`` value.
+        fastmcp_meta = meta.setdefault("fastmcp", {})
+        if isinstance(fastmcp_meta, dict):
+            fastmcp_meta["wrap_result"] = False
         return ToolResult(
             content=result.content,
             structured_content=classify_result(text, result.is_error),
-            meta=result.meta,
+            meta=meta,
             is_error=result.is_error,
         )

@@ -60,7 +60,10 @@ def test_call_middleware_preserves_text_and_adds_structured_result():
         context = SimpleNamespace(message=SimpleNamespace(name="zotero_example"))
 
         async def call_next(_context):
-            return ToolResult(content="No matching items found.")
+            return ToolResult(
+                content="No matching items found.",
+                meta={"fastmcp": {"wrap_result": True}},
+            )
 
         return await middleware.on_call_tool(context, call_next)
 
@@ -74,3 +77,4 @@ def test_call_middleware_preserves_text_and_adds_structured_result():
         "warnings": [],
         "errors": [],
     }
+    assert result.meta["fastmcp"]["wrap_result"] is False
