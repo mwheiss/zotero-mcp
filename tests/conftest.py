@@ -11,6 +11,21 @@ skip_on_ci = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def isolated_zotero_api_lock(tmp_path_factory):
+    """Keep cross-process API-lock writes inside pytest's temporary tree."""
+    name = "ZOTERO_MCP_API_LOCK_PATH"
+    previous = os.environ.get(name)
+    os.environ[name] = str(tmp_path_factory.mktemp("zotero-api-lock") / "api.lock")
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+
 class DummyContext:
     """No-op MCP context for unit tests."""
 

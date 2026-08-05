@@ -6,6 +6,8 @@ as an opaque "-32001 Request timed out" on reads too. The lock now acquires with
 a bounded wait and raises ZoteroApiBusyError for waiters instead of hanging.
 """
 
+import multiprocessing
+import os
 import threading
 import time
 
@@ -19,6 +21,32 @@ from zotero_mcp.client import (
     _zotero_api_lock,
     with_zotero_api_lock,
 )
+
+
+def _hold_process_lock(lock_path, ready, release):
+    os.environ["ZOTERO_MCP_API_LOCK_PATH"] = lock_path
+    os.environ["ZOTERO_MCP_LOCK_TIMEOUT"] = "5"
+
+    @with_zotero_api_lock
+    def hold():
+        ready.set()
+        release.wait(timeout=5)
+
+    hold()
+
+
+def _try_process_lock(lock_path, result):
+    os.environ["ZOTERO_MCP_API_LOCK_PATH"] = lock_path
+    os.environ["ZOTERO_MCP_LOCK_TIMEOUT"] = "0.3"
+
+    @with_zotero_api_lock
+    def attempt():
+        return "ran"
+
+    try:
+        result.put(attempt())
+    except ZoteroApiBusyError:
+        result.put("busy")
 
 
 def test_uncontended_call_runs(monkeypatch):
@@ -46,6 +74,70 @@ def test_reentrant_same_thread(monkeypatch):
         return inner()
 
     assert outer() == "inner-ok"
+
+
+def test_reentrant_call_holds_one_file_lock(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZOTERO_MCP_API_LOCK_PATH", str(tmp_path / "api.lock"))
+    acquired = []
+    released = []
+    real_acquire = _client.acquire_file_lock
+    real_release = _client.release_file_lock
+
+    def acquire(*args, **kwargs):
+        acquired.append(1)
+        return real_acquire(*args, **kwargs)
+
+    def release(lock_file):
+        released.append(1)
+        return real_release(lock_file)
+
+    monkeypatch.setattr(_client, "acquire_file_lock", acquire)
+    monkeypatch.setattr(_client, "release_file_lock", release)
+
+    @with_zotero_api_lock
+    def inner():
+        return "inner"
+
+    @with_zotero_api_lock
+    def outer():
+        return inner()
+
+    assert outer() == "inner"
+    assert len(acquired) == 1
+    assert len(released) == 1
+
+
+def test_api_lock_serializes_separate_processes(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    result = context.Queue()
+    lock_path = str(tmp_path / "api.lock")
+    holder = context.Process(
+        target=_hold_process_lock,
+        args=(lock_path, ready, release),
+    )
+    waiter = context.Process(
+        target=_try_process_lock,
+        args=(lock_path, result),
+    )
+
+    holder.start()
+    try:
+        assert ready.wait(timeout=5), "holder process never acquired the API lock"
+        waiter.start()
+        waiter.join(timeout=5)
+        assert not waiter.is_alive()
+        assert result.get(timeout=1) == "busy"
+    finally:
+        release.set()
+        holder.join(timeout=5)
+        if waiter.is_alive():
+            waiter.terminate()
+            waiter.join(timeout=2)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(timeout=2)
 
 
 def test_waiter_fails_fast_when_lock_held(monkeypatch):

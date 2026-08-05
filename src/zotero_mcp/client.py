@@ -6,6 +6,7 @@ import functools
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,7 @@ from dotenv import load_dotenv
 from markitdown import MarkItDown
 from pyzotero import zotero
 
+from zotero_mcp._file_lock import acquire_file_lock, release_file_lock
 from zotero_mcp.utils import format_creators
 from zotero_mcp.webdav import (
     WebDAVNotConfiguredError,
@@ -26,11 +28,12 @@ from zotero_mcp.webdav import (
 load_dotenv()
 
 # Serialize all Zotero API access. The local API (port 23119) is single-threaded;
-# concurrent requests from parallel MCP tool threads queue at the network layer and
-# risk hitting pyzotero's 30s timeout. A process-local lock ensures only one
-# request is in-flight at a time — the rest queue in-process (microseconds) instead
-# of at the API (seconds/timeout). RLock allows nested calls from the same thread.
+# concurrent requests from parallel MCP tool threads or a separate CLI process
+# queue at the network layer and risk hitting pyzotero's 30s timeout. The RLock
+# handles threads and a file lock coordinates processes. Nested calls from the
+# same thread acquire both as one reentrant critical section.
 _zotero_api_lock = threading.RLock()
+_zotero_api_lock_state = threading.local()
 
 # Bound how long a tool will WAIT to acquire the lock before giving up. Without a
 # bound, a single slow/stuck op (e.g. a hung cloud write or PDF upload) holds the
@@ -87,8 +90,15 @@ def _lock_timeout() -> float:
         return _DEFAULT_LOCK_TIMEOUT
 
 
+def _api_lock_path() -> Path:
+    configured = os.getenv("ZOTERO_MCP_API_LOCK_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".config" / "zotero-mcp" / "zotero-api.lock"
+
+
 class ZoteroApiBusyError(RuntimeError):
-    """Raised when the per-process Zotero API lock can't be acquired in time.
+    """Raised when the cross-process Zotero API lock can't be acquired in time.
 
     Signals that another Zotero operation is still in flight (likely slow or
     stuck) — not that this call itself failed. Callers should surface a clear,
@@ -96,23 +106,66 @@ class ZoteroApiBusyError(RuntimeError):
     """
 
 
-def _call_with_zotero_api_lock(func, *args, **kwargs):
-    """Call ``func`` while holding the bounded reentrant API lock."""
-    timeout = _lock_timeout()
+def _busy_error(timeout: float) -> ZoteroApiBusyError:
+    return ZoteroApiBusyError(
+        f"Another Zotero API operation is still in progress and did not "
+        f"release within {timeout:.0f}s. This usually means a previous "
+        f"call is slow or stuck (e.g. a large PDF upload or an "
+        f"unreachable Zotero cloud). Please retry shortly; if it "
+        f"persists, restart the Zotero MCP server."
+    )
+
+
+def _acquire_cross_process_api_lock(
+    *,
+    timeout: float,
+    deadline: float | None,
+):
+    """Acquire the API file lock within the caller's shared timeout budget."""
+    path = _api_lock_path()
     if timeout <= 0:
-        with _zotero_api_lock:
-            return func(*args, **kwargs)
-    acquired = _zotero_api_lock.acquire(timeout=timeout)
+        return acquire_file_lock(path, exclusive=True, blocking=True)
+
+    while True:
+        lock_file = acquire_file_lock(path, exclusive=True, blocking=False)
+        if lock_file is not None:
+            return lock_file
+        remaining = (deadline or time.monotonic()) - time.monotonic()
+        if remaining <= 0:
+            raise _busy_error(timeout)
+        time.sleep(min(0.05, remaining))
+
+
+def _call_with_zotero_api_lock(func, *args, **kwargs):
+    """Call ``func`` while holding the bounded, cross-process API lock."""
+    timeout = _lock_timeout()
+    deadline = time.monotonic() + timeout if timeout > 0 else None
+    if timeout <= 0:
+        _zotero_api_lock.acquire()
+        acquired = True
+    else:
+        acquired = _zotero_api_lock.acquire(timeout=timeout)
     if not acquired:
-        raise ZoteroApiBusyError(
-            f"Another Zotero API operation is still in progress and did not "
-            f"release within {timeout:.0f}s. This usually means a previous "
-            f"call is slow or stuck (e.g. a large PDF upload or an "
-            f"unreachable Zotero cloud). Please retry shortly; if it "
-            f"persists, restart the Zotero MCP server."
-        )
+        raise _busy_error(timeout)
+
+    depth = getattr(_zotero_api_lock_state, "depth", 0)
     try:
-        return func(*args, **kwargs)
+        try:
+            if depth == 0:
+                _zotero_api_lock_state.file = _acquire_cross_process_api_lock(
+                    timeout=timeout,
+                    deadline=deadline,
+                )
+            _zotero_api_lock_state.depth = depth + 1
+            return func(*args, **kwargs)
+        finally:
+            if getattr(_zotero_api_lock_state, "depth", 0) > 0:
+                _zotero_api_lock_state.depth -= 1
+                if _zotero_api_lock_state.depth == 0:
+                    lock_file = getattr(_zotero_api_lock_state, "file", None)
+                    _zotero_api_lock_state.file = None
+                    if lock_file is not None:
+                        release_file_lock(lock_file)
     finally:
         _zotero_api_lock.release()
 

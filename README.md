@@ -392,6 +392,8 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `ZOTERO_API_KEY`: Your Zotero API key (for web API)
 - `ZOTERO_LIBRARY_ID`: Your Zotero library ID (for web API)
 - `ZOTERO_LIBRARY_TYPE`: The type of library (user or group, default: user)
+- `ZOTERO_MCP_LOCK_TIMEOUT`: Maximum seconds to wait for another Zotero API request across threads or processes (default: 45; `0` waits indefinitely)
+- `ZOTERO_MCP_API_LOCK_PATH`: Optional shared API lock-file path when MCP and CLI processes use different home/config directories
 - `ZOTERO_WEBDAV_URL`: Optional WebDAV folder URL for direct attachment downloads in remote mode
 - `ZOTERO_WEBDAV_USERNAME`: Optional WebDAV username
 - `ZOTERO_WEBDAV_PASSWORD`: Optional WebDAV password
