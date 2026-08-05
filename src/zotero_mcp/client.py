@@ -46,10 +46,10 @@ _DEFAULT_LOCK_TIMEOUT = 45.0
 class _SerializedCallProxy:
     """Serialize callable access to a wrapped Zotero/httpx client.
 
-    Tool-level decorators are useful for keeping multi-call workflows ordered,
-    but they are too easy to omit.  Wrapping the clients themselves makes the
-    fundamental guarantee true even for new tools and direct ``client.patch``
-    calls.  Existing decorators remain safe because the lock is reentrant.
+    Wrapping the clients makes the fundamental guarantee true even for new
+    tools and direct ``client.patch`` calls. Locking each request, rather than
+    an entire tool workflow, keeps model calls, file conversion, and external
+    downloads from blocking unrelated Zotero reads for minutes or hours.
     """
 
     __slots__ = ("_wrapped",)
@@ -118,12 +118,12 @@ def _call_with_zotero_api_lock(func, *args, **kwargs):
 
 
 def with_zotero_api_lock(func):
-    """Serialize Zotero API access across concurrent MCP tool threads.
+    """Explicitly serialize a short callable across MCP tool threads.
 
-    Acquires the shared RLock with a bounded wait so a stuck op can't wedge
-    every other tool into an opaque client timeout. The lock is reentrant, so
-    nested decorated calls on the same thread (e.g. add_by_url -> add_by_doi)
-    acquire instantly and are never blocked by this bound.
+    API clients already serialize individual requests through
+    :class:`_SerializedCallProxy`. This decorator remains for callers that need
+    to group a deliberately short critical section; it must not wrap model,
+    conversion, download, or other potentially long-running work.
     """
 
     @functools.wraps(func)

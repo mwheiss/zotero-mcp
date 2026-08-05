@@ -12,7 +12,6 @@ from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context, context_error, context_info, context_warning
-from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
 
 
@@ -81,7 +80,6 @@ def _resolve_paper_identity(
         "Example: zotero_synthesize_annotations(collection_key='MT53KB66')."
     ),
 )
-@with_zotero_api_lock
 def synthesize_annotations(
     collection_key: str | None = None,
     tag: list[str] | str | None = None,
@@ -299,7 +297,6 @@ def _render_entries(rendered) -> list[str]:
         "style='apa', export_format='bib')."
     ),
 )
-@with_zotero_api_lock
 def export_bibliography(
     item_keys: list[str] | str | None = None,
     collection_key: str | None = None,

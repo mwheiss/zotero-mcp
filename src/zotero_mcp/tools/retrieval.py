@@ -12,7 +12,6 @@ from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context, context_error, context_info, context_warning
-from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
 
 
@@ -46,7 +45,6 @@ from zotero_mcp.tools import _helpers
         "format='bibtex')."
     ),
 )
-@with_zotero_api_lock
 def get_item_metadata(
     item_key: str,
     include_abstract: bool = True,
@@ -113,7 +111,6 @@ def get_item_metadata(
         "Example: zotero_get_item_fulltext(item_key='RTKZQI8E')."
     ),
 )
-@with_zotero_api_lock
 def get_item_fulltext(
     item_key: str,
     attachment_key: str | None = None,
@@ -357,7 +354,6 @@ def get_attachment_path(item_key: str, *, ctx: Context) -> str:
         "      - **I. Historiography & Methodology** (Key: XFN79DUT)"
     ),
 )
-@with_zotero_api_lock
 def get_collections(limit: int | str | None = None, include_trashed: bool = False, *, ctx: Context) -> str:
     """
     List all collections in your Zotero library.
@@ -484,7 +480,6 @@ def _is_top_level_item(item: dict) -> bool:
     return _is_standalone_attachment(data)
 
 
-@with_zotero_api_lock
 def _build_attachment_extra(info):
     """Build extra_fields dict from attachment_info for format_item_result."""
     if not info:
@@ -504,7 +499,6 @@ def _build_attachment_extra(info):
     name="zotero_get_collection_items",
     description="Get all items in a specific Zotero collection. Supports detail='keys_only' (minimal), 'summary' (default, no abstracts), or 'full' (with abstracts). Includes PDF/notes indicators. TIP: To find papers on a specific topic, use zotero_semantic_search instead — it's faster and returns only relevant results.",
 )
-@with_zotero_api_lock
 def get_collection_items(
     collection_key: str,
     detail: Literal["keys_only", "summary", "full"] = "summary",
@@ -653,7 +647,6 @@ def get_collection_items(
         "PDF attachment key + any notes."
     ),
 )
-@with_zotero_api_lock
 def get_item_children(item_key: str, *, ctx: Context) -> str:
     """
     Get all child items (attachments, notes) for a specific Zotero item.
@@ -779,7 +772,6 @@ def get_item_children(item_key: str, *, ctx: Context) -> str:
         "item_keys=['RTKZQI8E', '9UZR8GXT'])."
     ),
 )
-@with_zotero_api_lock
 def get_items_children(item_keys: list[str] | str, *, ctx: Context) -> str:
     """
     Get child items for multiple Zotero items in a single call.
@@ -879,7 +871,6 @@ def get_items_children(item_keys: list[str] | str, *, ctx: Context) -> str:
         "  - AI agents"
     ),
 )
-@with_zotero_api_lock
 def get_tags(limit: int | str | None = None, *, ctx: Context) -> str:
     """
     Get all tags used in your Zotero library.
@@ -958,7 +949,6 @@ def get_tags(limit: int | str | None = None, *, ctx: Context) -> str:
         "Example: zotero_list_libraries()."
     ),
 )
-@with_zotero_api_lock
 def list_libraries(*, ctx: Context) -> str:
     """
     List all accessible Zotero libraries.
@@ -1072,7 +1062,6 @@ def list_libraries(*, ctx: Context) -> str:
         "library_id='', library_type='default')."
     ),
 )
-@with_zotero_api_lock
 def switch_library(
     library_id: str,
     library_type: Literal["user", "group", "feed", "default"] = "group",
@@ -1130,7 +1119,6 @@ def switch_library(
         return f"Error switching library: {str(e)}"
 
 
-@with_zotero_api_lock
 def validate_library_switch(library_id: str, library_type: str) -> str | None:
     """Validate a library switch request before applying it.
 
@@ -1185,7 +1173,6 @@ def validate_library_switch(library_id: str, library_type: str) -> str | None:
         "Example: zotero_list_feeds() → all subscribed feeds."
     ),
 )
-@with_zotero_api_lock
 def list_feeds(*, ctx: Context) -> str:
     """
     List all RSS feed subscriptions from the local Zotero database.
@@ -1246,7 +1233,6 @@ def list_feeds(*, ctx: Context) -> str:
         "Example: zotero_get_feed_items(library_id=12, limit=30)."
     ),
 )
-@with_zotero_api_lock
 def get_feed_items(
     library_id: int,
     limit: int = 20,
@@ -1338,7 +1324,6 @@ def get_feed_items(
         "zotero_get_recent(collection_key='MT53KB66', limit=5)."
     ),
 )
-@with_zotero_api_lock
 def get_recent(limit: int | str = 10, collection_key: str | None = None, *, ctx: Context) -> str:
     """
     Get recently added items to your Zotero library.

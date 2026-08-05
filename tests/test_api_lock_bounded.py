@@ -10,6 +10,7 @@ import threading
 import time
 
 import pytest
+from conftest import DummyContext
 
 from zotero_mcp import client as _client
 from zotero_mcp.client import (
@@ -178,6 +179,44 @@ def test_client_proxy_serializes_direct_calls(monkeypatch):
         thread.join(timeout=2)
 
     assert raw.max_active == 1
+
+
+def test_long_semantic_update_does_not_hold_zotero_api_lock(monkeypatch):
+    from zotero_mcp import semantic_search
+    from zotero_mcp.tools.search import update_search_database
+
+    monkeypatch.setenv("ZOTERO_MCP_LOCK_TIMEOUT", "0.1")
+    started = threading.Event()
+    release = threading.Event()
+
+    class Search:
+        def update_database(self, **kwargs):
+            started.set()
+            release.wait(timeout=2)
+            return {"total_items": 0, "processed_items": 0}
+
+    monkeypatch.setattr(
+        semantic_search,
+        "create_semantic_search",
+        lambda *args, **kwargs: Search(),
+    )
+    worker = threading.Thread(
+        target=lambda: update_search_database(ctx=DummyContext())
+    )
+    worker.start()
+    assert started.wait(timeout=1)
+
+    class Client:
+        def item(self, key):
+            return key
+
+    try:
+        assert _SerializedCallProxy(Client()).item("ABCD1234") == "ABCD1234"
+    finally:
+        release.set()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
 
 
 def test_library_overrides_are_session_scoped(monkeypatch):

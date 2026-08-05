@@ -10,7 +10,6 @@ import requests
 from zotero_mcp._context import Context, context_error, context_info, context_warning
 from zotero_mcp._app import mcp
 from zotero_mcp import client as _client
-from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp import utils as _utils
 from zotero_mcp.tools import _helpers
 
@@ -93,7 +92,6 @@ def _get_note_write_client(op_description: str):
         "highlight/note on that paper."
     )
 )
-@with_zotero_api_lock
 def get_annotations(
     item_key: str | None = None,
     use_pdf_extraction: bool = False,
@@ -487,7 +485,6 @@ _get_annotations = get_annotations
         "round-trippable HTML."
     )
 )
-@with_zotero_api_lock
 def get_notes(
     item_key: str | None = None,
     limit: int | str | None = 20,
@@ -586,7 +583,6 @@ def get_notes(
 # Helpers for search_notes
 # ---------------------------------------------------------------------------
 
-@with_zotero_api_lock
 def _batch_resolve_parent_titles(
     zot, parent_keys: set[str], ctx: Context
 ) -> dict[str, str]:
@@ -618,7 +614,6 @@ def _batch_resolve_parent_titles(
     return titles
 
 
-@with_zotero_api_lock
 def _batch_resolve_grandparent_titles(
     zot, parent_keys: set[str], ctx: Context
 ) -> dict[str, str]:
@@ -698,7 +693,6 @@ def _batch_resolve_grandparent_titles(
     return result
 
 
-@with_zotero_api_lock
 def _format_search_results(
     query: str,
     note_results: list[dict],
@@ -776,7 +770,6 @@ def _format_search_results(
         "contains that word."
     )
 )
-@with_zotero_api_lock
 def search_notes(
     query: str,
     limit: int | str | None = 20,
@@ -921,7 +914,6 @@ def search_notes(
         "note_text='<p>Key claim: ...</p>', tags=['to-cite'])."
     )
 )
-@with_zotero_api_lock
 def create_note(
     item_key: str,
     note_title: str,
@@ -1219,7 +1211,6 @@ def delete_note(
         "cite')."
     )
 )
-@with_zotero_api_lock
 def create_annotation(
     attachment_key: str,
     page: int,

@@ -9,7 +9,6 @@ from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils  # noqa: F401  (kept for module-level conventions)
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context, context_error, context_info
-from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
 
 _OPENALEX_BASE = "https://api.openalex.org"
@@ -148,7 +147,6 @@ def _render_related(papers: list[dict], heading: str) -> list[str]:
         "direction='citations', limit=10)."
     ),
 )
-@with_zotero_api_lock
 def find_related_papers(
     identifier: str,
     direction: Literal["references", "citations", "both"] = "both",
@@ -284,7 +282,6 @@ def _item_has_pdf(zot, item: dict) -> bool:
         "limit=100)."
     ),
 )
-@with_zotero_api_lock
 def library_coverage(
     collection_key: str | None = None,
     limit: int | str | None = 200,

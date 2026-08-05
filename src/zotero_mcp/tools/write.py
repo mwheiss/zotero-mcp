@@ -17,7 +17,6 @@ from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context, context_error, context_info, context_warning
-from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
 
 # Accessed as _helpers.X so that monkeypatch/mock on the module attribute works.
@@ -193,7 +192,6 @@ def _handle_existing_item(write_zot, existing, coll_keys, tags, if_exists,
         "mark everything tagged 'to-read' as 'reviewed'."
     )
 )
-@with_zotero_api_lock
 def batch_update_tags(
     query: str = "",
     add_tags: list[str] | str | None = None,
@@ -459,7 +457,6 @@ def _apply_extra_edits(
         "remove_keys=['tex.draft'])."
     )
 )
-@with_zotero_api_lock
 def batch_update_extra(
     item_keys: list[str] | str | None = None,
     set_keys: dict[str, str] | str | None = None,
@@ -601,7 +598,6 @@ def batch_update_extra(
         "Use zotero_search_collections to find collection keys."
     )
 )
-@with_zotero_api_lock
 def create_collection(
     name: str,
     parent_collection: str | None = None,
@@ -712,7 +708,6 @@ def delete_collection(
         'collection with "orals" in its name.'
     )
 )
-@with_zotero_api_lock
 def search_collections(
     query: str,
     include_trashed: bool = False,
@@ -779,7 +774,6 @@ def search_collections(
         "Use zotero_search_items to find item keys and zotero_search_collections to find collection keys."
     )
 )
-@with_zotero_api_lock
 def manage_collections(
     item_keys: list[str] | str,
     add_to: list[str] | str | None = None,
@@ -894,7 +888,6 @@ def manage_collections(
         "collections=['9SU943GB'], tags=['MCP'])."
     )
 )
-@with_zotero_api_lock
 def add_by_doi(
     doi: str,
     collections: list[str] | str | None = None,
@@ -1134,7 +1127,6 @@ def add_by_doi(
         "collections=['9SU943GB'])."
     )
 )
-@with_zotero_api_lock
 def add_by_url(
     url: str,
     collections: list[str] | str | None = None,
@@ -1229,7 +1221,6 @@ def add_by_url(
         return f"Error adding by URL: {e}"
 
 
-@with_zotero_api_lock
 def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto",
                   read_zot=None, if_exists="duplicate",
                   create_missing_collections=False):
@@ -1750,7 +1741,6 @@ _UPDATE_ITEM_API_TO_PARAM = {
         "add_tags=['reviewed'], doi='10.1145/3708319')."
     )
 )
-@with_zotero_api_lock
 def update_item(
     item_key: str,
     title: str | None = None,
@@ -2117,7 +2107,6 @@ def delete_item(
         "Example: zotero_find_duplicates(method='doi', limit=20)."
     )
 )
-@with_zotero_api_lock
 def find_duplicates(
     method: Literal["title", "doi", "both"] = "both",
     collection_key: str | None = None,
@@ -2247,7 +2236,6 @@ def find_duplicates(
         "Example execute: same, plus confirm=True."
     )
 )
-@with_zotero_api_lock
 def merge_duplicates(
     keeper_key: str,
     duplicate_keys: list[str] | str,
@@ -2469,7 +2457,6 @@ def merge_duplicates(
         "Example: zotero_get_pdf_outline(item_key='RTKZQI8E')."
     )
 )
-@with_zotero_api_lock
 def get_pdf_outline(
     item_key: str,
     *,
@@ -2553,7 +2540,6 @@ def get_pdf_outline(
         "collections=['9SU943GB'])."
     )
 )
-@with_zotero_api_lock
 def add_from_file(
     file_path: str,
     title: str | None = None,
@@ -2774,7 +2760,6 @@ def _restore_relation_items(write_zot, originals: list[dict], ctx: Context) -> b
         "'owl:sameAs'. Repeating an existing relation is a no-op."
     )
 )
-@with_zotero_api_lock
 def add_item_relation(
     item_key: str,
     related_item_key: str,
@@ -2918,7 +2903,6 @@ def add_item_relation(
         "deliberately. relation_type supports 'dc:relation' or 'owl:sameAs'."
     )
 )
-@with_zotero_api_lock
 def remove_item_relation(
     item_key: str,
     related_item_key: str,

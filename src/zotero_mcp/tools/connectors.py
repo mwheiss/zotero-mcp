@@ -8,7 +8,6 @@ from pathlib import Path
 from zotero_mcp._context import Context, context_error
 from zotero_mcp._app import mcp
 from zotero_mcp import client as _client
-from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp import utils as _utils
 from zotero_mcp.tools.retrieval import get_item_fulltext
 
@@ -40,7 +39,6 @@ from zotero_mcp.tools.retrieval import get_item_fulltext
         "therapy')."
     )
 )
-@with_zotero_api_lock
 def chatgpt_connector_search(
     query: str,
     *,
@@ -107,7 +105,6 @@ def chatgpt_connector_search(
         "Example (agent-invoked): fetch(id='RTKZQI8E')."
     )
 )
-@with_zotero_api_lock
 def connector_fetch(
     id: str,
     *,

@@ -13,7 +13,6 @@ from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context, context_error, context_info, context_warning
-from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
 
 _search_logger = _logging.getLogger("zotero_mcp.search")
@@ -72,7 +71,6 @@ def _maybe_fire_presearch_sync(search) -> None:
     _threading.Thread(target=_run, daemon=True, name="zmcp-presearch-sync").start()
 
 
-@with_zotero_api_lock
 def _search_with_variants(zot, query: str, qmode: str, limit: int,
                           item_type: str = "-attachment",
                           tag: list[str] | None = None,
@@ -152,7 +150,6 @@ def _search_with_variants(zot, query: str, qmode: str, limit: int,
         "zotero_search_items(query='Brewer 2011', limit=5)."
     )
 )
-@with_zotero_api_lock
 def search_items(
     query: str,
     qmode: Literal["titleCreatorYear", "everything"] = "titleCreatorYear",
@@ -398,7 +395,6 @@ def search_items(
         "Example: zotero_search_by_tag(tag=['to-read'], limit=20)."
     )
 )
-@with_zotero_api_lock
 def search_by_tag(
     tag: list[str] | list[dict] | str,
     item_type: str = "-attachment",
@@ -492,7 +488,6 @@ def search_by_tag(
         "metadata for that single item."
     )
 )
-@with_zotero_api_lock
 def search_by_citation_key(
     citekey: str,
     *,
@@ -567,7 +562,6 @@ def search_by_citation_key(
         "join_mode='all')."
     )
 )
-@with_zotero_api_lock
 def advanced_search(
     conditions: list[dict[str, str]] | str,
     join_mode: Literal["all", "any"] = "all",
@@ -845,7 +839,6 @@ def advanced_search(
         "limit=5)."
     )
 )
-@with_zotero_api_lock
 def semantic_search(
     query: str,
     limit: int = 10,
@@ -1236,7 +1229,6 @@ _MCP_FORCE_REBUILD_CONFIRMATION = "REBUILD ALL ITEMS"
         "zotero_get_search_database_status."
     )
 )
-@with_zotero_api_lock
 def update_search_database(
     force_rebuild: bool = False,
     force_clear: bool = False,
@@ -1384,7 +1376,6 @@ def get_search_database_status(*, ctx: Context) -> str:
     """
     Get semantic search database status.
 
-    Deliberately NOT wrapped in ``@with_zotero_api_lock``: this is a read-only
     ChromaDB query that never touches the Zotero API, and holding the shared
     lock here would make a slow status read block every other tool. The read
     path below also avoids constructing the embedding function, which for the

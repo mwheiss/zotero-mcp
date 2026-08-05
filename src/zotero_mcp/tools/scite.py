@@ -19,7 +19,6 @@ import logging
 
 from zotero_mcp._context import Context, context_error, context_info
 from zotero_mcp import client as _client
-from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp import scite_client as _scite
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
@@ -33,7 +32,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-@with_zotero_api_lock
 def _extract_doi(item: dict) -> str | None:
     """Extract and normalize DOI from a Zotero item."""
     doi = item.get("data", {}).get("DOI", "")
@@ -47,7 +45,6 @@ def _extract_doi(item: dict) -> str | None:
     return None
 
 
-@with_zotero_api_lock
 def _format_tally_line(tally: dict) -> str:
     """Format a tally dict as a compact inline string."""
     s = tally.get("supporting", 0)
@@ -57,7 +54,6 @@ def _format_tally_line(tally: dict) -> str:
     return f"Supporting: {s} | Contrasting: {c} | Mentioning: {m} (total citing: {total})"
 
 
-@with_zotero_api_lock
 def _format_editorial_notices(notices: list[dict]) -> list[str]:
     """Format editorial notices as warning lines."""
     lines = []
@@ -69,7 +65,6 @@ def _format_editorial_notices(notices: list[dict]) -> list[str]:
     return lines
 
 
-@with_zotero_api_lock
 def enrich_items(items: list[dict]) -> dict[str, dict[str, str]]:
     """Batch-enrich a list of Zotero items with Scite data.
 
@@ -143,7 +138,6 @@ def enrich_items(items: list[dict]) -> dict[str, dict[str, str]]:
         "scite_enrich_item(item_key='RTKZQI8E')."
     ),
 )
-@with_zotero_api_lock
 def enrich_item(
     doi: str | None = None,
     item_key: str | None = None,
@@ -241,7 +235,6 @@ def enrich_item(
         "Example: scite_enrich_search(query='Cladder-Micus', limit=5)."
     ),
 )
-@with_zotero_api_lock
 def enrich_search(
     query: str,
     limit: int | str = 10,
@@ -322,7 +315,6 @@ def enrich_search(
         "scite_check_retractions(collection='Orals', limit=500)."
     ),
 )
-@with_zotero_api_lock
 def check_retractions(
     collection: str | None = None,
     tag: str | None = None,
