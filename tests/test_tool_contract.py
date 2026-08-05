@@ -54,6 +54,26 @@ def test_result_classification_distinguishes_empty_blocked_and_partial():
     ] == "partial"
 
 
+def test_result_classification_recognizes_formatted_failures_and_warnings():
+    failures = [
+        "# Database\n\n**Error:** embedding failed",
+        "Input error: invalid item key",
+        "Collections: FAILED to update",
+        "[ERROR] content hash mismatch",
+        "Semantic search error: encoder unavailable",
+    ]
+
+    for failure in failures:
+        outcome = classify_result(failure)
+        assert outcome["ok"] is False
+        assert outcome["status"] == "error"
+        assert outcome["errors"]
+
+    warning = classify_result("[WARN] fulltext unavailable")
+    assert warning["status"] == "success"
+    assert warning["warnings"] == ["[WARN] fulltext unavailable"]
+
+
 def test_call_middleware_preserves_text_and_adds_structured_result():
     async def run():
         middleware = ToolContractMiddleware()
@@ -74,7 +94,28 @@ def test_call_middleware_preserves_text_and_adds_structured_result():
         "ok": True,
         "status": "empty",
         "text": "No matching items found.",
+        "data": None,
         "warnings": [],
         "errors": [],
     }
     assert result.meta["fastmcp"]["wrap_result"] is False
+
+
+def test_call_middleware_preserves_native_data_and_sets_error_bit():
+    async def run():
+        middleware = ToolContractMiddleware()
+        context = SimpleNamespace(message=SimpleNamespace(name="zotero_example"))
+
+        async def call_next(_context):
+            return ToolResult(
+                content="**Error:** write rejected",
+                structured_content={"item_key": "ABCD1234"},
+            )
+
+        return await middleware.on_call_tool(context, call_next)
+
+    result = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured_content["status"] == "error"
+    assert result.structured_content["data"] == {"item_key": "ABCD1234"}

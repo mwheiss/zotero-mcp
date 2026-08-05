@@ -21,6 +21,12 @@ RESULT_SCHEMA = {
             "description": "Machine-readable outcome class.",
         },
         "text": {"type": "string", "description": "The complete human-readable markdown result."},
+        "data": {
+            "description": (
+                "Native machine-readable result data when the tool provides it; "
+                "null for legacy text-only tools."
+            ),
+        },
         "warnings": {
             "type": "array",
             "items": {"type": "string"},
@@ -32,7 +38,7 @@ RESULT_SCHEMA = {
             "description": "Error lines extracted from the result.",
         },
     },
-    "required": ["ok", "status", "text", "warnings", "errors"],
+    "required": ["ok", "status", "text", "data", "warnings", "errors"],
     "additionalProperties": False,
 }
 
@@ -65,25 +71,66 @@ def _result_text(result: ToolResult) -> str:
     return "\n".join(parts)
 
 
-def classify_result(text: str, is_error: bool = False) -> dict[str, Any]:
+def _marker_text(line: str) -> str:
+    """Strip common Markdown decoration before inspecting outcome markers."""
+    value = re.sub(r"^[\s>#*+-]+", "", line).strip()
+    value = value.replace("**", "").replace("__", "").strip()
+    return value
+
+
+def _is_error_marker(line: str) -> bool:
+    marker = _marker_text(line)
+    return bool(
+        re.match(
+            r"^(?:\[(?:error|fail(?:ed|ure)?)\]|"
+            r"(?:(?:input|semantic search)\s+)?error\b|"
+            r"fail(?:ed|ure)?\b)",
+            marker,
+            re.I,
+        )
+        or re.search(r":\s*fail(?:ed|ure)?\b", marker, re.I)
+    )
+
+
+def _is_warning_marker(line: str) -> bool:
+    return bool(
+        re.match(
+            r"^(?:\[warn(?:ing)?\]|warnings?\b|warn:)",
+            _marker_text(line),
+            re.I,
+        )
+    )
+
+
+def classify_result(
+    text: str,
+    is_error: bool = False,
+    data: Any = None,
+) -> dict[str, Any]:
     stripped = text.strip()
     lowered = stripped.lower()
     errors = [
         line.strip()
         for line in stripped.splitlines()
-        if re.match(r"^(?:error|failed)\b", line.strip(), re.I)
+        if _is_error_marker(line)
         or re.search(r"\bpartial failure\b", line, re.I)
     ]
     warnings = [
         line.strip()
         for line in stripped.splitlines()
-        if re.match(r"^(?:warning|warn:)\b", line.strip(), re.I)
+        if _is_warning_marker(line)
     ]
     has_partial_failure = "partial failure" in lowered
-    if is_error or lowered.startswith(("error", "failed")):
-        status = "error"
-    elif has_partial_failure:
+    has_positive_result = bool(
+        re.search(
+            r"\b(?:successfully|created|updated|deleted|reused|restored|attached)\b",
+            lowered,
+        )
+    )
+    if has_partial_failure or (errors and has_positive_result):
         status = "partial"
+    elif is_error or errors:
+        status = "error"
     elif "not started" in lowered or "requires explicit" in lowered:
         status = "blocked"
     elif lowered.startswith("no ") or "\n\nno " in lowered:
@@ -94,9 +141,18 @@ def classify_result(text: str, is_error: bool = False) -> dict[str, Any]:
         "ok": status in {"success", "empty"},
         "status": status,
         "text": text,
+        "data": data,
         "warnings": warnings,
         "errors": errors,
     }
+
+
+def _result_data(result: ToolResult, text: str) -> Any:
+    """Preserve native structured data while dropping FastMCP's string wrapper."""
+    structured = result.structured_content
+    if isinstance(structured, dict) and structured == {"result": text}:
+        return None
+    return copy.deepcopy(structured)
 
 
 class ToolContractMiddleware(Middleware):
@@ -143,9 +199,14 @@ class ToolContractMiddleware(Middleware):
         fastmcp_meta = meta.setdefault("fastmcp", {})
         if isinstance(fastmcp_meta, dict):
             fastmcp_meta["wrap_result"] = False
+        structured = classify_result(
+            text,
+            result.is_error,
+            data=_result_data(result, text),
+        )
         return ToolResult(
             content=result.content,
-            structured_content=classify_result(text, result.is_error),
+            structured_content=structured,
             meta=meta,
-            is_error=result.is_error,
+            is_error=result.is_error or structured["status"] == "error",
         )
