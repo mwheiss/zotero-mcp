@@ -1,9 +1,9 @@
 """Tests for direct WebDAV attachment access."""
 
-import pytest
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from conftest import skip_on_ci
+
 from zotero_mcp import client, webdav
 
 

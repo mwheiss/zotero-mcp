@@ -7,10 +7,10 @@ import uuid
 
 import requests
 
-from zotero_mcp._context import Context, context_error, context_info, context_warning
-from zotero_mcp._app import mcp
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
+from zotero_mcp._app import mcp
+from zotero_mcp._context import Context, context_error, context_info, context_warning
 from zotero_mcp.tools import _helpers
 
 _WEB_API_ENV_VARS = (
@@ -155,8 +155,8 @@ def get_annotations(
                     # Import Better BibTeX dependencies
                     from zotero_mcp.better_bibtex_client import (
                         ZoteroBetterBibTexAPI,
+                        get_color_category,
                         process_annotation,
-                        get_color_category
                     )
 
                     # Initialize Better BibTeX client
@@ -288,7 +288,7 @@ def get_annotations(
             # PDF Extraction fallback
             if use_pdf_extraction and not (better_bibtex_annotations or zotero_api_annotations):
                 try:
-                    from zotero_mcp.pdfannots_helper import extract_annotations_from_pdf, ensure_pdfannots_installed
+                    from zotero_mcp.pdfannots_helper import ensure_pdfannots_installed, extract_annotations_from_pdf
 
                     # Ensure PDF annotation tool is installed
                     if ensure_pdfannots_installed():
@@ -1242,9 +1242,9 @@ def create_annotation(
     """
 
     from zotero_mcp.pdf_utils import (
+        build_annotation_position,
         find_text_position,
         get_page_label,
-        build_annotation_position,
         verify_pdf_attachment,
     )
 
@@ -1311,11 +1311,11 @@ def create_annotation(
             # Verify the file is valid
             if file_type == "pdf":
                 if not verify_pdf_attachment(file_path):
-                    return f"Error: Downloaded file is not a valid PDF"
+                    return "Error: Downloaded file is not a valid PDF"
             else:  # epub
                 from zotero_mcp.epub_utils import verify_epub_attachment
                 if not verify_epub_attachment(file_path):
-                    return f"Error: Downloaded file is not a valid EPUB"
+                    return "Error: Downloaded file is not a valid EPUB"
 
             # Search for the text and get position data
             search_preview = text[:50] + "..." if len(text) > 50 else text
@@ -1332,7 +1332,7 @@ def create_annotation(
                 # Build debug info message
                 debug_lines = [
                     f"Error: {position_data['error']}",
-                    f"",
+                    "",
                     f"Text searched: \"{text[:100]}{'...' if len(text) > 100 else ''}\"",
                 ]
 
@@ -1357,8 +1357,8 @@ def create_annotation(
                     debug_lines.append("")
                     debug_lines.append("TIP: Copy the exact text from the PDF instead of paraphrasing.")
                 elif best_score > 0:
-                    debug_lines.append(f"")
-                    debug_lines.append(f"Debug info:")
+                    debug_lines.append("")
+                    debug_lines.append("Debug info:")
                     debug_lines.append(f"  Best match score: {best_score:.2f} (too low for suggestion)")
                     if best_match:
                         preview = best_match[:80]
@@ -1426,7 +1426,7 @@ def create_annotation(
             if page_label:
                 annotation_data["annotationPageLabel"] = page_label
 
-            context_info(ctx, f"Creating annotation via Web API...")
+            context_info(ctx, "Creating annotation via Web API...")
 
             # Create the annotation using web client
             result = web_client.create_items([annotation_data])
@@ -1438,8 +1438,8 @@ def create_annotation(
                     annotation_key = list(successful.values())[0]
                     location_label = "Page" if file_type == "pdf" else "Chapter"
                     response = [
-                        f"Successfully created highlight annotation",
-                        f"",
+                        "Successfully created highlight annotation",
+                        "",
                         f"**Annotation Key:** {annotation_key}",
                         f"**{location_label}:** {page_label}",
                     ]

@@ -1,10 +1,9 @@
 """Tests for Features 7-8: find_duplicates and merge_duplicates."""
 
-import pytest
 
-from conftest import DummyContext, FakeZotero, _FakeResponse
+from conftest import FakeZotero, _FakeResponse
+
 from zotero_mcp import server
-
 
 # ---------------------------------------------------------------------------
 # Helpers: item factory and extended FakeZotero for duplicates
@@ -294,7 +293,7 @@ class TestMergeDuplicatesConfirm:
         """All unique tags from duplicates are consolidated into keeper."""
         fake = self._setup_merge(monkeypatch)
 
-        result = server.merge_duplicates(
+        server.merge_duplicates(
             keeper_key="KEEP", duplicate_keys=["DUP1", "DUP2"], confirm=True, ctx=dummy_ctx
         )
 
@@ -377,7 +376,6 @@ class TestMergeDuplicatesConfirm:
         )
 
         # Keeper should NOT be trashed — check the direct PATCH calls
-        import json
         trashed_urls = [c["url"] for c in fake.client.patch_calls]
         assert not any("KEEP" in url for url in trashed_urls)
         # DUP1 should be trashed
@@ -499,7 +497,7 @@ class TestMergeDuplicatesConfirm:
         monkeypatch.setattr("zotero_mcp.tools._helpers._get_write_client", lambda ctx: (fake, fake))
 
         # Pass a single string instead of a list
-        result = server.merge_duplicates(
+        server.merge_duplicates(
             keeper_key="KEEP", duplicate_keys="DUP1", confirm=True, ctx=dummy_ctx
         )
 

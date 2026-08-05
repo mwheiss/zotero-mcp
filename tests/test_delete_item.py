@@ -6,10 +6,10 @@ delete_item tool that wraps that mechanism for books, journalArticles,
 webpages, attachments, and so on.
 """
 
-import pytest
+
+from conftest import DummyContext
 
 from zotero_mcp import server
-from conftest import DummyContext
 
 
 class _FakePatchResponse:

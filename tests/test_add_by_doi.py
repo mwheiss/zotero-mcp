@@ -1,11 +1,11 @@
 """Tests for Feature 4: Add by DOI (zotero_add_by_doi)."""
 
-import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-from zotero_mcp import server
+import pytest
 from conftest import DummyContext, FakeZotero
 
+from zotero_mcp import server
 
 # ---------------------------------------------------------------------------
 # Sample CrossRef response data
@@ -169,7 +169,7 @@ class TestAddByDoiHappyPath:
             "requests.get", lambda *a, **kw: _make_crossref_response()
         )
 
-        result = server.add_by_doi(
+        server.add_by_doi(
             doi="10.1234/test.2024.001", ctx=dummy_ctx
         )
 
@@ -532,7 +532,7 @@ class TestTagsAndCollections:
             "requests.get", lambda *a, **kw: _make_crossref_response()
         )
 
-        result = server.add_by_doi(
+        server.add_by_doi(
             doi="10.1234/test.2024.001", ctx=dummy_ctx
         )
         assert len(fake_zot.created) == 1

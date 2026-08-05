@@ -5,12 +5,11 @@ import os
 import uuid
 from pathlib import Path
 
-from zotero_mcp._context import Context, context_error
-from zotero_mcp._app import mcp
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
+from zotero_mcp._app import mcp
+from zotero_mcp._context import Context, context_error
 from zotero_mcp.tools.retrieval import get_item_fulltext
-
 
 # These are required for ChatGPT custom MCP servers via web "connectors"
 # specific tools required are "search" and "fetch"

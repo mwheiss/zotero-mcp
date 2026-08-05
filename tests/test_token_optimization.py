@@ -1,12 +1,11 @@
 """Tests for token usage optimization fixes (A through F)."""
 
-import pytest
-from typing import Literal
 
-from conftest import DummyContext, FakeZotero, _FakeResponse
+import pytest
+from conftest import DummyContext, FakeZotero
+
 from zotero_mcp import server
 from zotero_mcp.tools import _helpers
-
 
 # ---------------------------------------------------------------------------
 # Helpers: collection items fixture with children
@@ -165,7 +164,7 @@ class TestAttachmentSummary:
 
         # P1 has a PDF attachment
         lines = result.split("\n")
-        p1_line = [l for l in lines if "P1" in l][0]
+        p1_line = [line for line in lines if "P1" in line][0]
         assert "PDF" in p1_line
 
     def test_notes_indicator(self, monkeypatch, coll_zot, dummy_ctx):
@@ -176,7 +175,7 @@ class TestAttachmentSummary:
         result = get_collection_items(collection_key="COL1", detail="keys_only", ctx=dummy_ctx)
 
         lines = result.split("\n")
-        p1_line = [l for l in lines if "P1" in l][0]
+        p1_line = [line for line in lines if "P1" in line][0]
         assert "Notes" in p1_line
 
     def test_attachment_info_in_summary(self, monkeypatch, coll_zot, dummy_ctx):

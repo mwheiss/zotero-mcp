@@ -138,7 +138,7 @@ def _build_prop_xml(md5_hex: str, mtime_ms: int) -> bytes:
         f"<mtime>{int(mtime_ms)}</mtime>"
         f"<hash>{md5_hex}</hash>"
         "</properties>"
-    ).encode("utf-8")
+    ).encode()
 
 
 def upload_attachment_to_webdav(

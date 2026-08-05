@@ -1,10 +1,9 @@
 """Tests for Feature 6: update_item (zotero_update_item)."""
 
-import pytest
 
-from zotero_mcp import server
 from conftest import DummyContext, FakeZotero, _FakeResponse
 
+from zotero_mcp import server
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -216,7 +215,7 @@ class TestUpdateMultipleFields:
         monkeypatch.setattr("zotero_mcp.tools._helpers._get_write_client",
                             lambda ctx: (fake, fake))
 
-        result = server.update_item(
+        server.update_item(
             item_key="ABCD1234",
             title="Brand New Title",
             date="2025-06-15",
@@ -955,7 +954,7 @@ class TestUpdateItemNewFields:
         assert fake.update_calls[0]["data"]["accessDate"] == "2026-04-21"
         assert "2026-04-21" in result
 
-    def test_update_place_on_book(self, monkeypatch):
+    def test_update_place_on_book_round_trip(self, monkeypatch):
         """place should be writable on book items (issue #238 round-trip)."""
         item = _make_book_item()
         fake = FakeZoteroForUpdate(items=[item])

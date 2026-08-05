@@ -5,10 +5,9 @@ Open Library → Google Books lookup cascade, and the resulting Zotero book
 item shape.
 """
 
-import json
 
-import pytest
 import requests
+from conftest import DummyContext, FakeZotero
 
 from zotero_mcp import server
 from zotero_mcp.tools import write as _write
@@ -17,8 +16,6 @@ from zotero_mcp.tools._helpers import (
     _isbn13_checksum_valid,
     _normalize_isbn,
 )
-from conftest import DummyContext, FakeZotero
-
 
 # ---------------------------------------------------------------------------
 # ISBN normalization

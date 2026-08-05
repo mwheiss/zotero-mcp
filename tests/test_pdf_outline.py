@@ -3,11 +3,7 @@
 import sys
 import types
 
-import pytest
-
-from conftest import DummyContext, FakeZotero
 from zotero_mcp import server
-
 
 # ---------------------------------------------------------------------------
 # Helpers: fake fitz module and document

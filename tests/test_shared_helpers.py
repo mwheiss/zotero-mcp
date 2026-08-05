@@ -1,12 +1,11 @@
 """Tests for shared helper functions in server.py and utils.py."""
 
+
 import pytest
-from unittest.mock import patch, MagicMock
+from conftest import DummyContext, FakeZotero
 
 from zotero_mcp import server
 from zotero_mcp.utils import clean_html
-from conftest import DummyContext, FakeZotero
-
 
 # ---------------------------------------------------------------------------
 # _normalize_str_list_input

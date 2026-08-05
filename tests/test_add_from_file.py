@@ -2,12 +2,11 @@
 
 import sys
 import types
-import pytest
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import MagicMock
+
+from conftest import FakeZotero
 
 from zotero_mcp import server
-from conftest import DummyContext, FakeZotero, _FakeResponse
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -124,7 +123,7 @@ class TestHappyPathNoDoi:
         fake_doc = FakeFitzDocument(metadata={"subject": "", "keywords": ""}, first_page_text="No doi here.")
         _patch_fitz(monkeypatch, fake_doc)
 
-        result = server.add_from_file(
+        server.add_from_file(
             file_path="/Users/test/Documents/paper.pdf",
             title="My Paper",
             item_type="document",
@@ -153,7 +152,7 @@ class TestHappyPathNoDoi:
         fake_doc = FakeFitzDocument(metadata={}, first_page_text="Some text without DOI.")
         _patch_fitz(monkeypatch, fake_doc)
 
-        result = server.add_from_file(
+        server.add_from_file(
             file_path="/Users/test/Documents/report.pdf",
             title=None,
             item_type="document",
@@ -200,7 +199,7 @@ class TestDoiFromMetadata:
 
         monkeypatch.setattr("zotero_mcp.tools.write.add_by_doi", mock_add_by_doi)
 
-        result = server.add_from_file(
+        server.add_from_file(
             file_path="/Users/test/Documents/paper.pdf",
             title=None,
             item_type="document",

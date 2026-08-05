@@ -2,13 +2,13 @@
 Utility for downloading and installing the pdfannots2json tool.
 """
 
+import hashlib
 import os
 import platform
-import tempfile
 import tarfile
-import zipfile
-import hashlib
+import tempfile
 import urllib.request
+import zipfile
 
 # Constants
 CURRENT_VERSION = "1.0.15"

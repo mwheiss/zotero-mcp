@@ -5,7 +5,7 @@ This module provides intelligent updating that detects the original installation
 method and preserves all user configurations.
 """
 
-import json
+import logging
 import os
 import shutil
 import subprocess
@@ -13,7 +13,6 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
-import logging
 
 try:
     import requests
@@ -213,7 +212,7 @@ def backup_configurations() -> Path:
         try:
             backup_semantic_path = backup_dir / "semantic_config.json"
             shutil.copy2(semantic_config_path, backup_semantic_path)
-            print(f"Backed up semantic search config")
+            print("Backed up semantic search config")
         except Exception as e:
             logger.warning(f"Could not backup semantic search config: {e}")
 
@@ -223,7 +222,7 @@ def backup_configurations() -> Path:
         try:
             backup_chroma_path = backup_dir / "chroma_db"
             shutil.copytree(chroma_db_path, backup_chroma_path)
-            print(f"Backed up ChromaDB database")
+            print("Backed up ChromaDB database")
         except Exception as e:
             logger.warning(f"Could not backup ChromaDB database: {e}")
 
@@ -264,7 +263,7 @@ def restore_configurations(backup_dir: Path) -> bool:
             semantic_config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
             semantic_config_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(semantic_backup, semantic_config_path)
-            print(f"Restored semantic search config")
+            print("Restored semantic search config")
         except Exception as e:
             logger.error(f"Could not restore semantic search config: {e}")
             success = False
@@ -277,7 +276,7 @@ def restore_configurations(backup_dir: Path) -> bool:
             if chroma_db_path.exists():
                 shutil.rmtree(chroma_db_path)
             shutil.copytree(chroma_backup, chroma_db_path)
-            print(f"Restored ChromaDB database")
+            print("Restored ChromaDB database")
         except Exception as e:
             logger.error(f"Could not restore ChromaDB database: {e}")
             success = False
@@ -373,7 +372,6 @@ def verify_installation() -> tuple[bool, str]:
     """
     try:
         # Try to import the module
-        import zotero_mcp
 
         # Try to get version
         from zotero_mcp._version import __version__

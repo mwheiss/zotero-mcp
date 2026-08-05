@@ -390,7 +390,7 @@ class TestManageCollections:
         """add_to passed as a JSON string should be normalized."""
         _patch_web_only(monkeypatch, fake_zot)
 
-        result = server.manage_collections(
+        server.manage_collections(
             item_keys=["ITEM0001"],
             add_to='["ABC00002", "ABC00003"]',
             ctx=ctx,
@@ -402,7 +402,7 @@ class TestManageCollections:
         """remove_from passed as a JSON string should be normalized."""
         _patch_web_only(monkeypatch, fake_zot)
 
-        result = server.manage_collections(
+        server.manage_collections(
             item_keys=["ITEM0001"],
             remove_from='["ABC00001"]',
             ctx=ctx,
@@ -414,7 +414,7 @@ class TestManageCollections:
         """A single item_key string (not a list) should be normalized to a list."""
         _patch_web_only(monkeypatch, fake_zot)
 
-        result = server.manage_collections(
+        server.manage_collections(
             item_keys="ITEM0001",
             add_to=["ABC00002"],
             ctx=ctx,
@@ -441,7 +441,7 @@ class TestManageCollections:
 
         _patch_hybrid(monkeypatch, read_zot, write_zot)
 
-        result = server.manage_collections(
+        server.manage_collections(
             item_keys=["ITEM0001"],
             add_to=["COL00001"],
             ctx=ctx,

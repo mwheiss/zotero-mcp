@@ -1,11 +1,11 @@
 """Tests for Feature 5: Add by URL (zotero_add_by_url)."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
+from conftest import FakeZotero
 
 from zotero_mcp import server
-from conftest import DummyContext, FakeZotero
-
 
 # ---------------------------------------------------------------------------
 # Sample arXiv Atom XML response
@@ -115,10 +115,9 @@ class TestDoiUrlRouting:
 
     def test_doi_org_url_delegates(self, dummy_ctx, patch_write_client):
         """https://doi.org/10.xxx should be routed through DOI handling."""
-        fake_zot = patch_write_client
         with patch("zotero_mcp.tools.write.add_by_doi") as mock_doi:
             mock_doi.return_value = "Added via DOI: 10.1234/test.2024"
-            result = server.add_by_url(
+            server.add_by_url(
                 url="https://doi.org/10.1234/test.2024",
                 ctx=dummy_ctx,
             )
@@ -131,7 +130,7 @@ class TestDoiUrlRouting:
         """http://dx.doi.org/10.xxx should also route to DOI logic."""
         with patch("zotero_mcp.tools.write.add_by_doi") as mock_doi:
             mock_doi.return_value = "Added via DOI"
-            result = server.add_by_url(
+            server.add_by_url(
                 url="http://dx.doi.org/10.1038/nature12373",
                 ctx=dummy_ctx,
             )
@@ -151,7 +150,7 @@ class TestArxivUrl:
         mock_resp = _make_arxiv_response(ARXIV_ATOM_XML)
 
         with patch("zotero_mcp.tools.write.requests.get", return_value=mock_resp) as mock_get:
-            result = server.add_by_url(
+            server.add_by_url(
                 url="https://arxiv.org/abs/2401.00001",
                 ctx=dummy_ctx,
             )
@@ -173,7 +172,7 @@ class TestArxivUrl:
         mock_resp = _make_arxiv_response(ARXIV_ATOM_XML)
 
         with patch("zotero_mcp.tools.write.requests.get", return_value=mock_resp) as mock_get:
-            result = server.add_by_url(
+            server.add_by_url(
                 url="https://arxiv.org/pdf/2401.00001.pdf",
                 ctx=dummy_ctx,
             )
@@ -188,7 +187,7 @@ class TestArxivUrl:
         mock_resp = _make_arxiv_response(ARXIV_OLD_FORMAT_XML)
 
         with patch("zotero_mcp.tools.write.requests.get", return_value=mock_resp) as mock_get:
-            result = server.add_by_url(
+            server.add_by_url(
                 url="https://arxiv.org/abs/hep-ph/9901234",
                 ctx=dummy_ctx,
             )
@@ -206,7 +205,7 @@ class TestArxivUrl:
         mock_resp = _make_arxiv_response(ARXIV_ATOM_XML)
 
         with patch("zotero_mcp.tools.write.requests.get", return_value=mock_resp):
-            result = server.add_by_url(
+            server.add_by_url(
                 url="arXiv:2401.00001",
                 ctx=dummy_ctx,
             )
@@ -276,9 +275,9 @@ class TestGenericUrl:
         """A plain URL creates a webpage item."""
         fake_zot = patch_write_client
 
-        with patch("zotero_mcp.tools.write.requests.get") as mock_get:
+        with patch("zotero_mcp.tools.write.requests.get"):
             # Don't let it try to actually fetch for arXiv
-            result = server.add_by_url(
+            server.add_by_url(
                 url="https://example.com/interesting-article",
                 ctx=dummy_ctx,
             )
@@ -459,7 +458,7 @@ class TestArxivXmlNamespace:
         mock_resp = _make_arxiv_response(ARXIV_ATOM_XML)
 
         with patch("zotero_mcp.tools.write.requests.get", return_value=mock_resp):
-            result = server.add_by_url(
+            server.add_by_url(
                 url="https://arxiv.org/abs/2401.00001",
                 ctx=dummy_ctx,
             )
@@ -467,7 +466,7 @@ class TestArxivXmlNamespace:
         # The category info (cs.CL) should appear somewhere in the result
         # or in the item's extra field — exact location depends on implementation
         item = fake_zot.created[0]
-        item_str = str(item)
+        str(item)
         # At minimum the item should have been created successfully
         assert item["itemType"] == "preprint"
 
@@ -642,7 +641,7 @@ class TestTagsAndCollections:
         """Tags should also be applied when creating a generic webpage item."""
         fake_zot = patch_write_client
 
-        result = server.add_by_url(
+        server.add_by_url(
             url="https://example.com/article",
             tags=["reference"],
             ctx=dummy_ctx,

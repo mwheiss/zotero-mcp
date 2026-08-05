@@ -3,15 +3,12 @@ merge attachment dedup, linked-URL removal, and no-PDF messaging."""
 
 from unittest.mock import MagicMock, patch
 
-import pytest
+from conftest import DummyContext
 
-from conftest import DummyContext, FakeZotero
 from zotero_mcp.tools import _helpers
 from zotero_mcp.tools.annotations import (
     _batch_resolve_grandparent_titles,
-    _batch_resolve_parent_titles,
 )
-
 
 # -------------------------------------------------------------------------
 # Fix 1 — Pagination helper
@@ -284,7 +281,7 @@ class TestMergeAttachmentDedup:
 
         from zotero_mcp.tools.write import merge_duplicates
 
-        result = merge_duplicates("KEEPER", ["DUP1"], confirm=True, ctx=dummy_ctx)
+        merge_duplicates("KEEPER", ["DUP1"], confirm=True, ctx=dummy_ctx)
 
         # The different attachment SHOULD have been re-parented
         reparent_calls = [

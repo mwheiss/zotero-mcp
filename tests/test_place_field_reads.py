@@ -9,11 +9,10 @@ workflows could not determine whether users had populated place.
 import json
 
 import pytest
+from conftest import DummyContext
 
 from zotero_mcp.client import format_item_metadata, generate_bibtex
 from zotero_mcp.tools import connectors as _conn
-
-from conftest import DummyContext
 
 
 def _book(**fields):

@@ -131,7 +131,6 @@ def test_search_notes_note_results_survive_annotation_crash(monkeypatch):
         "ITEM0001": {"data": {"title": "Mindfulness Paper"}},
     }
 
-    call_count = [0]
 
     class CrashingAnnotationZot(FakeZoteroForNotes):
         def items(self, **kwargs):

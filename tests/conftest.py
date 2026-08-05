@@ -1,6 +1,7 @@
 """Shared test fixtures for Zotero MCP tests."""
 
 import os
+
 import pytest
 
 # Marker for tests that use tmp_path and fail on GitHub Actions

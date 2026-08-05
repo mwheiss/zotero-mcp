@@ -2,8 +2,8 @@
 Helper functions for PDF annotation extraction using pdfannots2json.
 """
 
-import os
 import json
+import os
 import platform
 import subprocess
 import tempfile
