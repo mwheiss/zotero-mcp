@@ -316,6 +316,13 @@ def search_items(
                                     zot_item = sr.get("zotero_item", {})
                                     key = sr.get("item_key", zot_item.get("key", ""))
                                     item_data = zot_item.get("data", {})
+                                    result_item_type = item_data.get("itemType", "")
+                                    if item_type:
+                                        if item_type.startswith("-"):
+                                            if result_item_type == item_type[1:]:
+                                                continue
+                                        elif result_item_type != item_type:
+                                            continue
                                     item_tags = {
                                         value.get("tag", "")
                                         for value in item_data.get("tags", [])
@@ -1113,7 +1120,7 @@ def get_semantic_context(
         if not isinstance(target_metadata, dict):
             return (
                 f"Error: indexed semantic chunk `{chunk_id}` has inconsistent "
-                "provenance. Run zotero-cli db-health before using it."
+                "provenance. Call zotero_get_search_database_health before using it."
             )
         if (
             target_metadata.get("parent_item_key", item_key) != item_key
@@ -1121,7 +1128,7 @@ def get_semantic_context(
         ):
             return (
                 f"Error: indexed semantic chunk `{chunk_id}` has inconsistent "
-                "provenance. Run zotero-cli db-health before using it."
+                "provenance. Call zotero_get_search_database_health before using it."
             )
 
         target_hash = hashlib.sha256(target_document.encode("utf-8")).hexdigest()
@@ -1136,7 +1143,7 @@ def get_semantic_context(
         if isinstance(n_chunks, int) and not 0 <= chunk_index < n_chunks:
             return (
                 f"Error: indexed semantic chunk `{chunk_id}` has inconsistent "
-                "provenance. Run zotero-cli db-health before using it."
+                "provenance. Call zotero_get_search_database_health before using it."
             )
         title = target_metadata.get("title") or item_key
         output = [
@@ -1360,7 +1367,8 @@ def update_search_database(
     description=(
         "Report the active library's semantic database readiness and stats: "
         "distinct item count, vector-record/passage count, index layout, last "
-        "update time, embedding provider/model, and whether "
+        "successful update time, indexed-fulltext/content-contract state, "
+        "active update lock, embedding provider/model, and whether "
         "the [semantic] optional dependency is installed. "
         "Use this to decide whether zotero_semantic_search will return "
         "useful results, or whether the user should run "
@@ -1395,8 +1403,13 @@ def get_search_database_status(*, ctx: Context) -> str:
         # semantic-search modules so they share the [semantic] extra's import
         # guard, but neither loads an embedding model or a Zotero client.
         try:
+            from zotero_mcp._file_lock import acquire_file_lock, release_file_lock
             from zotero_mcp.chroma_client import read_collection_status
-            from zotero_mcp.semantic_search import load_update_config, should_update
+            from zotero_mcp.semantic_search import (
+                load_update_config,
+                read_lock_holder,
+                should_update,
+            )
         except ImportError:
             return (
                 "Semantic search is not available. Install the required packages with:\n"
@@ -1414,18 +1427,40 @@ def get_search_database_status(*, ctx: Context) -> str:
             str(config_path), scope_identity=identity
         )
         update_config = load_update_config(str(config_path))
+        library_state = {}
+        semantic_config = {}
         try:
             with open(config_path, encoding="utf-8") as config_file:
-                library_state = (
-                    json.load(config_file)
-                    .get("semantic_search", {})
-                    .get("library_states", {})
-                    .get(identity, {})
+                semantic_config = json.load(config_file).get(
+                    "semantic_search", {}
+                )
+                library_state = semantic_config.get("library_states", {}).get(
+                    identity, {}
                 )
             if library_state.get("last_update"):
                 update_config["last_update"] = library_state["last_update"]
         except Exception:
             pass
+        base_collection = semantic_config.get("collection_name", "zotero_library")
+        uses_legacy_state = collection_info.get("name") == base_collection
+
+        def scoped_state(name: str):
+            if name in library_state:
+                return library_state[name]
+            return semantic_config.get(name) if uses_legacy_state else None
+
+        lock_path = config_path.parent / "update.lock"
+        lock_file = acquire_file_lock(
+            lock_path,
+            exclusive=False,
+            blocking=False,
+        )
+        update_active = lock_file is None
+        if lock_file is not None:
+            release_file_lock(lock_file)
+        holder_pid, holder_alive = (
+            read_lock_holder(lock_path) if update_active else (None, False)
+        )
 
         # Format results
         output = ["# Semantic Search Database Status", ""]
@@ -1439,6 +1474,10 @@ def get_search_database_status(*, ctx: Context) -> str:
         )
         output.append(f"**Passage Records:** {collection_info.get('chunk_count', 0)}")
         output.append(f"**Index Layout:** {collection_info.get('layout', 'unknown')}")
+        output.append(
+            f"**Collection Owner:** "
+            f"{collection_info.get('library_identity') or identity}"
+        )
         output.append(f"**Embedding Model:** {collection_info.get('embedding_model', 'Unknown')}")
         output.append(f"**Database Path:** {collection_info.get('persist_directory', 'Unknown')}")
 
@@ -1452,7 +1491,31 @@ def get_search_database_status(*, ctx: Context) -> str:
         output.append("## Update Configuration")
         output.append(f"**Auto Update:** {update_config.get('auto_update', False)}")
         output.append(f"**Frequency:** {update_config.get('update_frequency', 'manual')}")
-        output.append(f"**Last Update:** {update_config.get('last_update', 'Never')}")
+        output.append(
+            f"**Last Successful Refresh:** "
+            f"{update_config.get('last_update', 'Never')}"
+        )
+        indexed_fulltext = scoped_state("indexed_fulltext")
+        output.append(
+            "**Indexed Full Text:** "
+            + (
+                "yes"
+                if indexed_fulltext is True
+                else "no"
+                if indexed_fulltext is False
+                else "unknown"
+            )
+        )
+        output.append(
+            f"**Content Contract:** "
+            f"{scoped_state('indexed_content_signature') or 'unknown'}"
+        )
+        output.append(f"**Update Active:** {'yes' if update_active else 'no'}")
+        if update_active and holder_pid is not None:
+            output.append(
+                f"**Update Holder:** PID {holder_pid} "
+                f"({'alive' if holder_alive else 'unknown'})"
+            )
         output.append(f"**Should Update Now:** {should_update(update_config)}")
 
         frequency = update_config.get('update_frequency', 'manual')

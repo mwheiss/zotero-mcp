@@ -494,6 +494,71 @@ class TestVerificationGuidance:
 
         assert "may NOT be" in result or "semantic" in result.lower()
 
+    @skip_on_ci
+    def test_semantic_fallback_preserves_negative_item_type(
+        self, monkeypatch, tmp_path
+    ):
+        def fake_search_with_variants(*args, **kwargs):
+            return []
+
+        monkeypatch.setattr(
+            search_module,
+            "_search_with_variants",
+            fake_search_with_variants,
+        )
+        monkeypatch.setattr(
+            search_module._client,
+            "get_zotero_client",
+            lambda: MagicMock(),
+        )
+        fake_sem = MagicMock()
+        fake_sem.search.return_value = {
+            "results": [
+                {
+                    "item_key": "BOOK0001",
+                    "zotero_item": {
+                        "key": "BOOK0001",
+                        "data": {
+                            "title": "Excluded Book",
+                            "itemType": "book",
+                            "creators": [],
+                            "tags": [],
+                        },
+                    },
+                },
+                {
+                    "item_key": "PAPER001",
+                    "zotero_item": {
+                        "key": "PAPER001",
+                        "data": {
+                            "title": "Included Paper",
+                            "itemType": "journalArticle",
+                            "creators": [],
+                            "tags": [],
+                        },
+                    },
+                },
+            ]
+        }
+        config_dir = tmp_path / ".config" / "zotero-mcp"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text("{}")
+        monkeypatch.setattr(search_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "zotero_mcp.semantic_search.create_semantic_search",
+            lambda *args, **kwargs: fake_sem,
+        )
+
+        result = search_module.search_items(
+            query="topic",
+            item_type="-book",
+            fallback_mode="semantic",
+            ctx=DummyContext(),
+        )
+
+        assert "Included Paper" in result
+        assert "Excluded Book" not in result
+
 
 # ---------------------------------------------------------------------------
 # TestCascadeTimeout (P5 fix)

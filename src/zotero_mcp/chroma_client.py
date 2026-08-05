@@ -1890,11 +1890,6 @@ def read_collection_status(
 
     if persist_directory is None:
         persist_directory = str(Path.home() / ".config" / "zotero-mcp" / "chroma_db")
-    collection_name = resolve_scoped_collection_name(
-        collection_name or "zotero_library",
-        persist_directory=persist_directory,
-        scope_identity=scope_identity,
-    )
     base = {
         "name": collection_name,
         "embedding_model": embedding_model,
@@ -1902,6 +1897,12 @@ def read_collection_status(
     }
 
     try:
+        collection_name = resolve_scoped_collection_name(
+            collection_name or "zotero_library",
+            persist_directory=persist_directory,
+            scope_identity=scope_identity,
+        )
+        base["name"] = collection_name
         with index_lifecycle_lock(persist_directory, exclusive=False):
             with suppress_stdout():
                 client = chromadb.PersistentClient(

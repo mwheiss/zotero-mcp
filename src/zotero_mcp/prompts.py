@@ -32,7 +32,7 @@ def literature_review(topic: str, depth: str = "standard") -> str:
         "relevant papers already in the library. Note each paper's key and the "
         "matched passage and Chunk ID.",
         "2. For the strongest result in each theme, call "
-        "`zotero_get_semantic_context(chunk_id=<Chunk ID>, content_hash=<Chunk Hash>)` "
+        "`zotero_get_semantic_context(chunk_id=<Chunk ID>, expected_hash=<Chunk Hash>)` "
         "before quoting or making a detailed claim. Then cluster the papers into "
         "themes and summarize each contribution with the verified passage.",
     ]

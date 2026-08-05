@@ -78,15 +78,13 @@ def tool_visible(name: str, profile: str | None = None) -> bool:
     profile = profile or effective_tool_profile()
     if name == "zotero_get_capabilities":
         return True
-    if profile == "all":
-        return True
     if profile == "connector":
         return name in CONNECTOR_TOOLS
     if profile == "admin":
         visible = name in ADMIN_TOOLS
     else:
         visible = True
-    if name in CONNECTOR_TOOLS:
+    if name in CONNECTOR_TOOLS and profile != "all":
         return False
     if name in SEMANTIC_TOOLS and importlib.util.find_spec("chromadb") is None:
         return False

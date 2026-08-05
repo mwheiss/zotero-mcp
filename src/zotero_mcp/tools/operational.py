@@ -10,7 +10,12 @@ from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context, context_error, context_info
-from zotero_mcp.tool_profiles import effective_tool_profile, requested_tool_profile
+from zotero_mcp.tool_profiles import (
+    WRITE_TOOLS,
+    effective_tool_profile,
+    requested_tool_profile,
+    tool_visible,
+)
 
 
 @mcp.tool(
@@ -30,13 +35,12 @@ def get_capabilities(*, ctx: Context) -> str:
     api_key = bool(os.getenv("ZOTERO_API_KEY"))
     semantic_available = importlib.util.find_spec("chromadb") is not None
     pdf_available = importlib.util.find_spec("fitz") is not None
-    local_paths = os.getenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
     requested = requested_tool_profile()
     effective = effective_tool_profile()
+    local_paths = tool_visible("zotero_get_attachment_path", effective)
+    write_usable = api_key and any(
+        tool_visible(tool_name, effective) for tool_name in WRITE_TOOLS
+    )
 
     lines = [
         "# Zotero MCP Capabilities",
@@ -44,7 +48,7 @@ def get_capabilities(*, ctx: Context) -> str:
         f"**Tool profile:** {effective} (requested: {requested})",
         f"**Active library:** {library.get('library_type', 'user')}:{library.get('library_id', '')}",
         f"**Zotero access:** {'local desktop API' if local_mode else 'Web API'}",
-        f"**Write tools usable:** {'yes' if api_key else 'no - no ZOTERO_API_KEY'}",
+        f"**Write tools usable:** {'yes' if write_usable else 'no'}",
         f"**Semantic search installed:** {'yes' if semantic_available else 'no'}",
         f"**PDF page/outline support:** {'yes' if pdf_available else 'no'}",
         f"**Local full-text extraction:** {'yes' if local_mode else 'no'}",

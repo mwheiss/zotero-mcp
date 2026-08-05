@@ -16,6 +16,8 @@ def test_research_prompts_verify_semantic_passages_before_claims():
 
     assert "zotero_get_semantic_context" in review
     assert "Chunk Hash" in review
+    assert "expected_hash=<Chunk Hash>" in review
+    assert "content_hash=<Chunk Hash>" not in review
     assert "zotero_get_semantic_context" in contradictions
 
 

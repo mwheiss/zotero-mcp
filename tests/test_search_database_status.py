@@ -31,6 +31,7 @@ conflict check for *any* persisted backend. The no-op function is still never
 invoked, because ``count()`` does not embed.
 """
 
+import json
 import shutil
 import tempfile
 
@@ -133,3 +134,62 @@ def test_read_collection_status_reports_database_errors(monkeypatch, tmp_path):
     assert status["count"] == 0
     assert "database unavailable" in status["error"]
     assert "initialized" not in status
+
+
+def test_mcp_status_reports_scoped_contract_and_update_lock(monkeypatch, tmp_path):
+    from conftest import DummyContext
+
+    from zotero_mcp import semantic_search
+    from zotero_mcp.tools import search as search_tools
+
+    config_dir = tmp_path / ".config" / "zotero-mcp"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "semantic_search": {
+                    "indexed_fulltext": True,
+                    "indexed_content_signature": "contract-v1",
+                    "update_config": {
+                        "auto_update": False,
+                        "update_frequency": "manual",
+                        "last_update": "2026-08-06T12:00:00",
+                    },
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(search_tools.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        chroma_client,
+        "read_collection_status",
+        lambda *args, **kwargs: {
+            "name": "zotero_library",
+            "item_count": 2,
+            "record_count": 4,
+            "chunk_count": 4,
+            "layout": "passage",
+            "embedding_model": "openai",
+            "persist_directory": str(tmp_path / "chroma_db"),
+            "library_identity": "user:0",
+        },
+    )
+    monkeypatch.setattr(
+        semantic_search,
+        "load_update_config",
+        lambda path: {
+            "auto_update": False,
+            "update_frequency": "manual",
+            "last_update": "2026-08-06T12:00:00",
+        },
+    )
+    monkeypatch.setattr(semantic_search, "should_update", lambda config: False)
+
+    result = search_tools.get_search_database_status(ctx=DummyContext())
+
+    assert "**Collection Owner:** user:0" in result
+    assert "**Indexed Full Text:** yes" in result
+    assert "**Content Contract:** contract-v1" in result
+    assert "**Last Successful Refresh:** 2026-08-06T12:00:00" in result
+    assert "**Update Active:** no" in result

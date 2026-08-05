@@ -67,6 +67,28 @@ def test_research_profile_hides_writes_connectors_and_paths(monkeypatch):
     assert "fetch" not in names
 
 
+def test_all_profile_still_enforces_path_and_write_capabilities(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "all")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.delenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", raising=False)
+    monkeypatch.delenv("ZOTERO_API_KEY", raising=False)
+
+    names = _listed_tool_names()
+
+    assert "search" in names
+    assert "fetch" in names
+    assert "zotero_get_attachment_path" not in names
+    assert "zotero_add_by_doi" not in names
+
+
+def test_all_profile_exposes_paths_only_with_explicit_local_opt_in(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "all")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", "true")
+
+    assert "zotero_get_attachment_path" in _listed_tool_names()
+
+
 def test_capabilities_reports_effective_contract(monkeypatch):
     monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "research")
     monkeypatch.setenv("ZOTERO_LOCAL", "true")
@@ -78,6 +100,17 @@ def test_capabilities_reports_effective_contract(monkeypatch):
     assert "**Tool profile:** research" in result
     assert "**Active library:** user:0" in result
     assert "**Write tools usable:** no" in result
+
+
+def test_capabilities_path_report_matches_visible_tools(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "all")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.delenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", raising=False)
+
+    result = get_capabilities(ctx=DummyContext())
+
+    assert "**Local paths exposed:** no" in result
+    assert not tool_visible("zotero_get_attachment_path", "all")
 
 
 def test_health_tool_scopes_audit_to_active_library(monkeypatch):
