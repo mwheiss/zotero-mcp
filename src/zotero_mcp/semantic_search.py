@@ -581,10 +581,12 @@ def _passages_overlap(candidate: dict[str, Any], selected: dict[str, Any]) -> bo
 def _passage_result(candidate: dict[str, Any]) -> dict[str, Any]:
     """Build the public supporting-passage representation."""
     result = {
+        "chunk_id": candidate["raw_id"],
         "matched_passage": candidate["passage"],
         "similarity_score": candidate["similarity"],
     }
     meta = candidate["meta"]
+    result["content_hash"] = _embedding_content_hash(candidate["document"])
     for key in (
         "chunk_index",
         "n_chunks",
@@ -4388,6 +4390,10 @@ class ZoteroSemanticSearch:
                 "query": query,
             }
             if is_chunked:
+                enriched_result["chunk_id"] = best["raw_id"]
+                enriched_result["content_hash"] = _embedding_content_hash(
+                    best["document"]
+                )
                 enriched_result["best_chunk_similarity_score"] = best_score
                 enriched_result["supporting_chunk_count"] = len(selected) - 1
                 enriched_result["matched_passages"] = [

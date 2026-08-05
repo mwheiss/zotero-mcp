@@ -1,5 +1,6 @@
 """Search-related tool functions for the Zotero MCP server."""
 
+import hashlib
 import json
 import logging as _logging
 import re
@@ -899,6 +900,10 @@ def semantic_search(
 
             if zotero_item:
                 extra = {"Relevance": f"{similarity_score:.3f}"}
+                if chunk_id := result.get("chunk_id"):
+                    extra["Chunk ID"] = f"`{chunk_id}`"
+                if content_hash := result.get("content_hash"):
+                    extra["Chunk Hash"] = f"`{content_hash}`"
                 if loc_bits:
                     extra["Location"] = ", ".join(loc_bits)
                 if snippet:
@@ -906,9 +911,14 @@ def semantic_search(
                 supporting = result.get("matched_passages", [])[1:]
                 if supporting:
                     extra["Supporting Passages"] = "\n\n".join(
-                        passage.get("matched_passage", "")[:400]
+                        (
+                            f"`{passage['chunk_id']}`: "
+                            f"`{passage.get('content_hash', '')}`\n"
+                            f"{passage.get('matched_passage', '')[:400]}"
+                        )
                         for passage in supporting
-                        if passage.get("matched_passage")
+                        if passage.get("chunk_id")
+                        and passage.get("matched_passage")
                     )
                 # Override key from result since it may differ from item["key"]
                 zotero_item.setdefault("key", result.get("item_key", ""))
@@ -917,6 +927,10 @@ def semantic_search(
                 # Fallback if full Zotero item not available
                 output.append(f"## {i}. Item {result.get('item_key', 'Unknown')}")
                 output.append(f"**Relevance:** {similarity_score:.3f}")
+                if chunk_id := result.get("chunk_id"):
+                    output.append(f"**Chunk ID:** `{chunk_id}`")
+                if content_hash := result.get("content_hash"):
+                    output.append(f"**Chunk Hash:** `{content_hash}`")
                 if loc_bits:
                     output.append(f"**Location:** {', '.join(loc_bits)}")
                 if snippet:
@@ -930,6 +944,182 @@ def semantic_search(
     except Exception as e:
         ctx.error(f"Error in semantic search: {str(e)}")
         return f"Error in semantic search: {str(e)}"
+
+
+_SEMANTIC_CHUNK_ID_RE = re.compile(
+    r"^(?P<item_key>[^#\s]+)#(?P<chunk_index>0|[1-9]\d*)$"
+)
+_MAX_ADJACENT_SEMANTIC_CHUNKS = 2
+
+
+@mcp.tool(
+    name="zotero_get_semantic_context",
+    description=(
+        "Retrieve the exact stored semantic-index chunk identified by a "
+        "zotero_semantic_search result, optionally with neighboring chunks. "
+        "Use this to expand a promising matched passage without loading an "
+        "entire paper. chunk_id: the exact Chunk ID returned by semantic "
+        "search, such as ABCD1234#17; do not invent one. adjacent_chunks: "
+        "number of chunks to include on each side, from 0 (default) through "
+        "2. expected_hash: optional Chunk Hash from the same search result; "
+        "when supplied, retrieval refuses stale content if the index changed. "
+        "This reads ChromaDB only: it does not contact Zotero, extract an "
+        "attachment, or generate a new embedding. Requires a populated, "
+        "passage-chunked semantic search database. Example: "
+        "zotero_get_semantic_context(chunk_id='ABCD1234#17', "
+        "adjacent_chunks=1, expected_hash='<hash from search result>')."
+    ),
+)
+def get_semantic_context(
+    chunk_id: str,
+    adjacent_chunks: int = 0,
+    expected_hash: str | None = None,
+    *,
+    ctx: Context,
+) -> str:
+    """Return an exact indexed passage and bounded neighboring passages."""
+    match = (
+        _SEMANTIC_CHUNK_ID_RE.fullmatch(chunk_id.strip())
+        if isinstance(chunk_id, str)
+        else None
+    )
+    if not match:
+        return (
+            "Error: chunk_id must be an exact Chunk ID returned by "
+            "zotero_semantic_search (for example, ABCD1234#17)."
+        )
+
+    if isinstance(adjacent_chunks, bool) or not isinstance(adjacent_chunks, int):
+        return "Error: adjacent_chunks must be an integer from 0 through 2."
+    adjacent = adjacent_chunks
+    if not 0 <= adjacent <= _MAX_ADJACENT_SEMANTIC_CHUNKS:
+        return "Error: adjacent_chunks must be an integer from 0 through 2."
+
+    normalized_hash: str | None = None
+    if expected_hash is not None:
+        if not isinstance(expected_hash, str):
+            return "Error: expected_hash must be the 64-character Chunk Hash from semantic search."
+        normalized_hash = expected_hash.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized_hash):
+            return "Error: expected_hash must be the 64-character Chunk Hash from semantic search."
+
+    item_key = match.group("item_key")
+    chunk_index = int(match.group("chunk_index"))
+    first_index = max(0, chunk_index - adjacent)
+    requested_ids = [
+        f"{item_key}#{index}"
+        for index in range(first_index, chunk_index + adjacent + 1)
+    ]
+
+    try:
+        try:
+            from zotero_mcp.semantic_search import create_semantic_search
+        except ImportError:
+            return (
+                "Semantic search is not available. Install "
+                "zotero-mcp-server[semantic] first."
+            )
+
+        ctx.info(f"Retrieving semantic context for {chunk_id}")
+        config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
+        search = create_semantic_search(str(config_path))
+        records = search.chroma_client.get_records(requested_ids)
+        target = records.get(chunk_id)
+        if not target:
+            return (
+                f"No indexed semantic chunk found for `{chunk_id}`. The "
+                "index may have changed; run zotero_semantic_search again."
+            )
+
+        target_document = target.get("document") or ""
+        target_metadata = target.get("metadata") or {}
+        if not target_document.strip():
+            return f"Error: indexed semantic chunk `{chunk_id}` is empty."
+        if not isinstance(target_metadata, dict):
+            return (
+                f"Error: indexed semantic chunk `{chunk_id}` has inconsistent "
+                "provenance. Run zotero-cli db-health before using it."
+            )
+        if (
+            target_metadata.get("parent_item_key", item_key) != item_key
+            or target_metadata.get("chunk_index", chunk_index) != chunk_index
+        ):
+            return (
+                f"Error: indexed semantic chunk `{chunk_id}` has inconsistent "
+                "provenance. Run zotero-cli db-health before using it."
+            )
+
+        target_hash = hashlib.sha256(target_document.encode("utf-8")).hexdigest()
+        if normalized_hash is not None and normalized_hash != target_hash:
+            return (
+                f"Semantic chunk `{chunk_id}` changed after the search result "
+                "was produced. No text was returned; run "
+                "zotero_semantic_search again."
+            )
+
+        n_chunks = target_metadata.get("n_chunks")
+        if isinstance(n_chunks, int) and not 0 <= chunk_index < n_chunks:
+            return (
+                f"Error: indexed semantic chunk `{chunk_id}` has inconsistent "
+                "provenance. Run zotero-cli db-health before using it."
+            )
+        title = target_metadata.get("title") or item_key
+        output = [
+            f"# Semantic Context: {title}",
+            "",
+            f"**Item Key:** `{item_key}`",
+            f"**Requested Chunk:** `{chunk_id}`",
+            f"**Chunk Hash:** `{target_hash}`",
+        ]
+        if isinstance(n_chunks, int) and n_chunks > 0:
+            output.append(f"**Location:** passage {chunk_index + 1}/{n_chunks}")
+        if source := target_metadata.get("fulltext_source"):
+            output.append(f"**Indexed Source:** {source}")
+        output.append("")
+
+        returned = 0
+        for record_id in requested_ids:
+            record = records.get(record_id)
+            if not record:
+                continue
+            document = record.get("document") or ""
+            metadata = record.get("metadata") or {}
+            record_match = _SEMANTIC_CHUNK_ID_RE.fullmatch(record_id)
+            record_index = int(record_match.group("chunk_index")) if record_match else -1
+            shared_fields = (
+                "n_chunks",
+                "index_layout_signature",
+                "index_content_signature",
+                "attachment_signature",
+                "date_modified",
+                "fulltext_source",
+            )
+            if (
+                not document.strip()
+                or not isinstance(metadata, dict)
+                or metadata.get("parent_item_key", item_key) != item_key
+                or metadata.get("chunk_index", record_index) != record_index
+                or (
+                    isinstance(n_chunks, int)
+                    and not 0 <= record_index < n_chunks
+                )
+                or any(
+                    field in target_metadata
+                    and metadata.get(field) != target_metadata[field]
+                    for field in shared_fields
+                )
+            ):
+                continue
+            label = "Requested Chunk" if record_id == chunk_id else "Adjacent Chunk"
+            output.extend([f"## {label} `{record_id}`", "", document, ""])
+            returned += 1
+
+        if returned == 0:  # Defensive: the validated target should be present.
+            return f"Error: no readable semantic context found for `{chunk_id}`."
+        return "\n".join(output).rstrip()
+    except Exception as exc:
+        ctx.error(f"Error retrieving semantic context: {exc}")
+        return f"Error retrieving semantic context: {exc}"
 
 
 _MCP_FORCE_REBUILD_CONFIRMATION = "REBUILD ALL ITEMS"

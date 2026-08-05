@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-05
+
+### Added
+- **Exact semantic-context retrieval** — semantic search results now expose the stored Chroma chunk ID and content hash. The new `zotero_get_semantic_context` tool returns that exact indexed passage, optionally with up to two neighboring chunks on each side, and can reject stale search references by hash without re-extracting attachments or generating embeddings.
+
 ## [0.6.2] - 2026-07-13
 
 ### Added

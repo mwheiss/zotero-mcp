@@ -63,6 +63,7 @@ from zotero_mcp.tools.search import (  # noqa: F401
     search_by_citation_key,
     advanced_search,
     semantic_search,
+    get_semantic_context,
     update_search_database,
     get_search_database_status,
 )

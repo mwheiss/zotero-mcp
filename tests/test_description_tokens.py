@@ -47,6 +47,7 @@ TOOL_BUDGETS = {
     "zotero_search_by_citation_key":   (125, 280),
     "zotero_advanced_search":          (175, 400),
     "zotero_semantic_search":          (130, 295),
+    "zotero_get_semantic_context":     (100, 245),
     "zotero_update_search_database":   (130, 295),
     "zotero_get_search_database_status": ( 75, 170),
 }

@@ -512,6 +512,8 @@ def test_enrich_groups_chunks_back_to_items(monkeypatch):
     assert [r["item_key"] for r in enriched] == ["PAP1", "PAP2"]
     best = enriched[0]
     assert best["chunk_index"] == 3
+    assert best["chunk_id"] == "PAP1#3"
+    assert len(best["content_hash"]) == 64
     assert best["page"] == 4
     assert best["char_start"] == 900
     assert best["matched_passage"]
@@ -519,6 +521,8 @@ def test_enrich_groups_chunks_back_to_items(monkeypatch):
     assert best["best_chunk_similarity_score"] == pytest.approx(0.9)
     assert best["supporting_chunk_count"] == 1
     assert len(best["matched_passages"]) == 2
+    assert best["matched_passages"][0]["chunk_id"] == "PAP1#3"
+    assert len(best["matched_passages"][0]["content_hash"]) == 64
     assert best["similarity_score"] > best["best_chunk_similarity_score"]
 
 
