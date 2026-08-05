@@ -422,6 +422,9 @@ zotero-mcp serve
 # Specify transport method
 zotero-mcp serve --transport stdio|streamable-http|sse
 
+# Select the exposed MCP surface (auto is the default)
+zotero-mcp serve --tool-profile auto|research|full|admin|connector|all
+
 # Setup and configuration
 zotero-mcp setup --help                    # Get help on setup options
 zotero-mcp setup --semantic-config-only    # Configure only semantic search
@@ -590,8 +593,18 @@ zotero_remove_item_relation(
 
 ### 🧠 Semantic Search Tools
 - `zotero_semantic_search`: AI-powered similarity search with embedding models
+- `zotero_get_semantic_context`: Retrieve an exact matched passage and optional neighboring chunks
 - `zotero_update_search_database`: Manually update the semantic search database
 - `zotero_get_search_database_status`: Check database status and configuration
+- `zotero_get_search_database_health`: Audit semantic storage for the active library
+- `zotero_get_capabilities`: Show the active tool profile, library, credentials, and optional features
+
+Tool profiles keep the advertised surface aligned with the deployment. `auto`
+selects `full` when a web API key is available and `research` otherwise;
+`connector` exposes only the standard `search`/`fetch` pair plus capabilities;
+`admin` exposes semantic maintenance and health tools. `all` is intended for
+diagnosis because individual tools can still require credentials or optional
+dependencies.
 
 ### 🔍 Search Tools
 - `zotero_search_items`: Search your library by keywords
@@ -627,7 +640,7 @@ zotero_remove_item_relation(
 - `zotero_add_by_csl_json`: Add one or more items from CSL JSON (inline or file)
 - `zotero_add_from_file`: Import a local PDF or EPUB file with automatic DOI extraction
 
-All add tools take a `collections` parameter accepting collection keys, names, or `parent/child` paths — resolved and validated before the item is created, so unknown or ambiguous specs fail with suggestions instead of producing an unfiled item. They also take `if_exists` (`"duplicate"` — default — always creates; `"file"` reuses an existing item matching the DOI/arXiv ID/ISBN/URL, filing it into missing collections and adding missing tags; `"skip"` leaves a match untouched) and `create_missing_collections` (create unknown collection specs, including path chains, instead of failing). The `zotero-cli add` commands default to `--if-exists file`.
+All add tools take a `collections` parameter accepting collection keys, names, or `parent/child` paths — resolved and validated before the item is created, so unknown or ambiguous specs fail with suggestions instead of producing an unfiled item. They also take `if_exists` (`"reuse"` — default — returns an identifier match unchanged; `"merge"` adds missing collections and tags to the match; `"duplicate"` explicitly creates another item) and `create_missing_collections` (create unknown collection specs, including path chains, instead of failing). Legacy `skip`/`file` values remain aliases for `reuse`/`merge`. Attachment-aware import tools use `attach_mode="auto|none|linked_url|required"`; an unsatisfied `required` request is reported as partial because Zotero metadata creation cannot be rolled back reliably.
 - `zotero_create_collection`: Create a new collection (folder/project) in your library
 - `zotero_search_collections`: Search for collections by name to find their keys
 - `zotero_manage_collections`: Add or remove items from collections (accepts keys, names, or `parent/child` paths)
@@ -646,7 +659,7 @@ All add tools take a `collections` parameter accepting collection keys, names, o
 
 ### Unit Tests
 ```bash
-uv run pytest tests/     # 294 tests, ~2 seconds
+uv run pytest tests/
 ```
 
 ### Integration Test Plan
@@ -659,7 +672,7 @@ A 45-point live integration test plan is included at `docs/integration-test-plan
 - **Can't connect to library**: Check your API key and library ID if using web API
 - **Full text not available**: Make sure you're using Zotero 7+ for local full-text access
 - **Local library limitations**: Some functionality (tagging, library modifications) may not work with local JS API. Consider using web library setup for full functionality. (See the [docs](docs/getting-started.md#local-library-limitations) for more info.)
-- **Installation/search option switching issues**: Database problems from changing install methods or search options can often be resolved with `zotero-mcp update-db --force-rebuild`
+- **Installation/search option switching issues**: Inspect with `zotero-mcp db-status` or `zotero_get_search_database_health` first. A confirmed `zotero-mcp update-db --force-rebuild` is the last resort because it re-embeds the whole library.
 
 ### Semantic Search Issues
 - **"Missing required environment variables" when running update-db**: Run `zotero-mcp setup` to configure your environment, or the CLI will automatically load settings from your MCP client config (e.g., Claude Desktop)

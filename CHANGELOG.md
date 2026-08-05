@@ -7,8 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-05
+
+### Added
+- **Capability-aware MCP profiles** — `serve --tool-profile auto|research|full|admin|connector|all` exposes a coherent surface for the active credentials and optional dependencies. `zotero_get_capabilities` explains the effective contract, while `zotero_get_search_database_health` audits the active library's semantic storage.
+- **Stable structured tool results** — Zotero tools retain their complete Markdown response and now also return a common `ok`, `status`, `text`, `warnings`, and `errors` envelope. Tool schemas describe every parameter; connector-standard `search` and `fetch` retain their required protocol shape.
+
 ### Changed
+- **Safe, deterministic retrieval** — metadata search is exact by default with explicit relaxed/semantic fallback, semantic filters compose correctly, exact item/chunk retrieval is supported, and PDF/full-text attachment choice has deterministic documented precedence with an explicit attachment-key override.
+- **Convergent imports by default** — add tools and `zotero-cli add` now default to `if_exists="reuse"`; `merge` and `duplicate` are explicit. Legacy `skip`/`file` aliases remain accepted. Attachment policies are consistently `auto|none|linked_url|required`, and unsatisfied required attachments report retained metadata as a partial result.
+- **Grounded research guidance** — prompts direct models from semantic discovery to exact chunk verification before quotation or detailed claims, reserve whole-fulltext retrieval for document-wide reading, and require confirmation before library writes.
+- **Fresh semantic indexes use passage chunking by default** with a 6,000-character target, 750-character overlap, and a 768-chunk item cap. Existing explicitly configured indexes are not silently rebuilt.
 - **Semantic retrieval tools now advertise a three-tier reading workflow:** use semantic search for discovery, exact semantic context for targeted evidence, and full-text retrieval only for whole-document analysis. The descriptions include practical follow-up rules, stale-hash guidance, and token-cost safeguards so MCP clients can choose the appropriate tool reliably.
+
+### Fixed
+- Library switching now scopes semantic collections, update state, and local SQLite reads to the active Zotero library; all Zotero client calls share bounded serialization so reads and writes cannot race a prune/update phase.
+- Removed-item pruning, immediate metadata refresh, staged vector replacement, semantic health checks, and status accounting now agree across incremental and rebuild pathways.
+- Child attachment reporting, collection filtering, relation rollback, synthesis grouping, and PDF page/outline selection no longer produce ambiguous or cross-item results.
+- Synchronous tools no longer leak un-awaited FastMCP logging coroutines or risk deadlocking execution on progress messages.
 
 ## [0.6.3] - 2026-08-05
 

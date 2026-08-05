@@ -226,6 +226,10 @@ Switching installs or install methods (sometimes to deal with failed installs), 
 zotero-mcp update-db --force-rebuild
 ```
 
-Other than time waiting for the rebuild, there is generally little to no risk involved in triggering the rebuild - so if you're experiencing database-related issues, it's worth trying this command.
+Force rebuilding discards and re-embeds the complete semantic index, can take
+hours, and may incur API cost. The CLI requires interactive confirmation and
+the MCP tool requires an explicit confirmation value supplied by the user.
+Prefer `zotero-mcp db-status` and `zotero_get_search_database_health` before a
+rebuild; ordinary `update-db` runs already prune and reconcile incrementally.
 
 For more help, try the [discussions](https://github.com/54yyyu/zotero-mcp/discussions).
