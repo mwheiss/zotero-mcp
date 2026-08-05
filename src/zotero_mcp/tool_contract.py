@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 from typing import Any
 
@@ -23,8 +24,8 @@ RESULT_SCHEMA = {
         "text": {"type": "string", "description": "The complete human-readable markdown result."},
         "data": {
             "description": (
-                "Native machine-readable result data when the tool provides it; "
-                "null for legacy text-only tools."
+                "Machine-readable result data. Native structures are preserved; "
+                "legacy markdown tools expose parsed fields and identifiers."
             ),
         },
         "warnings": {
@@ -171,11 +172,98 @@ def classify_result(
 
 
 def _result_data(result: ToolResult, text: str) -> Any:
-    """Preserve native structured data while dropping FastMCP's string wrapper."""
+    """Preserve native data or derive useful structure from legacy markdown."""
     structured = result.structured_content
-    if isinstance(structured, dict) and structured == {"result": text}:
-        return None
-    return copy.deepcopy(structured)
+    if not (isinstance(structured, dict) and structured == {"result": text}):
+        if structured is not None:
+            return copy.deepcopy(structured)
+    return _legacy_result_data(text)
+
+
+def _field_name(label: str) -> str:
+    """Normalize a human-facing markdown label into a stable data key."""
+    value = re.sub(r"[^a-z0-9]+", "_", label.strip().lower()).strip("_")
+    return value or "field"
+
+
+def _field_value(value: str) -> str:
+    """Remove presentation-only markdown around a field value."""
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] == "`":
+        cleaned = cleaned[1:-1]
+    return cleaned.strip()
+
+
+def _append_value(target: dict[str, Any], key: str, value: str) -> None:
+    existing = target.get(key)
+    if existing is None:
+        target[key] = value
+    elif isinstance(existing, list):
+        if value not in existing:
+            existing.append(value)
+    elif existing != value:
+        target[key] = [existing, value]
+
+
+def _legacy_result_data(text: str) -> Any:
+    """Derive a conservative machine view without changing legacy tool text."""
+    stripped = text.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
+    fields: dict[str, Any] = {}
+    identifiers: dict[str, Any] = {}
+    field_pattern = re.compile(
+        r"^\s*(?:[-*]\s+)?\*\*([^*:\n]+):\*\*\s*(.*?)\s*$"
+    )
+    identifier_fields = {
+        "item_key": "item_keys",
+        "attachment_key": "attachment_keys",
+        "collection_key": "collection_keys",
+        "chunk_id": "chunk_ids",
+        "chunk_hash": "chunk_hashes",
+        "doi": "dois",
+        "citation_key": "citation_keys",
+    }
+    prose_fields = {
+        "abstract",
+        "content",
+        "full_text",
+        "matched_passage",
+        "note",
+        "supporting_passages",
+        "text",
+    }
+
+    for line in stripped.splitlines():
+        match = field_pattern.match(line)
+        if not match:
+            continue
+        key = _field_name(match.group(1))
+        value = _field_value(match.group(2))
+        if not value or key in prose_fields:
+            continue
+        _append_value(fields, key, value)
+        identifier_key = identifier_fields.get(key)
+        if identifier_key:
+            _append_value(identifiers, identifier_key, value)
+
+    # Capture identifiers embedded in links or compact prose even when a tool
+    # does not render them as labelled fields.
+    for key in re.findall(r"zotero://select/(?:library|groups/\d+)/items/([A-Z0-9]{8})", stripped):
+        _append_value(identifiers, "item_keys", key)
+    for doi in re.findall(r"https?://doi\.org/([^\s)>]+)", stripped, re.I):
+        _append_value(identifiers, "dois", doi.rstrip(".,;"))
+
+    data: dict[str, Any] = {}
+    if fields:
+        data["fields"] = fields
+    if identifiers:
+        data["identifiers"] = identifiers
+    return data
 
 
 class ToolContractMiddleware(Middleware):

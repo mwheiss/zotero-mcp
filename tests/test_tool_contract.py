@@ -114,7 +114,7 @@ def test_call_middleware_preserves_text_and_adds_structured_result():
         "ok": True,
         "status": "empty",
         "text": "No matching items found.",
-        "data": None,
+        "data": {},
         "warnings": [],
         "errors": [],
     }
@@ -139,3 +139,50 @@ def test_call_middleware_preserves_native_data_and_sets_error_bit():
     assert result.is_error is True
     assert result.structured_content["status"] == "error"
     assert result.structured_content["data"] == {"item_key": "ABCD1234"}
+
+
+def test_call_middleware_derives_fields_and_identifiers_from_legacy_markdown():
+    async def run():
+        middleware = ToolContractMiddleware()
+        context = SimpleNamespace(message=SimpleNamespace(name="zotero_semantic_search"))
+
+        async def call_next(_context):
+            return ToolResult(
+                content=(
+                    "### Result one\n"
+                    "**Item Key:** `ABCD1234`\n"
+                    "**Chunk ID:** `ABCD1234:0007`\n"
+                    "**Chunk Hash:** `abc123`\n"
+                    "**DOI:** `10.1000/example`\n\n"
+                    "### Result two\n"
+                    "**Item Key:** `WXYZ5678`\n"
+                    "**Chunk ID:** `WXYZ5678:0002`"
+                ),
+                meta={"fastmcp": {"wrap_result": True}},
+            )
+
+        return await middleware.on_call_tool(context, call_next)
+
+    data = asyncio.run(run()).structured_content["data"]
+
+    assert data["fields"]["item_key"] == ["ABCD1234", "WXYZ5678"]
+    assert data["identifiers"] == {
+        "item_keys": ["ABCD1234", "WXYZ5678"],
+        "chunk_ids": ["ABCD1234:0007", "WXYZ5678:0002"],
+        "chunk_hashes": "abc123",
+        "dois": "10.1000/example",
+    }
+
+
+def test_call_middleware_uses_json_text_as_native_data():
+    async def run():
+        middleware = ToolContractMiddleware()
+        context = SimpleNamespace(message=SimpleNamespace(name="zotero_example"))
+
+        async def call_next(_context):
+            return ToolResult(content='{"items":[{"key":"ABCD1234"}]}')
+
+        return await middleware.on_call_tool(context, call_next)
+
+    data = asyncio.run(run()).structured_content["data"]
+    assert data == {"items": [{"key": "ABCD1234"}]}
