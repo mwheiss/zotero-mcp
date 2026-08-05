@@ -1,7 +1,6 @@
 """ChatGPT connector tool functions (search & fetch)."""
 
 import json
-import os
 import uuid
 from pathlib import Path
 
@@ -15,6 +14,30 @@ from zotero_mcp.tools.retrieval import get_item_fulltext
 # specific tools required are "search" and "fetch"
 # See: https://platform.openai.com/docs/mcp
 
+
+def _item_urls(item_key: str) -> tuple[str, str]:
+    """Return active-library-aware ``(select_url, web_url)`` links."""
+    library = _client.get_current_library()
+    library_type = (library.get("library_type") or "user").lower()
+    library_id = str(library.get("library_id") or "")
+
+    if library_type == "group" and library_id:
+        select_url = f"zotero://select/groups/{library_id}/items/{item_key}"
+        web_url = f"https://www.zotero.org/groups/{library_id}/items/{item_key}"
+    elif library_type == "feed" and library_id:
+        select_url = f"zotero://select/feeds/{library_id}/items/{item_key}"
+        web_url = ""
+    else:
+        select_url = f"zotero://select/library/items/{item_key}"
+        # The local Zotero API identifies My Library as user:0. It has no
+        # corresponding web-library URL; a synced Web API client has a real ID.
+        web_url = (
+            f"https://www.zotero.org/users/{library_id}/items/{item_key}"
+            if library_id and library_id != "0"
+            else ""
+        )
+    return select_url, web_url
+
 @mcp.tool(
     name="search",
     description=(
@@ -26,7 +49,7 @@ from zotero_mcp.tools.retrieval import get_item_fulltext
         "Performs semantic search over the active Zotero library and "
         "returns a JSON string {\"results\":[{\"id\",\"title\",\"url\"}, "
         "...]} matching the ChatGPT connector citation UI. URLs are "
-        "zotero://select/items/<key> deep-links. "
+        "active-library-aware zotero://select deep-links. "
         "query: topic string; natural language works (embedding match). "
         "No limit parameter — fixed at 10 per the connector UI's "
         "expected result-set size. "
@@ -65,7 +88,7 @@ def chatgpt_connector_search(
                 title = data.get("title", "")
             if not title:
                 title = f"Zotero Item {item_key}" if item_key else "Zotero Item"
-            url = f"zotero://select/items/{item_key}" if item_key else ""
+            url = _item_urls(item_key)[0] if item_key else ""
             result_list.append({
                 "id": item_key or uuid.uuid4().hex[:8],
                 "title": title,
@@ -93,7 +116,7 @@ def chatgpt_connector_search(
         "`search` call. Blank/missing returns an empty envelope (no "
         "error). "
         "url field: Zotero web-library URL when ZOTERO_LIBRARY_ID is "
-        "set; otherwise a zotero://select/items/<key> deep-link. "
+        "available; otherwise an active-library-aware zotero://select deep-link. "
         "text field: extracted fulltext via the same path as "
         "zotero_get_item_fulltext; if none can be extracted, falls back "
         "to title + authors + abstract so the connector isn't blank. "
@@ -134,13 +157,9 @@ def connector_fetch(
             data = {}
 
         title = data.get("title", f"Zotero Item {item_key}")
-        zotero_url = f"zotero://select/items/{item_key}"
-        # Prefer web URL for connectors; fall back to zotero:// if unknown
-        lib_type = (os.getenv("ZOTERO_LIBRARY_TYPE", "user") or "user").lower()
-        lib_id = os.getenv("ZOTERO_LIBRARY_ID", "")
-        if lib_type not in ["user", "group"]:
-            lib_type = "user"
-        web_url = f"https://www.zotero.org/{'users' if lib_type=='user' else 'groups'}/{lib_id}/items/{item_key}" if lib_id else ""
+        zotero_url, web_url = _item_urls(item_key)
+        # Prefer a shareable web URL; local-only and feed libraries use the
+        # Zotero desktop deep-link instead.
         url = web_url or zotero_url
 
         # Use existing tool to get best-effort fulltext/markdown
