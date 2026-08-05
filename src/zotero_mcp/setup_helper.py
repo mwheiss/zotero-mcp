@@ -377,8 +377,9 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
         if existing_semantic_config
         else False
     )
-    # Discoverable defaults for the two retrieval-quality knobs (both off so
-    # the base experience is unchanged). Preserve any existing user values.
+    # Discoverable defaults for the two retrieval-quality knobs. Preserve any
+    # existing user values. Fresh semantic indexes use passage retrieval so
+    # search results can lead directly to grounded context.
     #   reranker: local cross-encoder re-rank of candidates for higher
     #             precision (needs sentence-transformers; adds a model load).
     #   chunking: index each item as overlapping passages so search returns
@@ -396,9 +397,9 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
         config["chunking"] = existing_semantic_config["chunking"]
     else:
         config.setdefault("chunking", {
-            "enabled": False,
-            "chunk_size": 1500,
-            "overlap": 200,
+            "enabled": True,
+            "chunk_size": 6000,
+            "overlap": 750,
             "max_chunks_per_item": 768,
         })
     if zotero_db_path:

@@ -10,6 +10,8 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from zotero_mcp.tool_profiles import ToolProfileMiddleware
+
 # Configure logging from environment variable
 # Set ZOTERO_MCP_LOG_LEVEL=DEBUG in Claude Desktop config to enable debug logs
 _log_level = os.environ.get("ZOTERO_MCP_LOG_LEVEL", "WARNING").upper()
@@ -81,5 +83,16 @@ async def server_lifespan(server: FastMCP):
     sys.stderr.write("Shutting down Zotero MCP server...\n")
 
 
-# Create an MCP server (fastmcp 2.14+ no longer accepts `dependencies`)
-mcp = FastMCP("Zotero", lifespan=server_lifespan)
+# Create an MCP server (fastmcp 2.14+ no longer accepts `dependencies`).
+mcp = FastMCP(
+    "Zotero",
+    instructions=(
+        "Start with zotero_get_capabilities when availability is uncertain. "
+        "Use zotero_search_items for known metadata, zotero_semantic_search for "
+        "concepts, then zotero_get_semantic_context for evidence. Retrieve whole "
+        "full text only when document-wide reading is necessary. Destructive "
+        "semantic rebuilds require explicit user confirmation."
+    ),
+    lifespan=server_lifespan,
+)
+mcp.add_middleware(ToolProfileMiddleware())

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ._file_lock import acquire_file_lock, release_file_lock
-from .chroma_client import index_lifecycle_lock
+from .chroma_client import index_lifecycle_lock, scoped_collection_name
 
 
 @dataclass
@@ -163,14 +163,28 @@ def _deduplicate_index_items(items: list[Any]) -> list[Any]:
 def _read_zotero_keys(
     db_path: str | None,
     collection_keys: list[str] | None,
+    library: dict[str, str] | None = None,
 ) -> tuple[set[str], Path]:
     from .local_db import LocalZoteroReader
 
     with LocalZoteroReader(db_path=db_path) as reader:
-        items = reader.get_items_with_text(
+        sqlite_library_id = None
+        if library is not None:
+            sqlite_library_id = reader.resolve_library_id(
+                library.get("library_id", ""),
+                library.get("library_type", "user"),
+            )
+            if sqlite_library_id is None:
+                raise ValueError(
+                    "Active library is not present in the local Zotero snapshot"
+                )
+        read_kwargs = dict(
             include_fulltext=False,
             collection_keys=collection_keys,
         )
+        if library is not None:
+            read_kwargs["library_id"] = sqlite_library_id
+        items = reader.get_items_with_text(**read_kwargs)
         resolved_path = Path(reader.db_path)
     return {item.key for item in _deduplicate_index_items(items)}, resolved_path
 
@@ -182,6 +196,7 @@ def audit_semantic_database(
     zotero_db_path: str | None = None,
     full_integrity: bool = True,
     compare_zotero: bool = True,
+    library: dict[str, str] | None = None,
 ) -> DatabaseHealthReport:
     """Audit Chroma and Zotero state without opening a writable DB handle."""
     config_path = Path(config_path)
@@ -194,6 +209,13 @@ def audit_semantic_database(
 
     semantic_config = config.get("semantic_search", {})
     collection_name = semantic_config.get("collection_name", "zotero_library")
+    if library is not None:
+        from .client import library_identity
+
+        collection_name = scoped_collection_name(
+            collection_name,
+            scope_identity=library_identity(library),
+        )
     if persist_directory is None:
         persist_directory = Path.home() / ".config" / "zotero-mcp" / "chroma_db"
     persist_directory = Path(persist_directory)
@@ -631,6 +653,7 @@ def audit_semantic_database(
                 zotero_keys, resolved_zotero_path = _read_zotero_keys(
                     configured_db_path,
                     semantic_config.get("collection_keys"),
+                    library,
                 )
                 report.metrics["zotero_items"] = len(zotero_keys)
                 zotero_wal = resolved_zotero_path.with_name(

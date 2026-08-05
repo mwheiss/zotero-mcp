@@ -1366,8 +1366,9 @@ def update_search_database(
 @mcp.tool(
     name="zotero_get_search_database_status",
     description=(
-        "Report the semantic search database's readiness and stats: item "
-        "count, last update time, embedding provider / model, and whether "
+        "Report the active library's semantic database readiness and stats: "
+        "distinct item count, vector-record/passage count, index layout, last "
+        "update time, embedding provider/model, and whether "
         "the [semantic] optional dependency is installed. "
         "Use this to decide whether zotero_semantic_search will return "
         "useful results, or whether the user should run "
@@ -1416,15 +1417,37 @@ def get_search_database_status(*, ctx: Context) -> str:
         config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
 
         # Read status without loading any embedding model (fast, no network).
-        collection_info = read_collection_status(str(config_path))
+        library = _client.get_current_library()
+        identity = _client.library_identity(library)
+        collection_info = read_collection_status(
+            str(config_path), scope_identity=identity
+        )
         update_config = load_update_config(str(config_path))
+        try:
+            with open(config_path, encoding="utf-8") as config_file:
+                library_state = (
+                    json.load(config_file)
+                    .get("semantic_search", {})
+                    .get("library_states", {})
+                    .get(identity, {})
+                )
+            if library_state.get("last_update"):
+                update_config["last_update"] = library_state["last_update"]
+        except Exception:
+            pass
 
         # Format results
         output = ["# Semantic Search Database Status", ""]
 
         output.append("## Collection Information")
+        output.append(f"**Library:** {identity}")
         output.append(f"**Name:** {collection_info.get('name', 'Unknown')}")
-        output.append(f"**Document Count:** {collection_info.get('count', 0)}")
+        output.append(f"**Indexed Items:** {collection_info.get('item_count', 0)}")
+        output.append(
+            f"**Vector Records:** {collection_info.get('record_count', collection_info.get('count', 0))}"
+        )
+        output.append(f"**Passage Records:** {collection_info.get('chunk_count', 0)}")
+        output.append(f"**Index Layout:** {collection_info.get('layout', 'unknown')}")
         output.append(f"**Embedding Model:** {collection_info.get('embedding_model', 'Unknown')}")
         output.append(f"**Database Path:** {collection_info.get('persist_directory', 'Unknown')}")
 

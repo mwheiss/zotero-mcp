@@ -1,0 +1,105 @@
+import asyncio
+
+from conftest import DummyContext
+
+from zotero_mcp.server import get_capabilities, get_search_database_health, mcp
+from zotero_mcp.tool_profiles import (
+    ToolProfileMiddleware,
+    effective_tool_profile,
+    tool_visible,
+)
+
+
+def _listed_tool_names() -> set[str]:
+    async def run():
+        middleware = ToolProfileMiddleware()
+
+        async def list_registered(_context):
+            return await mcp.list_tools()
+
+        tools = await middleware.on_list_tools(None, list_registered)
+        return {tool.name for tool in tools}
+
+    return asyncio.run(run())
+
+
+def test_auto_profile_uses_research_without_api_key(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "auto")
+    monkeypatch.delenv("ZOTERO_API_KEY", raising=False)
+
+    assert effective_tool_profile() == "research"
+    assert tool_visible("zotero_semantic_search")
+    assert not tool_visible("zotero_add_by_doi")
+
+
+def test_auto_profile_uses_full_with_api_key(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "auto")
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+
+    assert effective_tool_profile() == "full"
+    assert tool_visible("zotero_add_by_doi")
+    assert not tool_visible("search")
+
+
+def test_connector_profile_is_small_and_coherent(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "connector")
+
+    assert _listed_tool_names() == {
+        "search",
+        "fetch",
+        "zotero_get_capabilities",
+    }
+
+
+def test_research_profile_hides_writes_connectors_and_paths(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "research")
+    monkeypatch.delenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", raising=False)
+
+    names = _listed_tool_names()
+
+    assert "zotero_semantic_search" in names
+    assert "zotero_get_search_database_health" in names
+    assert "zotero_add_by_doi" not in names
+    assert "zotero_get_attachment_path" not in names
+    assert "search" not in names
+    assert "fetch" not in names
+
+
+def test_capabilities_reports_effective_contract(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "research")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "0")
+    monkeypatch.delenv("ZOTERO_API_KEY", raising=False)
+
+    result = get_capabilities(ctx=DummyContext())
+
+    assert "**Tool profile:** research" in result
+    assert "**Active library:** user:0" in result
+    assert "**Write tools usable:** no" in result
+
+
+def test_health_tool_scopes_audit_to_active_library(monkeypatch):
+    from zotero_mcp import db_health
+
+    captured = {}
+    sentinel = object()
+
+    def audit(*args, **kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(db_health, "audit_semantic_database", audit)
+    monkeypatch.setattr(db_health, "format_health_report", lambda report: "healthy")
+    monkeypatch.setattr(
+        "zotero_mcp.tools.operational._client.get_current_library",
+        lambda: {"library_id": "5910265", "library_type": "group"},
+    )
+
+    result = get_search_database_health(ctx=DummyContext())
+
+    assert result == "healthy"
+    assert captured["library"] == {
+        "library_id": "5910265",
+        "library_type": "group",
+    }
+    assert captured["full_integrity"] is False

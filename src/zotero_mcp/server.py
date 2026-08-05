@@ -127,3 +127,7 @@ from zotero_mcp.tools.connectors import (  # noqa: F401
     chatgpt_connector_search,
     connector_fetch,
 )
+from zotero_mcp.tools.operational import (  # noqa: F401
+    get_capabilities,
+    get_search_database_health,
+)

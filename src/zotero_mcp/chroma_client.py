@@ -1807,9 +1807,68 @@ def read_collection_status(
                     )
                 except NotFoundError:
                     # Collection does not exist yet — database not initialized.
-                    return {**base, "count": 0, "initialized": False}
+                    return {
+                        **base,
+                        "count": 0,
+                        "record_count": 0,
+                        "item_count": 0,
+                        "chunk_count": 0,
+                        "layout": "empty",
+                        "initialized": False,
+                    }
                 count = collection.count()
-        return {**base, "count": count, "initialized": True}
+                item_count = count
+                chunk_count = 0
+                layout = "item"
+                database_path = Path(persist_directory) / "chroma.sqlite3"
+                if database_path.is_file():
+                    connection = sqlite3.connect(
+                        f"file:{database_path}?mode=ro",
+                        uri=True,
+                    )
+                    try:
+                        collection_row = connection.execute(
+                            "SELECT id FROM collections WHERE name = ?",
+                            (collection_name,),
+                        ).fetchone()
+                        if collection_row:
+                            segment_row = connection.execute(
+                                "SELECT id FROM segments WHERE collection = ? "
+                                "AND scope = 'METADATA'",
+                                (collection_row[0],),
+                            ).fetchone()
+                            if segment_row:
+                                item_count = connection.execute(
+                                    "SELECT COUNT(DISTINCT metadata.string_value) "
+                                    "FROM embeddings AS embedding "
+                                    "JOIN embedding_metadata AS metadata "
+                                    "ON metadata.id = embedding.id "
+                                    "WHERE embedding.segment_id = ? "
+                                    "AND metadata.key = 'item_key'",
+                                    (segment_row[0],),
+                                ).fetchone()[0]
+                                chunk_count = connection.execute(
+                                    "SELECT COUNT(*) FROM embeddings AS embedding "
+                                    "JOIN embedding_metadata AS metadata "
+                                    "ON metadata.id = embedding.id "
+                                    "WHERE embedding.segment_id = ? "
+                                    "AND metadata.key = 'chunk_index'",
+                                    (segment_row[0],),
+                                ).fetchone()[0]
+                                if not item_count and count:
+                                    item_count = count
+                                layout = "passage" if chunk_count else "item"
+                    finally:
+                        connection.close()
+        return {
+            **base,
+            "count": count,
+            "record_count": count,
+            "item_count": item_count,
+            "chunk_count": chunk_count,
+            "layout": layout,
+            "initialized": True,
+        }
     except Exception as e:
         logger.error(f"Error reading collection status: {e}")
         return {**base, "count": 0, "error": str(e)}

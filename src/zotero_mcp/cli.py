@@ -347,6 +347,15 @@ def main():
         default=8000,
         help="Port to bind to for SSE transport (default: 8000)",
     )
+    server_parser.add_argument(
+        "--tool-profile",
+        choices=["auto", "research", "full", "admin", "connector", "all"],
+        default="auto",
+        help=(
+            "MCP tool surface (default: auto; research without an API key, "
+            "full with one)"
+        ),
+    )
 
     # Setup command
     setup_parser = subparsers.add_parser("setup", help="Configure zotero-mcp (Claude Desktop or standalone)")
@@ -947,12 +956,15 @@ def main():
             sys.exit(1)
 
     elif args.command == "serve":
-        # Lazy import — triggers heavy dependencies (FastMCP, ChromaDB, etc.)
-        from zotero_mcp.server import mcp
         # Get transport with a default value if not specified
         transport = getattr(args, "transport", "stdio")
         # Ensure environment is initialized (Claude config or standalone config)
         setup_zotero_environment()
+        os.environ["ZOTERO_MCP_TOOL_PROFILE"] = getattr(
+            args, "tool_profile", "auto"
+        )
+        # Lazy import — triggers heavy dependencies (FastMCP, ChromaDB, etc.)
+        from zotero_mcp.server import mcp
         # If the reranker is enabled, warm it up in the background so the first
         # semantic search doesn't pay the ~tens-of-seconds model load inside the
         # request path and time out (issue #283). Daemon thread: never blocks
