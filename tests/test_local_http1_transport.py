@@ -60,6 +60,29 @@ def test_get_local_zotero_client_uses_http1_transport(monkeypatch):
     monkeypatch.setattr(zotero.Zotero, "__init__", real_init)
 
 
+def test_get_local_zotero_client_uses_active_library(monkeypatch):
+    captured: dict = {}
+
+    def spy_init(self, *args, **kwargs):
+        captured["kwargs"] = kwargs
+        self.library_id = kwargs.get("library_id")
+        self.library_type = kwargs.get("library_type")
+        self.api_key = kwargs.get("api_key")
+        self.client = kwargs.get("client")
+
+    monkeypatch.setattr(zotero.Zotero, "__init__", spy_init)
+    monkeypatch.setattr(zotero.Zotero, "items", lambda self, **_kw: [])
+    zclient.set_active_library("5910265", "group", session_id=None)
+
+    try:
+        client = zclient.get_local_zotero_client()
+        assert client is not None
+        assert captured["kwargs"]["library_id"] == "5910265"
+        assert captured["kwargs"]["library_type"] == "group"
+    finally:
+        zclient.clear_active_library(session_id=None)
+
+
 def test_get_zotero_client_uses_http1_only_when_local(monkeypatch):
     """The general get_zotero_client should pass an HTTP/1.1 client only
     when the underlying connection is local; the cloud Web API at

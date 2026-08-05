@@ -578,6 +578,7 @@ class ChromaClient:
         embedding_model: str = "default",
         embedding_config: dict[str, Any] | None = None,
         allow_embedding_mismatch: bool = False,
+        library_identity: str | None = None,
     ):
         """
         Initialize ChromaDB client.
@@ -592,6 +593,7 @@ class ChromaClient:
         self.embedding_model = embedding_model
         self.embedding_config = embedding_config or {}
         self.embedding_identity = self._configured_embedding_identity()
+        self.library_identity = library_identity
         self._pending_embedding_mismatch = False
         self._rebuild_original_collection = None
         self._rebuild_staging_name: str | None = None
@@ -648,13 +650,37 @@ class ChromaClient:
                         allow_embedding_mismatch,
                     )
 
-                stored_identity = (getattr(self.collection, "metadata", {}) or {}).get("zotero_mcp_embedding_identity")
+                collection_metadata = dict(
+                    getattr(self.collection, "metadata", {}) or {}
+                )
+                stored_identity = collection_metadata.get(
+                    "zotero_mcp_embedding_identity"
+                )
                 if stored_identity and stored_identity != self.embedding_identity:
                     self._handle_embedding_mismatch(
                         f"stored identity '{stored_identity}' differs from configured "
                         f"identity '{self.embedding_identity}'",
                         allow_embedding_mismatch,
                     )
+
+                stored_library = collection_metadata.get(
+                    "zotero_mcp_library_identity"
+                )
+                if (
+                    stored_library
+                    and self.library_identity
+                    and stored_library != self.library_identity
+                ):
+                    raise RuntimeError(
+                        f"Semantic collection '{self.collection_name}' belongs to "
+                        f"Zotero library '{stored_library}', not "
+                        f"'{self.library_identity}'. Refusing cross-library access."
+                    )
+                if self.library_identity and not stored_library:
+                    collection_metadata["zotero_mcp_library_identity"] = (
+                        self.library_identity
+                    )
+                    self.collection.modify(metadata=collection_metadata)
 
                 self._require_cosine_collection(allow_embedding_mismatch)
 
@@ -667,10 +693,13 @@ class ChromaClient:
         return f"{self.embedding_model}:{model_name or self.embedding_model}"
 
     def _new_collection_metadata(self) -> dict[str, str]:
-        return {
+        metadata = {
             "zotero_mcp_embedding_identity": self.embedding_identity,
             "hnsw:space": "cosine",
         }
+        if self.library_identity:
+            metadata["zotero_mcp_library_identity"] = self.library_identity
+        return metadata
 
     def _wait_for_collection_swap(self) -> None:
         """Wait for any active swap lock, then recover its stale marker."""
@@ -1597,6 +1626,7 @@ def scoped_collection_name(
     base_name: str,
     *,
     scope_identity: str | None = None,
+    legacy_owner_identity: str | None = None,
 ) -> str:
     """Return the Chroma collection for the effective Zotero library.
 
@@ -1607,7 +1637,10 @@ def scoped_collection_name(
     from .client import get_default_library, library_identity
 
     identity = scope_identity or library_identity()
-    if identity == library_identity(get_default_library()):
+    if legacy_owner_identity:
+        if identity == legacy_owner_identity:
+            return base_name
+    elif identity == library_identity(get_default_library()):
         return base_name
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", identity).strip("_") or "library"
     return f"{base_name}__{slug}"
@@ -1628,6 +1661,8 @@ def create_chroma_client(
     Returns:
         Configured ChromaClient instance
     """
+    from .client import library_identity
+
     # Default configuration
     config = {"collection_name": "zotero_library", "embedding_model": "default", "embedding_config": {}}
 
@@ -1701,15 +1736,24 @@ def create_chroma_client(
                 ec["base_url"] = env_base
         config["embedding_config"] = ec
 
-    collection_name = scoped_collection_name(
-        config.get("collection_name") or "zotero_library",
+    base_collection_name = config.get("collection_name") or "zotero_library"
+    persist_directory = config.get("persist_directory") or str(
+        Path.home() / ".config" / "zotero-mcp" / "chroma_db"
+    )
+    effective_identity = scope_identity or library_identity()
+    collection_name = resolve_scoped_collection_name(
+        base_collection_name,
+        persist_directory=persist_directory,
         scope_identity=scope_identity,
+        claim_legacy_owner=True,
     )
     return ChromaClient(
         collection_name=collection_name,
+        persist_directory=persist_directory,
         embedding_model=config["embedding_model"],
         embedding_config=config["embedding_config"],
         allow_embedding_mismatch=allow_embedding_mismatch,
+        library_identity=effective_identity,
     )
 
 
@@ -1742,6 +1786,69 @@ class _NoEmbeddingFunction(EmbeddingFunction):
     @staticmethod
     def name() -> str:
         return "default"
+
+
+def _existing_collection_owner(
+    collection_name: str,
+    persist_directory: str,
+    *,
+    claim_identity: str | None = None,
+) -> str | None:
+    """Return, and optionally initialize, an existing collection's owner."""
+    try:
+        with index_lifecycle_lock(
+            persist_directory,
+            exclusive=bool(claim_identity),
+        ):
+            with suppress_stdout():
+                client = chromadb.PersistentClient(
+                    path=persist_directory,
+                    settings=Settings(
+                        anonymized_telemetry=False,
+                        allow_reset=True,
+                    ),
+                )
+                collection = client.get_collection(
+                    name=collection_name,
+                    embedding_function=_NoEmbeddingFunction(),
+                )
+                metadata = dict(getattr(collection, "metadata", {}) or {})
+                owner = metadata.get("zotero_mcp_library_identity")
+                if not owner and claim_identity:
+                    metadata["zotero_mcp_library_identity"] = claim_identity
+                    collection.modify(metadata=metadata)
+                    owner = claim_identity
+        return str(owner) if owner else None
+    except NotFoundError:
+        return None
+
+
+def resolve_scoped_collection_name(
+    base_name: str,
+    *,
+    persist_directory: str,
+    scope_identity: str | None = None,
+    claim_legacy_owner: bool = False,
+) -> str:
+    """Resolve a stable library collection, honoring persisted ownership."""
+    from .client import get_default_library, library_identity
+
+    identity = scope_identity or library_identity()
+    default_identity = library_identity(get_default_library())
+    owner = _existing_collection_owner(
+        base_name,
+        persist_directory,
+        claim_identity=(
+            identity
+            if claim_legacy_owner and identity == default_identity
+            else None
+        ),
+    )
+    return scoped_collection_name(
+        base_name,
+        scope_identity=identity,
+        legacy_owner_identity=owner,
+    )
 
 
 def read_collection_status(
@@ -1783,8 +1890,9 @@ def read_collection_status(
 
     if persist_directory is None:
         persist_directory = str(Path.home() / ".config" / "zotero-mcp" / "chroma_db")
-    collection_name = scoped_collection_name(
+    collection_name = resolve_scoped_collection_name(
         collection_name or "zotero_library",
+        persist_directory=persist_directory,
         scope_identity=scope_identity,
     )
     base = {
@@ -1817,6 +1925,9 @@ def read_collection_status(
                         "initialized": False,
                     }
                 count = collection.count()
+                collection_owner = (
+                    getattr(collection, "metadata", {}) or {}
+                ).get("zotero_mcp_library_identity")
                 item_count = count
                 chunk_count = 0
                 layout = "item"
@@ -1867,6 +1978,7 @@ def read_collection_status(
             "item_count": item_count,
             "chunk_count": chunk_count,
             "layout": layout,
+            "library_identity": collection_owner or scope_identity,
             "initialized": True,
         }
     except Exception as e:

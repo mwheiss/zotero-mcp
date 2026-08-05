@@ -682,11 +682,27 @@ class ZoteroSemanticSearch:
         """
         self.library = get_current_library()
         self.library_identity = library_identity(self.library)
-        self._is_default_library = self.library_identity == library_identity(get_default_library())
         self.chroma_client = chroma_client or create_chroma_client(
             config_path,
             allow_embedding_mismatch=allow_embedding_mismatch,
             scope_identity=self.library_identity,
+        )
+        configured_collection = "zotero_library"
+        if config_path and os.path.exists(config_path):
+            try:
+                with open(config_path) as config_file:
+                    configured_collection = (
+                        json.load(config_file)
+                        .get("semantic_search", {})
+                        .get("collection_name", configured_collection)
+                    )
+            except Exception:
+                pass
+        actual_collection = getattr(self.chroma_client, "collection_name", None)
+        self._uses_legacy_state = (
+            actual_collection == configured_collection
+            if actual_collection
+            else self.library_identity == library_identity(get_default_library())
         )
         self.zotero_client = get_zotero_client()
         self.config_path = config_path
@@ -788,13 +804,13 @@ class ZoteroSemanticSearch:
         return load_update_config(self.config_path)
 
     def _library_scope(self) -> tuple[dict[str, str], str, bool]:
-        """Return the captured library scope, with a diagnostic-safe fallback."""
+        """Return the captured library scope and legacy-state ownership."""
         library = getattr(self, "library", None) or get_current_library()
         identity = getattr(self, "library_identity", None) or library_identity(library)
-        is_default = getattr(self, "_is_default_library", None)
-        if is_default is None:
-            is_default = identity == library_identity(get_default_library())
-        return library, identity, bool(is_default)
+        uses_legacy_state = getattr(self, "_uses_legacy_state", None)
+        if uses_legacy_state is None:
+            uses_legacy_state = identity == library_identity(get_default_library())
+        return library, identity, bool(uses_legacy_state)
 
     def _load_library_state(self) -> dict[str, Any]:
         """Return persisted state for this library identity."""
@@ -1938,7 +1954,18 @@ class ZoteroSemanticSearch:
                     except Exception:
                         pass
                 with LocalZoteroReader(db_path=zotero_db_path) as reader:
-                    snapshot_keys = reader.get_all_item_keys()
+                    library, _, _ = self._library_scope()
+                    sqlite_library_id = reader.resolve_library_id(
+                        library.get("library_id", ""),
+                        library.get("library_type", "user"),
+                    )
+                    if sqlite_library_id is None:
+                        raise RuntimeError(
+                            "active library is not present in the local Zotero snapshot"
+                        )
+                    snapshot_keys = reader.get_all_item_keys(
+                        library_id=sqlite_library_id
+                    )
         except Exception as e:
             logger.warning(f"Could not verify local snapshot completeness ({e}); keeping previous sync watermark.")
             return None

@@ -311,13 +311,15 @@ def get_local_zotero_client() -> zotero.Zotero | None:
         A local Zotero client instance, or None if local Zotero is not available.
     """
     try:
-        # Create a local client - library_id 0 is the default for local.
+        current = get_current_library()
+        library_id = current.get("library_id") or "0"
+        library_type = current.get("library_type") or "user"
         # HTTP/1.1-only transport for compatibility with Zotero 8's local
         # server (#160) — httpx default HTTP/2 negotiation returns 502.
         client = _SerializedCallProxy(
             zotero.Zotero(
-                library_id="0",
-                library_type="user",
+                library_id=library_id,
+                library_type=library_type,
                 api_key=None,
                 local=True,
                 client=_make_local_http_client(),
