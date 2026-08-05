@@ -72,6 +72,7 @@ def test_get_zotero_client_uses_http1_only_when_local(monkeypatch):
         self.library_id = kwargs.get("library_id", "0")
         self.library_type = kwargs.get("library_type", "users")
         self.api_key = kwargs.get("api_key")
+        self.client = kwargs.get("client")
 
     monkeypatch.setattr(zotero.Zotero, "__init__", spy_init)
     monkeypatch.setenv("ZOTERO_LOCAL", "true")
