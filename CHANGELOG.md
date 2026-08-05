@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-08-06
+
+### Added
+- Legacy Markdown-returning MCP tools now expose parsed scalar fields and stable Zotero item, attachment, collection, semantic chunk, DOI, and citation-key identifiers in the structured `data` result without duplicating long prose.
+
+### Fixed
+- Tool outcomes distinguish errors, blocked capabilities, empty resolver results, and partial success across all known return paths instead of reporting several negative outcomes as successful.
+- Connector citation links follow the active request library, use current Zotero personal/group deep-link formats, and no longer generate a nonexistent web-library URL for local `user:0` libraries.
+- Zotero API calls are serialized across MCP and CLI processes as well as threads, with bounded waiting, reentrant nested calls, and automatic kernel cleanup when a process exits.
+
 ## [0.7.0] - 2026-08-05
 
 ### Added
