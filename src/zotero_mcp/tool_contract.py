@@ -84,7 +84,13 @@ def _is_error_marker(line: str) -> bool:
         re.match(
             r"^(?:\[(?:error|fail(?:ed|ure)?)\]|"
             r"(?:(?:input|semantic search)\s+)?error\b|"
-            r"fail(?:ed|ure)?\b)",
+            r"fail(?:ed|ure)?\b|"
+            r"collection not found\b|"
+            r"invalid\b|"
+            r"could not\b|"
+            r"unable to\b|"
+            r"unsupported\b|"
+            r"missing\b)",
             marker,
             re.I,
         )
@@ -102,6 +108,19 @@ def _is_warning_marker(line: str) -> bool:
     )
 
 
+def _is_blocked_marker(line: str) -> bool:
+    """Recognize requests that cannot run until a capability is available."""
+    marker = _marker_text(line)
+    return bool(
+        re.match(
+            r"^(?:update not started\b|.*\brequires?\s+(?:local mode|web api credentials|explicit confirmation)\b|"
+            r".*\bcredentials required\b|.*\bis required for\b|.*\bis required\.?(?:\s|$))",
+            marker,
+            re.I,
+        )
+    )
+
+
 def classify_result(
     text: str,
     is_error: bool = False,
@@ -109,11 +128,15 @@ def classify_result(
 ) -> dict[str, Any]:
     stripped = text.strip()
     lowered = stripped.lower()
+    blocked = [line.strip() for line in stripped.splitlines() if _is_blocked_marker(line)]
     errors = [
         line.strip()
         for line in stripped.splitlines()
-        if _is_error_marker(line)
-        or re.search(r"\bpartial failure\b", line, re.I)
+        if not _is_blocked_marker(line)
+        and (
+            _is_error_marker(line)
+            or re.search(r"\bpartial failure\b", line, re.I)
+        )
     ]
     warnings = [
         line.strip()
@@ -131,7 +154,7 @@ def classify_result(
         status = "partial"
     elif is_error or errors:
         status = "error"
-    elif "not started" in lowered or "requires explicit" in lowered:
+    elif blocked:
         status = "blocked"
     elif lowered.startswith("no ") or "\n\nno " in lowered:
         status = "empty"

@@ -61,6 +61,12 @@ def test_result_classification_recognizes_formatted_failures_and_warnings():
         "Collections: FAILED to update",
         "[ERROR] content hash mismatch",
         "Semantic search error: encoder unavailable",
+        "Collection not found: 'ABCD1234'.",
+        "Invalid library_type 'wat'. Must be 'user', 'group', or 'feed'.",
+        "Could not reach Scite API - try again later.",
+        "Unable to read the requested attachment.",
+        "Unsupported operation 'containsAny'.",
+        "Missing item key.",
     ]
 
     for failure in failures:
@@ -72,6 +78,20 @@ def test_result_classification_recognizes_formatted_failures_and_warnings():
     warning = classify_result("[WARN] fulltext unavailable")
     assert warning["status"] == "success"
     assert warning["warnings"] == ["[WARN] fulltext unavailable"]
+
+
+def test_result_classification_recognizes_blocked_capabilities():
+    blocked = [
+        "PyMuPDF is required for PDF page reading. Install the PDF extra.",
+        "Error: zotero_get_attachment_path requires local mode (set ZOTERO_LOCAL=true).",
+        "Error: Web API credentials required for creating annotations.",
+        "Update not started: requires explicit confirmation.",
+    ]
+
+    for message in blocked:
+        outcome = classify_result(message)
+        assert outcome["ok"] is False
+        assert outcome["status"] == "blocked"
 
 
 def test_call_middleware_preserves_text_and_adds_structured_result():
