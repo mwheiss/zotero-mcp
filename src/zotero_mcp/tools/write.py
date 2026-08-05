@@ -3175,7 +3175,18 @@ def _maybe_reuse_existing(read_zot, write_zot, item_data, coll_keys, tags,
     doi = _helpers._normalize_doi(doi_raw) if doi_raw else None
     if not doi:
         return None
-    existing = _helpers.find_existing_items(read_zot, doi=doi, ctx=ctx)
+    try:
+        existing = _helpers.find_existing_items(read_zot, doi=doi, ctx=ctx)
+    except _helpers.ExistingItemLookupError as exc:
+        return {
+            "ok": False,
+            "key": None,
+            "doi": doi,
+            "pdf_status": None,
+            "error": f"existing-item lookup failed; no item was created ({exc})",
+            "title": item_data.get("title") or "(untitled)",
+            "collections_failed": [],
+        }
     if not existing:
         return None
 
@@ -3209,6 +3220,7 @@ def _maybe_reuse_existing(read_zot, write_zot, item_data, coll_keys, tags,
 def _format_batch_result(header: str, results: list[dict]) -> str:
     """Render a per-entry markdown summary for add_by_bibtex / add_by_csl_json."""
     ok_count = sum(1 for r in results if r["ok"])
+    failed_count = len(results) - ok_count
     reused_count = sum(1 for r in results if r["ok"] and r.get("existed"))
     lines = [header, ""]
     if len(results) == 1:
@@ -3235,6 +3247,12 @@ def _format_batch_result(header: str, results: list[dict]) -> str:
         if reused_count:
             summary_line += f" {reused_count} already existed (reused, not duplicated)."
         lines.append(summary_line)
+        if failed_count and ok_count:
+            lines.append(
+                f"Partial failure: {failed_count} item(s) were not created."
+            )
+        elif failed_count:
+            lines.append(f"Failed: {failed_count} item(s) were not created.")
         lines.append("")
         for i, r in enumerate(results, 1):
             if r["ok"]:

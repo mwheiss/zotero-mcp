@@ -162,12 +162,13 @@ class TestFindExistingItems:
         out = _helpers.find_existing_items(fake_zot, url="https://example.com/post")
         assert [i["key"] for i in out] == ["PAGE0001"]
 
-    def test_search_failure_returns_empty(self, dummy_ctx):
+    def test_search_failure_raises_convergence_error(self, dummy_ctx):
         class Boom(FakeZotero):
             def items(self, **kw):
                 raise RuntimeError("api down")
 
-        assert _helpers.find_existing_items(Boom(), doi=DOI, ctx=dummy_ctx) == []
+        with pytest.raises(_helpers.ExistingItemLookupError, match="api down"):
+            _helpers.find_existing_items(Boom(), doi=DOI, ctx=dummy_ctx)
 
     def test_no_identifier_returns_empty(self, fake_zot):
         assert _helpers.find_existing_items(fake_zot) == []
@@ -237,11 +238,34 @@ class TestAddByDoiIfExists:
 
     def test_duplicate_mode_explicitly_creates(self, monkeypatch, fake_zot, dummy_ctx):
         _patch_clients(monkeypatch, fake_zot)
+        monkeypatch.setattr(
+            fake_zot,
+            "items",
+            lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("duplicate mode must bypass existing-item lookup")
+            ),
+        )
 
         result = server.add_by_doi(doi=DOI, if_exists="duplicate", ctx=dummy_ctx)
 
         assert len(fake_zot.created) == 1
         assert "Successfully added" in result
+
+    def test_reuse_stops_when_existing_item_lookup_fails(
+        self, monkeypatch, fake_zot, dummy_ctx
+    ):
+        _patch_clients(monkeypatch, fake_zot)
+        monkeypatch.setattr(
+            fake_zot,
+            "items",
+            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("api down")),
+        )
+
+        result = server.add_by_doi(doi=DOI, ctx=dummy_ctx)
+
+        assert result.startswith("Error")
+        assert "could not verify whether the item already exists" in result
+        assert fake_zot.created == []
 
     def test_file_mode_creates_when_no_match(self, monkeypatch, fake_zot, dummy_ctx):
         fake_zot._items = []          # nothing in the library

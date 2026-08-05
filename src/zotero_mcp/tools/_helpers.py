@@ -501,6 +501,10 @@ def _create_collection_path(write_zot, paths, spec, ctx=None) -> str:
     return parent_key
 
 
+class ExistingItemLookupError(RuntimeError):
+    """Raised when a convergent write cannot verify existing-item state."""
+
+
 def find_existing_items(zot, *, doi=None, arxiv_id=None, isbn=None, url=None,
                         ctx=None) -> list[dict]:
     """Find non-attachment items already in the library by a normalized id.
@@ -515,8 +519,9 @@ def find_existing_items(zot, *, doi=None, arxiv_id=None, isbn=None, url=None,
     excludes the Trash, so a trashed copy never blocks a re-add.
 
     Returns full item dicts (with ``key``/``version``/``data``) so callers
-    can update them without re-fetching. Returns [] on search failure —
-    callers treat that as "nothing found" and proceed to create.
+    can update them without re-fetching. Search failures raise
+    :class:`ExistingItemLookupError`; treating an unknown result as no match
+    would make the default reuse policy create duplicates during retries.
     """
     if doi:
         query = doi
@@ -551,8 +556,10 @@ def find_existing_items(zot, *, doi=None, arxiv_id=None, isbn=None, url=None,
         )
     except Exception as e:
         if ctx is not None:
-            context_warning(ctx, f"Existing-item search failed (treating as no match): {e}")
-        return []
+            context_warning(ctx, f"Existing-item lookup failed; no item will be created: {e}")
+        raise ExistingItemLookupError(
+            f"could not verify whether the item already exists ({e})"
+        ) from e
 
     matches = []
     for item in candidates or []:
