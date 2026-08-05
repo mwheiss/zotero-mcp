@@ -40,7 +40,12 @@ from . import openai_batch
 from ._atomic_io import atomic_write_json
 from ._file_lock import advisory_file_lock
 from .chroma_client import ChromaClient, create_chroma_client, record_state_hash
-from .client import get_zotero_client
+from .client import (
+    get_current_library,
+    get_default_library,
+    get_zotero_client,
+    library_identity,
+)
 from .local_db import LocalZoteroReader
 from .utils import format_creators, is_local_mode, suppress_stdout
 
@@ -51,6 +56,9 @@ _SELF_CONTAINED_FULLTEXT_SOURCES = {"betterissa-indexing"}
 DEFAULT_MAX_CHUNKS_PER_ITEM = 768
 _IMMEDIATE_METADATA_FIELDS = {
     "item_key",
+    "library_identity",
+    "library_id",
+    "library_type",
     "item_type",
     "title",
     "date",
@@ -169,10 +177,7 @@ class _UpdateInterruptController:
             )
             return
 
-        self._write(
-            "\nSecond interrupt received: forcing immediate exit "
-            "(status 130).\n"
-        )
+        self._write("\nSecond interrupt received: forcing immediate exit (status 130).\n")
         os._exit(130)
 
 
@@ -675,9 +680,13 @@ class ZoteroSemanticSearch:
             config_path: Path to configuration file
             db_path: Optional path to Zotero database (overrides config file)
         """
+        self.library = get_current_library()
+        self.library_identity = library_identity(self.library)
+        self._is_default_library = self.library_identity == library_identity(get_default_library())
         self.chroma_client = chroma_client or create_chroma_client(
             config_path,
             allow_embedding_mismatch=allow_embedding_mismatch,
+            scope_identity=self.library_identity,
         )
         self.zotero_client = get_zotero_client()
         self.config_path = config_path
@@ -697,6 +706,9 @@ class ZoteroSemanticSearch:
 
         # Load update configuration
         self.update_config = self._load_update_config()
+        library_state = self._load_library_state()
+        if "last_update" in library_state:
+            self.update_config["last_update"] = library_state["last_update"]
 
         # Reranker (lazy-initialized on first search)
         self._reranker: CrossEncoderReranker | None = None
@@ -742,11 +754,7 @@ class ZoteroSemanticSearch:
         return "chunks-v1:{size}:{overlap}:{maximum}".format(
             size=int(self._chunking_config.get("chunk_size", 1500)),
             overlap=int(self._chunking_config.get("overlap", 200)),
-            maximum=int(
-                self._chunking_config.get(
-                    "max_chunks_per_item", DEFAULT_MAX_CHUNKS_PER_ITEM
-                )
-            ),
+            maximum=int(self._chunking_config.get("max_chunks_per_item", DEFAULT_MAX_CHUNKS_PER_ITEM)),
         )
 
     def _index_layout_changed(self, metadata: dict[str, Any]) -> bool:
@@ -755,9 +763,7 @@ class ZoteroSemanticSearch:
         # Old item-level indexes did not carry a signature. Preserve their
         # historical skip behavior, while an enabled chunk layout migrates old
         # records once. A stamped chunked index also migrates when disabled.
-        return (self._chunking_enabled or stored is not None) and (
-            stored != self._index_layout_signature
-        )
+        return (self._chunking_enabled or stored is not None) and (stored != self._index_layout_signature)
 
     def _load_reranker_config(self) -> dict[str, Any]:
         """Load reranker configuration from file or use defaults."""
@@ -781,6 +787,29 @@ class ZoteroSemanticSearch:
         """Load update configuration from file or use defaults."""
         return load_update_config(self.config_path)
 
+    def _library_scope(self) -> tuple[dict[str, str], str, bool]:
+        """Return the captured library scope, with a diagnostic-safe fallback."""
+        library = getattr(self, "library", None) or get_current_library()
+        identity = getattr(self, "library_identity", None) or library_identity(library)
+        is_default = getattr(self, "_is_default_library", None)
+        if is_default is None:
+            is_default = identity == library_identity(get_default_library())
+        return library, identity, bool(is_default)
+
+    def _load_library_state(self) -> dict[str, Any]:
+        """Return persisted state for this library identity."""
+        if not self.config_path or not os.path.exists(self.config_path):
+            return {}
+        try:
+            with open(self.config_path) as f:
+                semantic = json.load(f).get("semantic_search", {})
+            _, identity, _ = self._library_scope()
+            state = semantic.get("library_states", {}).get(identity, {})
+            return state if isinstance(state, dict) else {}
+        except Exception as e:
+            logger.warning(f"Error loading library-scoped semantic state: {e}")
+            return {}
+
     def _load_fulltext_setting(self) -> bool:
         """Load whether local full-text extraction is enabled."""
         if not self.config_path or not os.path.exists(self.config_path):
@@ -788,9 +817,7 @@ class ZoteroSemanticSearch:
         try:
             with open(self.config_path) as f:
                 file_config = json.load(f)
-                value = file_config.get("semantic_search", {}).get(
-                    "fulltext", False
-                )
+                value = file_config.get("semantic_search", {}).get("fulltext", False)
                 if not isinstance(value, bool):
                     raise ValueError("fulltext must be true or false")
                 return value
@@ -805,12 +832,7 @@ class ZoteroSemanticSearch:
         try:
             with open(self.config_path) as f:
                 file_config = json.load(f)
-                value = (
-                    file_config
-                    .get("semantic_search", {})
-                    .get("openai_batch", {})
-                    .get("enabled", False)
-                )
+                value = file_config.get("semantic_search", {}).get("openai_batch", {}).get("enabled", False)
                 return bool(value)
         except Exception as e:
             logger.warning(f"Error loading OpenAI batch setting: {e}")
@@ -833,7 +855,13 @@ class ZoteroSemanticSearch:
         try:
             with open(self.config_path) as f:
                 file_config = json.load(f)
-                value = file_config.get("semantic_search", {}).get("last_sync_version", 0)
+                semantic = file_config.get("semantic_search", {})
+                _, identity, is_default = self._library_scope()
+                state = semantic.get("library_states", {}).get(identity, {})
+                value = state.get(
+                    "last_sync_version",
+                    semantic.get("last_sync_version", 0) if is_default else 0,
+                )
                 return int(value) if value is not None else 0
         except Exception as e:
             logger.warning(f"Error loading last_sync_version: {e}")
@@ -845,10 +873,12 @@ class ZoteroSemanticSearch:
             return None
         try:
             with open(self.config_path) as f:
-                value = (
-                    json.load(f)
-                    .get("semantic_search", {})
-                    .get("indexed_fulltext")
+                semantic = json.load(f).get("semantic_search", {})
+                _, identity, is_default = self._library_scope()
+                state = semantic.get("library_states", {}).get(identity, {})
+                value = state.get(
+                    "indexed_fulltext",
+                    semantic.get("indexed_fulltext") if is_default else None,
                 )
             return value if isinstance(value, bool) else None
         except Exception as e:
@@ -861,10 +891,12 @@ class ZoteroSemanticSearch:
             return None
         try:
             with open(self.config_path) as f:
-                value = (
-                    json.load(f)
-                    .get("semantic_search", {})
-                    .get("indexed_content_signature")
+                semantic = json.load(f).get("semantic_search", {})
+                _, identity, is_default = self._library_scope()
+                state = semantic.get("library_states", {}).get(identity, {})
+                value = state.get(
+                    "indexed_content_signature",
+                    semantic.get("indexed_content_signature") if is_default else None,
                 )
             return value if isinstance(value, str) and value else None
         except Exception as e:
@@ -891,25 +923,34 @@ class ZoteroSemanticSearch:
                 with open(self.config_path) as f:
                     full_config = json.load(f)
             except Exception as e:
-                raise RuntimeError(
-                    f"Cannot update unreadable configuration {self.config_path}: {e}"
-                ) from e
+                raise RuntimeError(f"Cannot update unreadable configuration {self.config_path}: {e}") from e
 
         # Update semantic search config
         if "semantic_search" not in full_config:
             full_config["semantic_search"] = {}
 
         full_config["semantic_search"]["update_config"] = self.update_config
+        library, identity, is_default = self._library_scope()
+        library_states = full_config["semantic_search"].setdefault("library_states", {})
+        state = library_states.setdefault(identity, {})
+        state["library_id"] = library.get("library_id", "")
+        state["library_type"] = library.get("library_type", "user")
+        collection_name = getattr(self.chroma_client, "collection_name", None)
+        if collection_name:
+            state["collection_name"] = collection_name
+        state["last_update"] = self.update_config.get("last_update")
         if last_sync_version is not None:
-            full_config["semantic_search"]["last_sync_version"] = int(last_sync_version)
+            state["last_sync_version"] = int(last_sync_version)
+            if is_default:
+                full_config["semantic_search"]["last_sync_version"] = int(last_sync_version)
         if indexed_fulltext is not None:
-            full_config["semantic_search"]["indexed_fulltext"] = (
-                indexed_fulltext
-            )
+            state["indexed_fulltext"] = indexed_fulltext
+            if is_default:
+                full_config["semantic_search"]["indexed_fulltext"] = indexed_fulltext
         if indexed_content_signature is not None:
-            full_config["semantic_search"]["indexed_content_signature"] = (
-                indexed_content_signature
-            )
+            state["indexed_content_signature"] = indexed_content_signature
+            if is_default:
+                full_config["semantic_search"]["indexed_content_signature"] = indexed_content_signature
 
         atomic_write_json(self.config_path, full_config, indent=2)
 
@@ -942,11 +983,7 @@ class ZoteroSemanticSearch:
         # but do not influence vector similarity.
         title = data.get("title", "")
         abstract = data.get("abstractNote", "")
-        return "\n\n".join(
-            part.strip()
-            for part in (title, abstract)
-            if part and part.strip()
-        )
+        return "\n\n".join(part.strip() for part in (title, abstract) if part and part.strip())
 
     def _create_annotation_document_text(self, data: dict[str, Any]) -> str:
         """Build the embedding text for an annotation item.
@@ -979,8 +1016,12 @@ class ZoteroSemanticSearch:
         """
         data = item.get("data", {})
 
+        library, identity, _ = self._library_scope()
         metadata = {
             "item_key": item.get("key", ""),
+            "library_identity": identity,
+            "library_id": library.get("library_id", ""),
+            "library_type": library.get("library_type", "user"),
             "item_type": data.get("itemType", ""),
             "title": data.get("title", ""),
             "date": data.get("date", ""),
@@ -990,9 +1031,7 @@ class ZoteroSemanticSearch:
             "publication": data.get("publicationTitle", ""),
             "url": data.get("url", ""),
             "doi": data.get("DOI", ""),
-            "embedding_metadata_sha256": _embedding_content_hash(
-                self._create_document_text(item).strip()
-            ),
+            "embedding_metadata_sha256": _embedding_content_hash(self._create_document_text(item).strip()),
         }
         # If fulltext was extracted (or attempted), mark it so incremental
         # updates don't keep re-trying items that failed extraction
@@ -1041,12 +1080,8 @@ class ZoteroSemanticSearch:
         items: list[dict[str, Any]],
     ) -> tuple[int, int]:
         """Refresh result metadata without changing embedding state or vectors."""
-        get_metadata = getattr(
-            self.chroma_client, "get_document_metadata", None
-        )
-        update_metadata = getattr(
-            self.chroma_client, "update_item_metadata", None
-        )
+        get_metadata = getattr(self.chroma_client, "get_document_metadata", None)
+        update_metadata = getattr(self.chroma_client, "update_item_metadata", None)
         if not callable(get_metadata) or not callable(update_metadata):
             return 0, 0
 
@@ -1060,10 +1095,7 @@ class ZoteroSemanticSearch:
             if not existing:
                 continue
             current = self._create_metadata(item)
-            updates = {
-                key: current.get(key, "")
-                for key in _IMMEDIATE_METADATA_FIELDS
-            }
+            updates = {key: current.get(key, "") for key in _IMMEDIATE_METADATA_FIELDS}
             if all(existing.get(key, "") == value for key, value in updates.items()):
                 continue
             updated_records = update_metadata(item_key, updates)
@@ -1080,10 +1112,7 @@ class ZoteroSemanticSearch:
         chroma_client: ChromaClient | None = None,
         force_rebuild: bool = False,
         retry_failed_fulltext: bool = False,
-        pre_extraction_callback: Callable[
-            [list[dict[str, Any]], set[str], set[str]], None
-        ]
-        | None = None,
+        pre_extraction_callback: Callable[[list[dict[str, Any]], set[str], set[str]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Get canonical API metadata with optional local full text.
@@ -1126,10 +1155,7 @@ class ZoteroSemanticSearch:
         chroma_client: ChromaClient | None = None,
         force_rebuild: bool = False,
         retry_failed_fulltext: bool = False,
-        pre_extraction_callback: Callable[
-            [list[dict[str, Any]], set[str], set[str]], None
-        ]
-        | None = None,
+        pre_extraction_callback: Callable[[list[dict[str, Any]], set[str], set[str]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Get items from local Zotero database.
@@ -1152,9 +1178,7 @@ class ZoteroSemanticSearch:
             self._last_api_metadata_snapshot_complete = False
             try:
                 api_metadata_by_key = {
-                    item.get("key", ""): item
-                    for item in self._get_items_from_api()
-                    if item.get("key")
+                    item.get("key", ""): item for item in self._get_items_from_api() if item.get("key")
                 }
                 self._last_api_metadata_snapshot_complete = True
             except Exception as e:
@@ -1191,17 +1215,32 @@ class ZoteroSemanticSearch:
                     db_path=zotero_db_path, pdf_max_pages=pdf_max_pages, pdf_timeout=pdf_timeout
                 ) as reader,
             ):
+                library, _, _ = self._library_scope()
+                sqlite_library_id = reader.resolve_library_id(
+                    library.get("library_id", ""),
+                    library.get("library_type", "user"),
+                )
+                if sqlite_library_id is None:
+                    raise RuntimeError(
+                        "The active Zotero library is not present in the local "
+                        "SQLite snapshot; refusing an unscoped semantic scan."
+                    )
                 # Capture the snapshot's full key set on the SAME connection
                 # this scan uses. The staleness check after the (potentially
                 # long) extraction must compare against what this scan could
                 # actually see — a fresh read taken later could already
                 # include rows from a WAL checkpoint that landed mid-scan.
-                self._last_scan_snapshot_keys = reader.get_all_item_keys()
+                self._last_scan_snapshot_keys = reader.get_all_item_keys(sqlite_library_id)
                 # Phase 1: fetch metadata only (fast)
                 sys.stderr.write("Scanning local Zotero database for items...\n")
                 if collection_keys:
                     sys.stderr.write(f"Filtering to collections: {collection_keys}\n")
-                local_items = reader.get_items_with_text(limit=limit, include_fulltext=False, collection_keys=collection_keys)
+                local_items = reader.get_items_with_text(
+                    limit=limit,
+                    include_fulltext=False,
+                    collection_keys=collection_keys,
+                    library_id=sqlite_library_id,
+                )
                 candidate_count = len(local_items)
                 sys.stderr.write(f"Found {candidate_count} candidate items.\n")
 
@@ -1327,9 +1366,7 @@ class ZoteroSemanticSearch:
                         # Build display string: Author (Year) — Title
                         title = getattr(it, "title", "") or ""
                         creators = getattr(it, "creators", "") or ""
-                        canonical_data = api_metadata_by_key.get(
-                            it.key, {}
-                        ).get("data", {})
+                        canonical_data = api_metadata_by_key.get(it.key, {}).get("data", {})
                         publication_date = canonical_data.get("date", "")
                         first_author = ""
                         if creators:
@@ -1354,10 +1391,7 @@ class ZoteroSemanticSearch:
                                 status_parts.append(f"{extracted} extracted")
                             status = f" ({', '.join(status_parts)})" if status_parts else ""
                             eta = _format_eta(extraction_eta.estimate(item_idx - 1))
-                            prefix = (
-                                f"  Processing {item_idx}/{total_local}{status} "
-                                f"| ETA {eta} — "
-                            )
+                            prefix = f"  Processing {item_idx}/{total_local}{status} | ETA {eta} — "
                             line = f"{prefix}{display or 'working...'}"
                             _write_progress_line(sys.stderr, line)
                         except Exception:
@@ -1365,30 +1399,20 @@ class ZoteroSemanticSearch:
 
                         should_extract = True
 
-                        local_attachment_rows = reader.get_fulltext_meta_for_item(
-                            it.item_id
-                        )
-                        local_attachment_keys = {
-                            key for key, _path, _ctype in local_attachment_rows
-                        }
+                        local_attachment_rows = reader.get_fulltext_meta_for_item(it.item_id)
+                        local_attachment_keys = {key for key, _path, _ctype in local_attachment_rows}
                         api_attachment_map = self._last_api_attachment_keys_by_parent
                         allowed_attachment_keys: set[str] | None = None
                         if api_attachment_map is not None:
                             api_attachment_keys = api_attachment_map.get(it.key, set())
-                            missing_local_keys = (
-                                api_attachment_keys - local_attachment_keys
-                            )
+                            missing_local_keys = api_attachment_keys - local_attachment_keys
                             if missing_local_keys:
                                 self._last_scan_attachment_snapshot_complete = False
-                                _deferred_attachments.append(
-                                    (display or f"item {it.key}", len(missing_local_keys))
-                                )
+                                _deferred_attachments.append((display or f"item {it.key}", len(missing_local_keys)))
                                 continue
                             # Exclude SQLite rows that the live Zotero API has
                             # already deleted, even before WAL checkpointing.
-                            allowed_attachment_keys = (
-                                local_attachment_keys & api_attachment_keys
-                            )
+                            allowed_attachment_keys = local_attachment_keys & api_attachment_keys
 
                         # Current active attachment-key set, stored in metadata so a
                         # later run can detect attachment changes. Attaching a
@@ -1397,21 +1421,15 @@ class ZoteroSemanticSearch:
                         active_attachment_rows = (
                             local_attachment_rows
                             if allowed_attachment_keys is None
-                            else reader.get_fulltext_meta_for_item(
-                                it.item_id, allowed_attachment_keys
-                            )
+                            else reader.get_fulltext_meta_for_item(it.item_id, allowed_attachment_keys)
                         )
-                        att_keys = ",".join(
-                            sorted(k for k, _p, _c in active_attachment_rows)
-                        )
+                        att_keys = ",".join(sorted(k for k, _p, _c in active_attachment_rows))
                         it._attachment_keys = att_keys
                         if hasattr(reader, "get_attachment_signature"):
                             attachment_signature = (
                                 reader.get_attachment_signature(it.item_id)
                                 if allowed_attachment_keys is None
-                                else reader.get_attachment_signature(
-                                    it.item_id, allowed_attachment_keys
-                                )
+                                else reader.get_attachment_signature(it.item_id, allowed_attachment_keys)
                             )
                         else:
                             # Compatibility for custom/legacy readers. The key
@@ -1429,16 +1447,11 @@ class ZoteroSemanticSearch:
                                 chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
                                 local_has_fulltext = bool(att_keys)
                                 chroma_date = existing_metadata.get("date_modified", "")
-                                item_date = (
-                                    canonical_data.get("dateModified")
-                                    or getattr(it, "date_modified", "")
-                                    or ""
-                                )
+                                item_date = canonical_data.get("dateModified") or getattr(it, "date_modified", "") or ""
                                 metadata_changed = chroma_date != item_date
                                 stored_signature = existing_metadata.get("attachment_signature")
                                 signature_changed = (
-                                    stored_signature is not None
-                                    and stored_signature != attachment_signature
+                                    stored_signature is not None and stored_signature != attachment_signature
                                 )
                                 layout_changed = self._index_layout_changed(existing_metadata)
 
@@ -1451,9 +1464,7 @@ class ZoteroSemanticSearch:
                                         updated_existing += 1
                                         attachment_unchanged = False
                                     else:
-                                        stored_att_keys = existing_metadata.get(
-                                            "attachment_keys"
-                                        )
+                                        stored_att_keys = existing_metadata.get("attachment_keys")
                                         attachment_unchanged = (
                                             stored_signature == attachment_signature
                                             if stored_signature is not None
@@ -1468,15 +1479,11 @@ class ZoteroSemanticSearch:
                                         # Nothing changed since the failure — don't retry
                                         should_extract = False
                                         skipped_existing += 1
-                                        reason = existing_metadata.get(
-                                            "fulltext_error"
-                                        ) or (
+                                        reason = existing_metadata.get("fulltext_error") or (
                                             "The previous attempt returned no usable text; "
                                             "a detailed reason was not recorded."
                                         )
-                                        _skipped_failed.append(
-                                            (display or f"item {it.key}", reason)
-                                        )
+                                        _skipped_failed.append((display or f"item {it.key}", reason))
                                     elif not retry_failed_fulltext:
                                         # Item or its attachments changed since last
                                         # failure (legacy records without attachment_keys
@@ -1495,12 +1502,7 @@ class ZoteroSemanticSearch:
                                     else:
                                         should_extract = False
                                         skipped_existing += 1
-                                elif (
-                                    metadata_changed
-                                    or signature_changed
-                                    or local_has_fulltext
-                                    or layout_changed
-                                ):
+                                elif metadata_changed or signature_changed or local_has_fulltext or layout_changed:
                                     # Metadata changed, attachment content changed, or
                                     # a metadata-only item gained extractable content.
                                     updated_existing += 1
@@ -1515,19 +1517,13 @@ class ZoteroSemanticSearch:
                                 text = (
                                     reader.extract_fulltext_for_item(it.item_id)
                                     if allowed_attachment_keys is None
-                                    else reader.extract_fulltext_for_item(
-                                        it.item_id, allowed_attachment_keys
-                                    )
+                                    else reader.extract_fulltext_for_item(it.item_id, allowed_attachment_keys)
                                 )
                                 # Circuit breaker: stop PDF extraction after consecutive timeouts
                                 if isinstance(text, tuple) and len(text) == 2 and text[1] == "timeout":
-                                    failure_reason = (
-                                        f"PDF extraction timed out after {pdf_timeout} seconds."
-                                    )
+                                    failure_reason = f"PDF extraction timed out after {pdf_timeout} seconds."
                                     it._fulltext_error = failure_reason
-                                    _failed_extractions.append(
-                                        (display or f"item {it.key}", failure_reason)
-                                    )
+                                    _failed_extractions.append((display or f"item {it.key}", failure_reason))
                                     consecutive_timeouts += 1
                                     if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
                                         logger.warning(
@@ -1555,9 +1551,7 @@ class ZoteroSemanticSearch:
                                             it.fulltext, it.fulltext_source = text[0], text[1]
                                         else:
                                             it.fulltext = text
-                                        details = getattr(
-                                            reader, "last_extraction_details", None
-                                        ) or {}
+                                        details = getattr(reader, "last_extraction_details", None) or {}
                                         page_count = details.get("page_count")
                                         page_cap = details.get("page_cap")
                                         if (
@@ -1583,9 +1577,7 @@ class ZoteroSemanticSearch:
                                             else "No candidate full-text attachment was available."
                                         )
                                         it._fulltext_error = failure_reason
-                                        _failed_extractions.append(
-                                            (display or f"item {it.key}", failure_reason)
-                                        )
+                                        _failed_extractions.append((display or f"item {it.key}", failure_reason))
                             extracted += 1
                             items_to_process.append(it)
 
@@ -1602,15 +1594,9 @@ class ZoteroSemanticSearch:
                             parts.append(f"{skipped_existing} already up to date")
                         sys.stderr.write(", ".join(parts) + "\n")
                         if updated_existing > 0:
-                            sys.stderr.write(
-                                f"  ({updated_existing} existing items selected "
-                                "for full-text refresh)\n"
-                            )
+                            sys.stderr.write(f"  ({updated_existing} existing items selected for full-text refresh)\n")
                         if _failed_extractions:
-                            sys.stderr.write(
-                                f"  Full-text extraction failed for "
-                                f"{len(_failed_extractions)} item(s):\n"
-                            )
+                            sys.stderr.write(f"  Full-text extraction failed for {len(_failed_extractions)} item(s):\n")
                             for name, reason in _failed_extractions:
                                 sys.stderr.write(f"    - {name}\n")
                                 sys.stderr.write(f"      Reason: {reason}\n")
@@ -1620,14 +1606,9 @@ class ZoteroSemanticSearch:
                                 f"extraction for {len(_truncated_pdfs)} item(s):\n"
                             )
                             for name, page_count, page_cap in _truncated_pdfs[:10]:
-                                sys.stderr.write(
-                                    f"    - {name} ({page_count} pages; indexed first "
-                                    f"{page_cap})\n"
-                                )
+                                sys.stderr.write(f"    - {name} ({page_count} pages; indexed first {page_cap})\n")
                             if len(_truncated_pdfs) > 10:
-                                sys.stderr.write(
-                                    f"    ... and {len(_truncated_pdfs) - 10} more\n"
-                                )
+                                sys.stderr.write(f"    ... and {len(_truncated_pdfs) - 10} more\n")
                         if _deferred_attachments:
                             sys.stderr.write(
                                 f"  Warning: deferred {len(_deferred_attachments)} item(s) "
@@ -1635,16 +1616,11 @@ class ZoteroSemanticSearch:
                                 "the local SQLite snapshot:\n"
                             )
                             for name, count in _deferred_attachments[:10]:
-                                sys.stderr.write(
-                                    f"    - {name} ({count} pending attachment(s))\n"
-                                )
+                                sys.stderr.write(f"    - {name} ({count} pending attachment(s))\n")
                             if len(_deferred_attachments) > 10:
-                                sys.stderr.write(
-                                    f"    ... and {len(_deferred_attachments) - 10} more\n"
-                                )
+                                sys.stderr.write(f"    ... and {len(_deferred_attachments) - 10} more\n")
                             sys.stderr.write(
-                                "  Their existing index records were left unchanged; "
-                                "the next update will retry them.\n"
+                                "  Their existing index records were left unchanged; the next update will retry them.\n"
                             )
                         if _skipped_failed:
                             sys.stderr.write(
@@ -1711,41 +1687,24 @@ class ZoteroSemanticSearch:
         else:
             data = {
                 "key": item.key,
-                "itemType": getattr(item, "item_type", None)
-                or "journalArticle",
+                "itemType": getattr(item, "item_type", None) or "journalArticle",
                 "title": item.title or "",
                 "abstractNote": item.abstract or "",
                 "extra": item.extra or "",
                 "dateAdded": item.date_added,
                 "dateModified": item.date_modified,
-                "creators": (
-                    self._parse_creators_string(item.creators)
-                    if item.creators
-                    else []
-                ),
+                "creators": (self._parse_creators_string(item.creators) if item.creators else []),
             }
             if item.notes:
                 data["notes"] = item.notes
             merged = {"key": item.key, "version": 0, "data": data}
 
-        data["fulltext"] = (
-            getattr(item, "fulltext", None) or ""
-            if extract_fulltext
-            else ""
-        )
-        data["fulltextSource"] = (
-            getattr(item, "fulltext_source", None) or ""
-            if extract_fulltext
-            else ""
-        )
-        data["fulltext_attempted"] = getattr(
-            item, "_fulltext_attempted", False
-        )
+        data["fulltext"] = getattr(item, "fulltext", None) or "" if extract_fulltext else ""
+        data["fulltextSource"] = getattr(item, "fulltext_source", None) or "" if extract_fulltext else ""
+        data["fulltext_attempted"] = getattr(item, "_fulltext_attempted", False)
         if (att := getattr(item, "_attachment_keys", None)) is not None:
             data["attachmentKeys"] = att
-        if (
-            signature := getattr(item, "_attachment_signature", None)
-        ) is not None:
+        if (signature := getattr(item, "_attachment_signature", None)) is not None:
             data["attachmentSignature"] = signature
         if (error := getattr(item, "_fulltext_error", None)) is not None:
             data["fulltextError"] = error
@@ -1778,9 +1737,7 @@ class ZoteroSemanticSearch:
 
         return creators
 
-    def _get_items_from_api(
-        self, limit: int | None = None
-    ) -> list[dict[str, Any]]:
+    def _get_items_from_api(self, limit: int | None = None) -> list[dict[str, Any]]:
         """
         Get canonical item metadata from the Zotero API.
 
@@ -1827,16 +1784,13 @@ class ZoteroSemanticSearch:
                 parent_key = data.get("parentItem")
                 attachment_key = item.get("key") or data.get("key")
                 if parent_key and attachment_key and not data.get("deleted", False):
-                    attachment_keys_by_parent.setdefault(parent_key, set()).add(
-                        attachment_key
-                    )
+                    attachment_keys_by_parent.setdefault(parent_key, set()).add(attachment_key)
 
             # Child artifacts are represented only through their parent item.
             filtered_items = [
                 item
                 for item in items
-                if item.get("data", {}).get("itemType")
-                not in {"attachment", "note", "annotation"}
+                if item.get("data", {}).get("itemType") not in {"attachment", "note", "annotation"}
             ]
 
             all_items.extend(filtered_items)
@@ -1853,9 +1807,7 @@ class ZoteroSemanticSearch:
         logger.info(f"Retrieved {len(all_items)} items from API")
         return all_items
 
-    def _get_changed_items_from_api(
-        self, since_version: int
-    ) -> tuple[list[dict[str, Any]], set[str] | None]:
+    def _get_changed_items_from_api(self, since_version: int) -> tuple[list[dict[str, Any]], set[str] | None]:
         """Fetch only items changed in the Zotero library since a given version.
 
         Uses pyzotero's `item_versions(since=V)` to discover changed top-level
@@ -1942,9 +1894,7 @@ class ZoteroSemanticSearch:
             if parent:
                 changed_items_by_key[parent_key] = parent
 
-        return list(changed_items_by_key.values()), (
-            current_keys if discovery_complete else None
-        )
+        return list(changed_items_by_key.values()), (current_keys if discovery_complete else None)
 
     def _verify_local_snapshot_version(self, target_sync_version: int) -> int | None:
         """Decide whether the local sqlite snapshot supports promoting the
@@ -1982,18 +1932,13 @@ class ZoteroSemanticSearch:
                 if not zotero_db_path and self.config_path and os.path.exists(self.config_path):
                     try:
                         with open(self.config_path) as f:
-                            zotero_db_path = (
-                                json.load(f).get("semantic_search", {}).get("zotero_db_path")
-                            )
+                            zotero_db_path = json.load(f).get("semantic_search", {}).get("zotero_db_path")
                     except Exception:
                         pass
                 with LocalZoteroReader(db_path=zotero_db_path) as reader:
                     snapshot_keys = reader.get_all_item_keys()
         except Exception as e:
-            logger.warning(
-                f"Could not verify local snapshot completeness ({e}); "
-                "keeping previous sync watermark."
-            )
+            logger.warning(f"Could not verify local snapshot completeness ({e}); keeping previous sync watermark.")
             return None
 
         missing = api_keys - snapshot_keys
@@ -2018,9 +1963,7 @@ class ZoteroSemanticSearch:
         for key in to_delete_keys:
             if hasattr(self.chroma_client, "delete_item_records"):
                 self.chroma_client.delete_item_records(key)
-            elif self._chunking_enabled and hasattr(
-                self.chroma_client, "delete_item_chunks"
-            ):
+            elif self._chunking_enabled and hasattr(self.chroma_client, "delete_item_chunks"):
                 self.chroma_client.delete_item_chunks(key)
             else:
                 self.chroma_client.delete_documents([key])
@@ -2041,9 +1984,7 @@ class ZoteroSemanticSearch:
         preserved_items = 0
         preserved_records = 0
         snapshot_complete = True
-        update_item_metadata = getattr(
-            self.chroma_client, "update_item_metadata", None
-        )
+        update_item_metadata = getattr(self.chroma_client, "update_item_metadata", None)
         if not callable(update_item_metadata):
             return items, 0, 0, True
 
@@ -2052,10 +1993,7 @@ class ZoteroSemanticSearch:
             current = self._create_metadata(item)
             updated_records = update_item_metadata(
                 item.get("key", ""),
-                {
-                    key: current.get(key, "")
-                    for key in _IMMEDIATE_METADATA_FIELDS
-                },
+                {key: current.get(key, "") for key in _IMMEDIATE_METADATA_FIELDS},
             )
             if not updated_records:
                 return False
@@ -2066,11 +2004,7 @@ class ZoteroSemanticSearch:
         fulltext_items = []
         for item in items:
             item_key = item.get("key", "")
-            existing = (
-                self.chroma_client.get_document_metadata(item_key)
-                if item_key
-                else None
-            )
+            existing = self.chroma_client.get_document_metadata(item_key) if item_key else None
             if existing and existing.get("has_fulltext") is True:
                 fulltext_items.append((item, existing))
             else:
@@ -2093,9 +2027,7 @@ class ZoteroSemanticSearch:
         try:
             if self.config_path and os.path.exists(self.config_path):
                 with open(self.config_path) as config_file:
-                    semantic_config = json.load(config_file).get(
-                        "semantic_search", {}
-                    )
+                    semantic_config = json.load(config_file).get("semantic_search", {})
                 extraction_config = semantic_config.get("extraction", {})
                 pdf_max_pages = extraction_config.get("pdf_max_pages")
                 pdf_timeout = extraction_config.get("pdf_timeout", 30)
@@ -2125,18 +2057,13 @@ class ZoteroSemanticSearch:
 
                 try:
                     if self._last_api_attachment_keys_by_parent is not None:
-                        api_attachment_keys = set(
-                            self._last_api_attachment_keys_by_parent.get(
-                                item_key, set()
-                            )
-                        )
+                        api_attachment_keys = set(self._last_api_attachment_keys_by_parent.get(item_key, set()))
                     else:
                         children = self.zotero_client.children(item_key) or []
                         api_attachment_keys = {
                             child.get("key") or child.get("data", {}).get("key")
                             for child in children
-                            if child.get("data", {}).get("itemType")
-                            == "attachment"
+                            if child.get("data", {}).get("itemType") == "attachment"
                             and not child.get("data", {}).get("deleted", False)
                         }
                         api_attachment_keys.discard(None)
@@ -2153,10 +2080,7 @@ class ZoteroSemanticSearch:
                     continue
 
                 local_attachment_keys = {
-                    key
-                    for key, _path, _ctype in reader.get_fulltext_meta_for_item(
-                        local_item.item_id
-                    )
+                    key for key, _path, _ctype in reader.get_fulltext_meta_for_item(local_item.item_id)
                 }
                 if api_attachment_keys - local_attachment_keys:
                     snapshot_complete = False
@@ -2164,22 +2088,16 @@ class ZoteroSemanticSearch:
                         remaining.append(item)
                     continue
 
-                allowed_attachment_keys = (
-                    local_attachment_keys & api_attachment_keys
-                )
+                allowed_attachment_keys = local_attachment_keys & api_attachment_keys
                 signature = reader.get_attachment_signature(
                     local_item.item_id,
                     allowed_attachment_keys,
                 )
                 if existing.get("attachment_signature") == signature:
-                    current_metadata_hash = _embedding_content_hash(
-                        self._create_document_text(item).strip()
-                    )
+                    current_metadata_hash = _embedding_content_hash(self._create_document_text(item).strip())
                     metadata_payload_changed = (
-                        existing.get("fulltext_source")
-                        not in _SELF_CONTAINED_FULLTEXT_SOURCES
-                        and existing.get("embedding_metadata_sha256")
-                        != current_metadata_hash
+                        existing.get("fulltext_source") not in _SELF_CONTAINED_FULLTEXT_SOURCES
+                        and existing.get("embedding_metadata_sha256") != current_metadata_hash
                     )
                     if not metadata_payload_changed:
                         if not preserve(item):
@@ -2190,11 +2108,7 @@ class ZoteroSemanticSearch:
                     local_item.item_id,
                     allowed_attachment_keys,
                 )
-                if (
-                    isinstance(extracted, tuple)
-                    and len(extracted) == 2
-                    and extracted[1] == "timeout"
-                ):
+                if isinstance(extracted, tuple) and len(extracted) == 2 and extracted[1] == "timeout":
                     snapshot_complete = False
                     if not preserve(item):
                         remaining.append(item)
@@ -2205,20 +2119,14 @@ class ZoteroSemanticSearch:
                     "data": dict(item.get("data", {})),
                 }
                 data = refreshed["data"]
-                data["attachmentKeys"] = ",".join(
-                    sorted(allowed_attachment_keys)
-                )
+                data["attachmentKeys"] = ",".join(sorted(allowed_attachment_keys))
                 data["attachmentSignature"] = signature
                 if extracted:
                     data["fulltext"], data["fulltextSource"] = extracted
                     details = getattr(reader, "last_extraction_details", None) or {}
                     page_count = details.get("page_count")
                     page_cap = details.get("page_cap")
-                    if (
-                        isinstance(page_count, int)
-                        and isinstance(page_cap, int)
-                        and page_count > page_cap
-                    ):
+                    if isinstance(page_count, int) and isinstance(page_cap, int) and page_count > page_cap:
                         truncated_pdfs.append(
                             (
                                 data.get("title") or item_key,
@@ -2252,9 +2160,7 @@ class ZoteroSemanticSearch:
                 f"for {len(truncated_pdfs)} changed item(s):\n"
             )
             for title, page_count, page_cap in truncated_pdfs[:10]:
-                sys.stderr.write(
-                    f"  - {title} ({page_count} pages; indexed first {page_cap})\n"
-                )
+                sys.stderr.write(f"  - {title} ({page_count} pages; indexed first {page_cap})\n")
 
         return remaining, preserved_items, preserved_records, snapshot_complete
 
@@ -2309,37 +2215,20 @@ class ZoteroSemanticSearch:
         stats["processed_items"] += prepare_stats["processed"]
         stats["skipped_items"] += prepare_stats["skipped"]
         stats["errors"] += prepare_stats["errors"]
-        stats["reused_embeddings"] = stats.get("reused_embeddings", 0) + (
-            prepare_stats["reused_embeddings"]
-        )
+        stats["reused_embeddings"] = stats.get("reused_embeddings", 0) + (prepare_stats["reused_embeddings"])
 
         expected_ids_by_item: dict[str, list[str]] = {}
         for doc_id in prepared.expected_ids:
             parent = doc_id.split("#", 1)[0]
             expected_ids_by_item.setdefault(parent, []).append(doc_id)
-        expected_ids_by_item = {
-            parent: sorted(ids)
-            for parent, ids in expected_ids_by_item.items()
-        }
-        get_item_hashes = getattr(
-            self.chroma_client, "get_item_embedding_hashes", None
-        )
+        expected_ids_by_item = {parent: sorted(ids) for parent, ids in expected_ids_by_item.items()}
+        get_item_hashes = getattr(self.chroma_client, "get_item_embedding_hashes", None)
         baseline_embedding_hashes_by_item = (
-            {
-                parent: get_item_hashes(parent)
-                for parent in expected_ids_by_item
-            }
-            if callable(get_item_hashes)
-            else {}
+            {parent: get_item_hashes(parent) for parent in expected_ids_by_item} if callable(get_item_hashes) else {}
         )
-        get_item_record_hashes = getattr(
-            self.chroma_client, "get_item_record_hashes", None
-        )
+        get_item_record_hashes = getattr(self.chroma_client, "get_item_record_hashes", None)
         baseline_record_hashes_by_item = (
-            {
-                parent: get_item_record_hashes(parent)
-                for parent in expected_ids_by_item
-            }
+            {parent: get_item_record_hashes(parent) for parent in expected_ids_by_item}
             if callable(get_item_record_hashes)
             else {}
         )
@@ -2359,21 +2248,11 @@ class ZoteroSemanticSearch:
                         set(expected_ids),
                     )
             self.update_config["last_update"] = datetime.now().isoformat()
-            completed_sync_version = (
-                target_sync_version if stats["errors"] == 0 else None
-            )
+            completed_sync_version = target_sync_version if stats["errors"] == 0 else None
             self._save_update_config(
                 last_sync_version=completed_sync_version,
-                indexed_fulltext=(
-                    indexed_fulltext_state
-                    if completed_sync_version is not None
-                    else None
-                ),
-                indexed_content_signature=(
-                    _CONTENT_CONTRACT_SIGNATURE
-                    if completed_sync_version is not None
-                    else None
-                ),
+                indexed_fulltext=(indexed_fulltext_state if completed_sync_version is not None else None),
+                indexed_content_signature=(_CONTENT_CONTRACT_SIGNATURE if completed_sync_version is not None else None),
             )
             return stats
 
@@ -2395,9 +2274,7 @@ class ZoteroSemanticSearch:
             fulltext=indexed_fulltext_state,
             content_signature=_CONTENT_CONTRACT_SIGNATURE,
             expected_ids_by_item=expected_ids_by_item,
-            baseline_embedding_hashes_by_item=(
-                baseline_embedding_hashes_by_item
-            ),
+            baseline_embedding_hashes_by_item=(baseline_embedding_hashes_by_item),
             baseline_record_hashes_by_item=baseline_record_hashes_by_item,
             metadata_only_records=[
                 {"id": doc_id, "metadata": metadata}
@@ -2427,12 +2304,8 @@ class ZoteroSemanticSearch:
         if not callable(prune_orphans):
             return
         cleanup = prune_orphans()
-        stats["orphan_segment_directories_pruned"] = int(
-            cleanup.get("removed_directories", 0)
-        )
-        stats["orphan_segment_bytes_pruned"] = int(
-            cleanup.get("removed_bytes", 0)
-        )
+        stats["orphan_segment_directories_pruned"] = int(cleanup.get("removed_directories", 0))
+        stats["orphan_segment_bytes_pruned"] = int(cleanup.get("removed_bytes", 0))
         stats["orphan_segment_cleanup_errors"] = int(cleanup.get("errors", 0))
 
     def update_database(
@@ -2531,13 +2404,9 @@ class ZoteroSemanticSearch:
             stats["fulltext"] = fulltext
             indexed_fulltext = self._load_indexed_fulltext()
             indexed_content_signature = self._load_indexed_content_signature()
-            collection_has_items = (
-                int(self.chroma_client.get_collection_info().get("count", 0)) > 0
-            )
+            collection_has_items = int(self.chroma_client.get_collection_info().get("count", 0)) > 0
             indexed_fulltext_state = (
-                fulltext
-                if force_full_rebuild or not collection_has_items
-                else indexed_fulltext is True or fulltext
+                fulltext if force_full_rebuild or not collection_has_items else indexed_fulltext is True or fulltext
             )
             content_mismatch = (
                 not force_full_rebuild
@@ -2559,9 +2428,7 @@ class ZoteroSemanticSearch:
                 if self.config_path and os.path.exists(self.config_path):
                     with open(self.config_path) as config_file:
                         configured_collection_keys = (
-                            json.load(config_file)
-                            .get("semantic_search", {})
-                            .get("collection_keys")
+                            json.load(config_file).get("semantic_search", {}).get("collection_keys")
                         )
             except Exception:
                 pass
@@ -2582,14 +2449,9 @@ class ZoteroSemanticSearch:
                 raise ValueError("embedding_concurrency must be at least 1")
             if embedding_concurrency > 1:
                 if use_openai_batch:
-                    raise ValueError(
-                        "embedding_concurrency cannot be combined with OpenAI Batch mode"
-                    )
+                    raise ValueError("embedding_concurrency cannot be combined with OpenAI Batch mode")
                 if self.chroma_client.embedding_model != "openai":
-                    raise ValueError(
-                        "embedding_concurrency above 1 requires realtime "
-                        "OpenAI-compatible embeddings"
-                    )
+                    raise ValueError("embedding_concurrency above 1 requires realtime OpenAI-compatible embeddings")
                 stats["embedding_concurrency"] = embedding_concurrency
                 logger.info(
                     "Using %s concurrent realtime embedding batches",
@@ -2609,10 +2471,7 @@ class ZoteroSemanticSearch:
             # fulltext only), not a test limit, and a known prior sync version.
             last_sync_version = self._load_last_sync_version() if not force_full_rebuild else 0
             use_incremental = (
-                not force_full_rebuild
-                and not use_local_source
-                and limit is None
-                and last_sync_version > 0
+                not force_full_rebuild and not use_local_source and limit is None and last_sync_version > 0
             )
 
             target_sync_version: int | None = None
@@ -2637,11 +2496,7 @@ class ZoteroSemanticSearch:
                 self._save_update_config(
                     last_sync_version=target_sync_version,
                     indexed_fulltext=indexed_fulltext_state,
-                    indexed_content_signature=(
-                        None
-                        if content_mismatch
-                        else _CONTENT_CONTRACT_SIGNATURE
-                    ),
+                    indexed_content_signature=(None if content_mismatch else _CONTENT_CONTRACT_SIGNATURE),
                 )
                 end_time = datetime.now()
                 stats["duration"] = str(end_time - start_time)
@@ -2649,9 +2504,7 @@ class ZoteroSemanticSearch:
                 return stats
 
             if use_incremental:
-                all_items, current_library_keys = self._get_changed_items_from_api(
-                    since_version=last_sync_version
-                )
+                all_items, current_library_keys = self._get_changed_items_from_api(since_version=last_sync_version)
                 # Delete collection entries that are no longer present in the
                 # library. Map any chunk ids (``<key>#<n>``) back to item keys
                 # so deletion works identically whether or not chunking is on.
@@ -2672,8 +2525,7 @@ class ZoteroSemanticSearch:
                                 pass
                     except Exception as e:
                         raise RuntimeError(
-                            "Pruning removed semantic-index items failed; "
-                            "later refresh phases were not started"
+                            "Pruning removed semantic-index items failed; later refresh phases were not started"
                         ) from e
             else:
                 # Full scan: bootstrap or forced rebuild.
@@ -2703,15 +2555,10 @@ class ZoteroSemanticSearch:
                     if (
                         limit is None
                         and target_sync_version is not None
-                        and self._verify_local_snapshot_version(
-                            target_sync_version
-                        )
-                        is not None
+                        and self._verify_local_snapshot_version(target_sync_version) is not None
                     ):
                         prune_keys = indexable_keys
-                    elif getattr(
-                        self, "_last_api_metadata_snapshot_complete", False
-                    ):
+                    elif getattr(self, "_last_api_metadata_snapshot_complete", False):
                         # Even when SQLite lags, the complete API parent-key
                         # set safely identifies true Zotero deletions. It does
                         # not enforce local collection/dedup filters until the
@@ -2723,21 +2570,14 @@ class ZoteroSemanticSearch:
                         if deleted:
                             stats["deleted_items"] += deleted
                             sys.stderr.write(
-                                f"\nDeleted {deleted} items no longer present "
-                                "in the current Zotero corpus.\n"
+                                f"\nDeleted {deleted} items no longer present in the current Zotero corpus.\n"
                             )
 
-                    refreshed_items, refreshed_records = (
-                        self._refresh_bibliographic_metadata(preview_items)
-                    )
+                    refreshed_items, refreshed_records = self._refresh_bibliographic_metadata(preview_items)
                     if refreshed_items:
-                        stats["metadata_refreshed_items"] = (
-                            stats.get("metadata_refreshed_items", 0)
-                            + refreshed_items
-                        )
+                        stats["metadata_refreshed_items"] = stats.get("metadata_refreshed_items", 0) + refreshed_items
                         stats["metadata_refreshed_records"] = (
-                            stats.get("metadata_refreshed_records", 0)
-                            + refreshed_records
+                            stats.get("metadata_refreshed_records", 0) + refreshed_records
                         )
                         sys.stderr.write(
                             f"\nRefreshed bibliographic metadata for "
@@ -2753,17 +2593,13 @@ class ZoteroSemanticSearch:
                     chroma_client=self.chroma_client if not force_full_rebuild else None,
                     force_rebuild=force_full_rebuild,
                     retry_failed_fulltext=retry_failed_fulltext,
-                    pre_extraction_callback=(
-                        run_local_prephase if use_local_source else None
-                    ),
+                    pre_extraction_callback=(run_local_prephase if use_local_source else None),
                 )
                 # The local-extraction scan may lag behind the API version
                 # captured above (immutable sqlite reads skip WAL contents);
                 # only promote the watermark if the snapshot was complete.
                 if use_local_source and target_sync_version is not None:
-                    verified_sync_version = self._verify_local_snapshot_version(
-                        target_sync_version
-                    )
+                    verified_sync_version = self._verify_local_snapshot_version(target_sync_version)
                     local_snapshot_complete = verified_sync_version is not None
                     target_sync_version = verified_sync_version
 
@@ -2780,9 +2616,7 @@ class ZoteroSemanticSearch:
                     and not local_prephase_complete
                 ):
                     try:
-                        deleted = self._delete_missing_index_items(
-                            self._last_scan_indexable_keys
-                        )
+                        deleted = self._delete_missing_index_items(self._last_scan_indexable_keys)
                         if deleted:
                             stats["deleted_items"] = deleted
                             try:
@@ -2798,29 +2632,17 @@ class ZoteroSemanticSearch:
                 # API full scans (bootstrap, watermark recovery, and similar
                 # non-incremental runs) are authoritative too. Prune before
                 # embedding so removed records never wait behind a long queue.
-                if (
-                    not use_local_source
-                    and not force_full_rebuild
-                    and limit is None
-                ):
+                if not use_local_source and not force_full_rebuild and limit is None:
                     try:
                         deleted = self._delete_missing_index_items(
-                            {
-                                item.get("key", "")
-                                for item in all_items
-                                if item.get("key")
-                            }
+                            {item.get("key", "") for item in all_items if item.get("key")}
                         )
                         if deleted:
                             stats["deleted_items"] = deleted
-                            sys.stderr.write(
-                                f"\nDeleted {deleted} items no longer present "
-                                "in Zotero.\n"
-                            )
+                            sys.stderr.write(f"\nDeleted {deleted} items no longer present in Zotero.\n")
                     except Exception as e:
                         raise RuntimeError(
-                            "Pruning removed semantic-index items failed; "
-                            "later refresh phases were not started"
+                            "Pruning removed semantic-index items failed; later refresh phases were not started"
                         ) from e
 
                 # A forced scan also has an authoritative corpus view. Prune
@@ -2829,11 +2651,7 @@ class ZoteroSemanticSearch:
                 # retained because the complete indexable-key set includes
                 # them; unverifiable SQLite snapshots never prune.
                 force_prune_keys: set[str] | None = None
-                if (
-                    force_full_rebuild
-                    and not force_clear
-                    and limit is None
-                ):
+                if force_full_rebuild and not force_clear and limit is None:
                     if use_local_source:
                         if (
                             local_snapshot_complete
@@ -2842,26 +2660,18 @@ class ZoteroSemanticSearch:
                         ):
                             force_prune_keys = self._last_scan_indexable_keys
                     else:
-                        force_prune_keys = {
-                            item.get("key", "")
-                            for item in all_items
-                            if item.get("key")
-                        }
+                        force_prune_keys = {item.get("key", "") for item in all_items if item.get("key")}
                 if force_prune_keys is not None:
                     try:
-                        deleted = self._delete_missing_index_items(
-                            force_prune_keys
-                        )
+                        deleted = self._delete_missing_index_items(force_prune_keys)
                         if deleted:
                             stats["deleted_items"] = deleted
                             sys.stderr.write(
-                                f"\nDeleted {deleted} items no longer present "
-                                "in the current Zotero corpus.\n"
+                                f"\nDeleted {deleted} items no longer present in the current Zotero corpus.\n"
                             )
                     except Exception as e:
                         raise RuntimeError(
-                            "Pruning removed semantic-index items failed; "
-                            "later refresh phases were not started"
+                            "Pruning removed semantic-index items failed; later refresh phases were not started"
                         ) from e
 
             preserved_fulltext_items = 0
@@ -2885,17 +2695,11 @@ class ZoteroSemanticSearch:
                         "refreshed Zotero metadata only.\n"
                     )
 
-            metadata_refreshed_items, metadata_refreshed_records = (
-                self._refresh_bibliographic_metadata(all_items)
-            )
+            metadata_refreshed_items, metadata_refreshed_records = self._refresh_bibliographic_metadata(all_items)
             if metadata_refreshed_items:
-                stats["metadata_refreshed_items"] = (
-                    stats.get("metadata_refreshed_items", 0)
-                    + metadata_refreshed_items
-                )
+                stats["metadata_refreshed_items"] = stats.get("metadata_refreshed_items", 0) + metadata_refreshed_items
                 stats["metadata_refreshed_records"] = (
-                    stats.get("metadata_refreshed_records", 0)
-                    + metadata_refreshed_records
+                    stats.get("metadata_refreshed_records", 0) + metadata_refreshed_records
                 )
                 sys.stderr.write(
                     f"\nRefreshed bibliographic metadata for "
@@ -2951,9 +2755,7 @@ class ZoteroSemanticSearch:
                         sys.stderr.write("  Run 'zotero-mcp openai-batch-status' to check progress.\n")
                         sys.stderr.write("  Run 'zotero-mcp openai-batch-import' after the batch completes.\n")
                     else:
-                        sys.stderr.write(
-                            "  No embedding batch needed; all vectors were reused.\n"
-                        )
+                        sys.stderr.write("  No embedding batch needed; all vectors were reused.\n")
                 except Exception:
                     pass
                 end_time = datetime.now()
@@ -3008,8 +2810,7 @@ class ZoteroSemanticSearch:
                 try:
                     _write_progress_line(
                         sys.stderr,
-                        f"  [{pct:3d}%] {seen_items}/{total} finished "
-                        f"| ETA {eta} | Last: {title or 'untitled item'}",
+                        f"  [{pct:3d}%] {seen_items}/{total} finished | ETA {eta} | Last: {title or 'untitled item'}",
                     )
                 except Exception:
                     pass
@@ -3018,9 +2819,7 @@ class ZoteroSemanticSearch:
                 stats["processed_items"] += batch_stats["processed"]
                 stats["added_items"] += batch_stats["added"]
                 stats["updated_items"] += batch_stats["updated"]
-                stats["reused_embeddings"] += batch_stats.get(
-                    "reused_embeddings", 0
-                )
+                stats["reused_embeddings"] += batch_stats.get("reused_embeddings", 0)
                 stats["skipped_items"] += batch_stats["skipped"]
                 stats["errors"] += batch_stats["errors"]
 
@@ -3095,11 +2894,7 @@ class ZoteroSemanticSearch:
                             item_started = time.monotonic()
                             if prepared.documents:
                                 try:
-                                    embeddings = (
-                                        self.chroma_client.embed_documents(
-                                            prepared.documents
-                                        )
-                                    )
+                                    embeddings = self.chroma_client.embed_documents(prepared.documents)
                                 except Exception as e:
                                     error = e
                             duration = time.monotonic() - item_started
@@ -3121,10 +2916,7 @@ class ZoteroSemanticSearch:
                     max_workers=embedding_concurrency,
                     thread_name_prefix="zotero-embedding",
                 ) as executor:
-                    workers = [
-                        executor.submit(embedding_worker)
-                        for _ in range(embedding_concurrency)
-                    ]
+                    workers = [executor.submit(embedding_worker) for _ in range(embedding_concurrency)]
                     producer = threading.Thread(
                         target=prepare_entries,
                         name="zotero-embedding-producer",
@@ -3134,10 +2926,7 @@ class ZoteroSemanticSearch:
 
                     completed_workers = 0
                     try:
-                        while (
-                            completed_workers < embedding_concurrency
-                            and not stop_pipeline.is_set()
-                        ):
+                        while completed_workers < embedding_concurrency and not stop_pipeline.is_set():
                             try:
                                 result = result_queue.get(timeout=0.1)
                             except Empty:
@@ -3167,13 +2956,10 @@ class ZoteroSemanticSearch:
 
                             if error is not None:
                                 logger.warning(
-                                    "Concurrent embedding entry failed (%s), "
-                                    "saving it for a sequential retry",
+                                    "Concurrent embedding entry failed (%s), saving it for a sequential retry",
                                     error,
                                 )
-                                prepared.stats["errors"] += prepared.stats[
-                                    "processed"
-                                ]
+                                prepared.stats["errors"] += prepared.stats["processed"]
                                 failed_concurrent_batches.append(prepared)
 
                             item_duration += time.monotonic() - commit_started
@@ -3196,14 +2982,9 @@ class ZoteroSemanticSearch:
                 if failed_concurrent_batches:
                     import time as _retry_time
 
-                    failed_items = sum(
-                        batch.stats["processed"]
-                        for batch in failed_concurrent_batches
-                    )
+                    failed_items = sum(batch.stats["processed"] for batch in failed_concurrent_batches)
                     try:
-                        sys.stderr.write(
-                            f"\n  Retrying {failed_items} failed items sequentially...\n"
-                        )
+                        sys.stderr.write(f"\n  Retrying {failed_items} failed items sequentially...\n")
                     except Exception:
                         pass
                     _retry_time.sleep(1)
@@ -3212,9 +2993,7 @@ class ZoteroSemanticSearch:
                     retry_fail = 0
                     for prepared in failed_concurrent_batches:
                         try:
-                            embeddings = self.chroma_client.embed_documents(
-                                prepared.documents
-                            )
+                            embeddings = self.chroma_client.embed_documents(prepared.documents)
                             self._commit_prepared_batch(
                                 prepared,
                                 force_rebuild=force_full_rebuild,
@@ -3232,10 +3011,7 @@ class ZoteroSemanticSearch:
                                 e,
                             )
                     try:
-                        sys.stderr.write(
-                            f"  Retry: {retry_ok} recovered, "
-                            f"{retry_fail} still failed\n"
-                        )
+                        sys.stderr.write(f"  Retry: {retry_ok} recovered, {retry_fail} still failed\n")
                     except Exception:
                         pass
 
@@ -3289,8 +3065,7 @@ class ZoteroSemanticSearch:
                     staged_rebuild_active = False
                     try:
                         sys.stderr.write(
-                            "  Rebuild incomplete; discarded the staged index and "
-                            "left the previous index active.\n"
+                            "  Rebuild incomplete; discarded the staged index and left the previous index active.\n"
                         )
                     except Exception:
                         pass
@@ -3305,9 +3080,7 @@ class ZoteroSemanticSearch:
                 if stats["recovered_items"]:
                     summary += f", {stats['recovered_items']} recovered"
                 if stats["reused_embeddings"]:
-                    summary += (
-                        f", {stats['reused_embeddings']} unchanged vectors reused"
-                    )
+                    summary += f", {stats['reused_embeddings']} unchanged vectors reused"
                 sys.stderr.write(summary + "\n")
             except Exception:
                 pass
@@ -3317,9 +3090,7 @@ class ZoteroSemanticSearch:
             completed_sync_version = target_sync_version if stats["errors"] == 0 else None
             completed_fulltext = (
                 indexed_fulltext_state
-                if stats["errors"] == 0
-                and limit is None
-                and completed_sync_version is not None
+                if stats["errors"] == 0 and limit is None and completed_sync_version is not None
                 else None
             )
             completed_content_signature = (
@@ -3327,11 +3098,7 @@ class ZoteroSemanticSearch:
                 if stats["errors"] == 0
                 and limit is None
                 and completed_sync_version is not None
-                and (
-                    force_full_rebuild
-                    or not collection_has_items
-                    or not content_mismatch
-                )
+                and (force_full_rebuild or not collection_has_items or not content_mismatch)
                 else None
             )
             self._save_update_config(
@@ -3401,11 +3168,7 @@ class ZoteroSemanticSearch:
         chunking = self._chunking_enabled
         chunk_size = int(self._chunking_config.get("chunk_size", 1500))
         overlap = int(self._chunking_config.get("overlap", 200))
-        max_chunks = int(
-            self._chunking_config.get(
-                "max_chunks_per_item", DEFAULT_MAX_CHUNKS_PER_ITEM
-            )
-        )
+        max_chunks = int(self._chunking_config.get("max_chunks_per_item", DEFAULT_MAX_CHUNKS_PER_ITEM))
 
         documents: list[str] = []
         metadatas: list[dict[str, Any]] = []
@@ -3425,16 +3188,11 @@ class ZoteroSemanticSearch:
                 fulltext = (data.get("fulltext") or "").strip()
                 metadata_text = self._create_document_text(item).strip()
                 selected_fulltext_source = data.get("fulltextSource", "")
-                self_contained = (
-                    selected_fulltext_source
-                    in _SELF_CONTAINED_FULLTEXT_SOURCES
-                )
+                self_contained = selected_fulltext_source in _SELF_CONTAINED_FULLTEXT_SOURCES
                 metadata = self._create_metadata(item)
                 metadata["index_layout_signature"] = self._index_layout_signature
                 metadata["index_fulltext"] = bool(fulltext)
-                metadata["index_content_signature"] = (
-                    _CONTENT_CONTRACT_SIGNATURE
-                )
+                metadata["index_content_signature"] = _CONTENT_CONTRACT_SIGNATURE
 
                 if chunking:
                     passages: list[tuple[str, int, int, str, str]] = []
@@ -3492,27 +3250,17 @@ class ZoteroSemanticSearch:
                         cmeta["passage_kind"] = passage_kind
                         cmeta["char_start"] = c0
                         cmeta["char_end"] = c1
-                        page = (
-                            _page_for_offset(source_text, c0)
-                            if passage_kind == "body"
-                            else None
-                        )
+                        page = _page_for_offset(source_text, c0) if passage_kind == "body" else None
                         if page is not None:
                             cmeta["page"] = page
                         document = self.chroma_client.truncate_text(chunk_text)
-                        cmeta["embedding_content_sha256"] = (
-                            _embedding_content_hash(document)
-                        )
+                        cmeta["embedding_content_sha256"] = _embedding_content_hash(document)
                         documents.append(document)
                         metadatas.append(cmeta)
                         ids.append(f"{item_key}#{ci}")
                 else:
                     if fulltext:
-                        doc_text = (
-                            fulltext
-                            if self_contained or not metadata_text
-                            else f"{metadata_text}\n\n{fulltext}"
-                        )
+                        doc_text = fulltext if self_contained or not metadata_text else f"{metadata_text}\n\n{fulltext}"
                     else:
                         doc_text = metadata_text
                     if not doc_text:
@@ -3520,9 +3268,7 @@ class ZoteroSemanticSearch:
                         continue
                     # Truncate to fit the configured embedding model's token limit
                     document = self.chroma_client.truncate_text(doc_text)
-                    metadata["embedding_content_sha256"] = (
-                        _embedding_content_hash(document)
-                    )
+                    metadata["embedding_content_sha256"] = _embedding_content_hash(document)
                     documents.append(document)
                     metadatas.append(metadata)
                     ids.append(item_key)
@@ -3575,8 +3321,7 @@ class ZoteroSemanticSearch:
             stored_metadata = stored.get("metadata") or {}
             current_hash = metadata["embedding_content_sha256"]
             unchanged = (
-                stored_metadata.get("embedding_content_sha256") == current_hash
-                or stored.get("document") == document
+                stored_metadata.get("embedding_content_sha256") == current_hash or stored.get("document") == document
             )
             if unchanged:
                 prepared.metadata_only_ids.append(doc_id)
@@ -3612,10 +3357,7 @@ class ZoteroSemanticSearch:
         if not documents and not metadata_only_ids:
             return stats
         if embeddings is not None and len(embeddings) != len(documents):
-            raise ValueError(
-                "Embedding provider returned "
-                f"{len(embeddings)} vectors for {len(documents)} documents"
-            )
+            raise ValueError(f"Embedding provider returned {len(embeddings)} vectors for {len(documents)} documents")
 
         # Probe both layouts so migrations are classified as updates. Existing
         # records remain searchable until the replacement upsert succeeds.
@@ -3624,17 +3366,11 @@ class ZoteroSemanticSearch:
             unique_keys = list(dict.fromkeys(item_keys_order))
             probe_ids = unique_keys + [f"{key}#0" for key in unique_keys]
             existing_records = self.chroma_client.get_existing_ids(probe_ids)
-            existing_item_keys = {
-                record_id.split("#", 1)[0] for record_id in existing_records
-            }
+            existing_item_keys = {record_id.split("#", 1)[0] for record_id in existing_records}
 
-        expected_ids_by_item: dict[str, set[str]] = {
-            key: set() for key in item_keys_order
-        }
+        expected_ids_by_item: dict[str, set[str]] = {key: set() for key in item_keys_order}
         for doc_id in expected_ids:
-            expected_ids_by_item.setdefault(doc_id.split("#", 1)[0], set()).add(
-                doc_id
-            )
+            expected_ids_by_item.setdefault(doc_id.split("#", 1)[0], set()).add(doc_id)
 
         try:
             if documents:
@@ -3652,9 +3388,7 @@ class ZoteroSemanticSearch:
                     metadata_only_ids,
                     metadata_only_metadatas,
                 )
-            if not force_rebuild and hasattr(
-                self.chroma_client, "reconcile_item_records"
-            ):
+            if not force_rebuild and hasattr(self.chroma_client, "reconcile_item_records"):
                 for key, expected_ids in expected_ids_by_item.items():
                     self.chroma_client.reconcile_item_records(key, expected_ids)
             for key in item_keys_order:
@@ -3707,8 +3441,7 @@ class ZoteroSemanticSearch:
             batch_ids=selected_ids or None,
         )
         batches = [
-            batch for batch in manifest.get("batches", [])
-            if not selected_ids or batch.get("batch_id") in selected_ids
+            batch for batch in manifest.get("batches", []) if not selected_ids or batch.get("batch_id") in selected_ids
         ]
         missing_ids = selected_ids - {batch.get("batch_id") for batch in batches}
         if missing_ids:
@@ -3727,10 +3460,7 @@ class ZoteroSemanticSearch:
     ) -> dict[str, dict[str, str]]:
         """Load submitted payload hashes grouped by parent item."""
         hashes: dict[str, dict[str, str]] = {}
-        paths = [
-            Path(batch["records_path"])
-            for batch in manifest.get("batches", [])
-        ]
+        paths = [Path(batch["records_path"]) for batch in manifest.get("batches", [])]
         metadata_only_path = manifest.get("metadata_only_records_path")
         if metadata_only_path:
             paths.append(Path(metadata_only_path))
@@ -3738,9 +3468,7 @@ class ZoteroSemanticSearch:
             for record in openai_batch.read_jsonl(path):
                 doc_id = record["id"]
                 metadata = record.get("metadata") or {}
-                parent = metadata.get("parent_item_key") or doc_id.split(
-                    "#", 1
-                )[0]
+                parent = metadata.get("parent_item_key") or doc_id.split("#", 1)[0]
                 content_hash = metadata.get("embedding_content_sha256")
                 if content_hash:
                     hashes.setdefault(parent, {})[doc_id] = str(content_hash)
@@ -3774,18 +3502,12 @@ class ZoteroSemanticSearch:
         """Reject a batch that would overwrite vectors changed after submission."""
         if "baseline_embedding_hashes_by_item" not in manifest:
             logger.warning(
-                "OpenAI batch manifest predates stale-write protection; "
-                "importing without a baseline comparison."
+                "OpenAI batch manifest predates stale-write protection; importing without a baseline comparison."
             )
             return
-        get_item_hashes = getattr(
-            self.chroma_client, "get_item_embedding_hashes", None
-        )
+        get_item_hashes = getattr(self.chroma_client, "get_item_embedding_hashes", None)
         if not callable(get_item_hashes):
-            raise RuntimeError(
-                "The Chroma client cannot validate this batch against the "
-                "current index"
-            )
+            raise RuntimeError("The Chroma client cannot validate this batch against the current index")
 
         baseline = manifest.get("baseline_embedding_hashes_by_item") or {}
         submitted = self._openai_batch_submitted_hashes(manifest)
@@ -3796,11 +3518,10 @@ class ZoteroSemanticSearch:
             submitted_hashes = submitted.get(parent) or {}
             current_hashes = get_item_hashes(parent)
             expected_ids = set(expected.get(parent) or submitted_hashes)
-            submitted_complete = bool(expected_ids) and expected_ids.issubset(
-                current_hashes
-            ) and all(
-                current_hashes.get(doc_id) == submitted_hashes.get(doc_id)
-                for doc_id in expected_ids
+            submitted_complete = (
+                bool(expected_ids)
+                and expected_ids.issubset(current_hashes)
+                and all(current_hashes.get(doc_id) == submitted_hashes.get(doc_id) for doc_id in expected_ids)
             )
 
             if set(baseline_hashes) - set(current_hashes) and not submitted_complete:
@@ -3837,14 +3558,9 @@ class ZoteroSemanticSearch:
                 "protection; importing after payload-only validation."
             )
             return
-        get_item_record_hashes = getattr(
-            self.chroma_client, "get_item_record_hashes", None
-        )
+        get_item_record_hashes = getattr(self.chroma_client, "get_item_record_hashes", None)
         if not callable(get_item_record_hashes):
-            raise RuntimeError(
-                "The Chroma client cannot validate batch metadata against "
-                "the current index"
-            )
+            raise RuntimeError("The Chroma client cannot validate batch metadata against the current index")
 
         baseline_records = manifest.get("baseline_record_hashes_by_item") or {}
         submitted_records = self._openai_batch_submitted_record_hashes(manifest)
@@ -3868,11 +3584,7 @@ class ZoteroSemanticSearch:
 
         if record_conflicts:
             sample = ", ".join(record_conflicts[:10])
-            suffix = (
-                ""
-                if len(record_conflicts) <= 10
-                else f" and {len(record_conflicts) - 10} more"
-            )
+            suffix = "" if len(record_conflicts) <= 10 else f" and {len(record_conflicts) - 10} more"
             raise RuntimeError(
                 "OpenAI batch import is stale for item metadata changed after "
                 f"submission: {sample}{suffix}. Run a new update instead."
@@ -3888,15 +3600,11 @@ class ZoteroSemanticSearch:
             return
         target_version = manifest.get("target_sync_version")
         if target_version is None:
-            raise RuntimeError(
-                "OpenAI batch manifest has no verified Zotero source version"
-            )
+            raise RuntimeError("OpenAI batch manifest has no verified Zotero source version")
         try:
             current_version = self.zotero_client.last_modified_version()
         except Exception as e:
-            raise RuntimeError(
-                "Could not verify Zotero source state before OpenAI batch import"
-            ) from e
+            raise RuntimeError("Could not verify Zotero source state before OpenAI batch import") from e
         if int(current_version) <= int(target_version):
             return
         if manifest.get("force_full_rebuild"):
@@ -3905,47 +3613,25 @@ class ZoteroSemanticSearch:
                 "submit a new rebuild so the replacement corpus is complete"
             )
 
-        changed_items, current_keys = self._get_changed_items_from_api(
-            int(target_version)
-        )
+        changed_items, current_keys = self._get_changed_items_from_api(int(target_version))
         if current_keys is None:
-            raise RuntimeError(
-                "Could not completely verify Zotero changes before OpenAI "
-                "batch import"
-            )
-        expected_parents = set(
-            (manifest.get("expected_ids_by_item") or {}).keys()
-        )
-        changed_parents = {
-            item.get("key", "") for item in changed_items if item.get("key")
-        }
+            raise RuntimeError("Could not completely verify Zotero changes before OpenAI batch import")
+        expected_parents = set((manifest.get("expected_ids_by_item") or {}).keys())
+        changed_parents = {item.get("key", "") for item in changed_items if item.get("key")}
         deleted_method = getattr(self.zotero_client, "deleted", None)
         deleted_keys: set[str] = set()
         if callable(deleted_method):
             try:
-                deleted_keys = set(
-                    (deleted_method(since=int(target_version)) or {}).get(
-                        "items", []
-                    )
-                )
+                deleted_keys = set((deleted_method(since=int(target_version)) or {}).get("items", []))
             except Exception as e:
-                raise RuntimeError(
-                    "Could not verify Zotero deletions before OpenAI batch import"
-                ) from e
-        affected = (expected_parents - current_keys) | (
-            expected_parents & changed_parents
-        )
+                raise RuntimeError("Could not verify Zotero deletions before OpenAI batch import") from e
+        affected = (expected_parents - current_keys) | (expected_parents & changed_parents)
         if affected or deleted_keys:
             sample_keys = sorted(affected or deleted_keys)
             sample = ", ".join(sample_keys[:10])
-            suffix = (
-                ""
-                if len(sample_keys) <= 10
-                else f" and {len(sample_keys) - 10} more"
-            )
+            suffix = "" if len(sample_keys) <= 10 else f" and {len(sample_keys) - 10} more"
             raise RuntimeError(
-                "Zotero source data changed after OpenAI batch submission "
-                f"({sample}{suffix}); run a new update instead"
+                f"Zotero source data changed after OpenAI batch submission ({sample}{suffix}); run a new update instead"
             )
 
     def import_openai_batch(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
@@ -3962,10 +3648,7 @@ class ZoteroSemanticSearch:
         )
 
         all_batches = manifest.get("batches", [])
-        batches = [
-            batch for batch in all_batches
-            if not selected_ids or batch.get("batch_id") in selected_ids
-        ]
+        batches = [batch for batch in all_batches if not selected_ids or batch.get("batch_id") in selected_ids]
         missing_ids = selected_ids - {batch.get("batch_id") for batch in batches}
         if missing_ids:
             raise FileNotFoundError(f"No OpenAI batch manifest entries found for: {', '.join(sorted(missing_ids))}")
@@ -4021,8 +3704,7 @@ class ZoteroSemanticSearch:
                 and not all(batch.get("imported_at") for batch in all_batches)
             ):
                 raise RuntimeError(
-                    "Cannot safely resume a partially imported legacy force "
-                    "rebuild; submit a new force rebuild"
+                    "Cannot safely resume a partially imported legacy force rebuild; submit a new force rebuild"
                 )
             client = openai_batch.create_openai_client(self.chroma_client.embedding_config)
             prepared_imports = []
@@ -4032,10 +3714,12 @@ class ZoteroSemanticSearch:
                     continue
                 if batch.get("status") != "completed":
                     stats["batches_skipped"] += 1
-                    stats["errors"].append({
-                        "batch_id": batch.get("batch_id"),
-                        "error": f"Batch status is {batch.get('status')}, not completed",
-                    })
+                    stats["errors"].append(
+                        {
+                            "batch_id": batch.get("batch_id"),
+                            "error": f"Batch status is {batch.get('status')}, not completed",
+                        }
+                    )
                     continue
                 output_file_id = batch.get("output_file_id")
                 if not output_file_id:
@@ -4051,22 +3735,18 @@ class ZoteroSemanticSearch:
                 embeddings_by_id, row_failures = openai_batch.parse_embedding_output(output_text)
 
                 if batch.get("error_file_id"):
-                    error_path = Path(batch["records_path"]).with_name(Path(batch["records_path"]).stem + "-errors.jsonl")
+                    error_path = Path(batch["records_path"]).with_name(
+                        Path(batch["records_path"]).stem + "-errors.jsonl"
+                    )
                     error_text = openai_batch.download_file_text(client, batch["error_file_id"], error_path)
                     row_failures.extend(openai_batch.parse_error_output(error_text))
 
                 records = {record["id"]: record for record in openai_batch.read_jsonl(Path(batch["records_path"]))}
                 ids = [doc_id for doc_id in embeddings_by_id if doc_id in records]
                 unexpected_output_ids = [doc_id for doc_id in embeddings_by_id if doc_id not in records]
-                failure_ids = {
-                    failure.get("custom_id")
-                    for failure in row_failures
-                    if failure.get("custom_id")
-                }
+                failure_ids = {failure.get("custom_id") for failure in row_failures if failure.get("custom_id")}
                 missing_result_ids = [
-                    doc_id
-                    for doc_id in records
-                    if doc_id not in embeddings_by_id and doc_id not in failure_ids
+                    doc_id for doc_id in records if doc_id not in embeddings_by_id and doc_id not in failure_ids
                 ]
                 missing_errors = [
                     {"custom_id": doc_id, "error": "Batch output returned an embedding for an unknown record"}
@@ -4086,27 +3766,17 @@ class ZoteroSemanticSearch:
                     batch["import_error_count"] = len(batch_errors)
                     continue
 
-                prepared_imports.append(
-                    (batch, records, ids, embeddings_by_id)
-                )
+                prepared_imports.append((batch, records, ids, embeddings_by_id))
 
             # A force rebuild must validate the entire replacement before the
             # old collection is discarded. Partial output leaves the existing
             # index untouched and the manifest retryable.
-            pending_selected = [
-                batch for batch in batches if not batch.get("imported_at")
-            ]
-            if manifest.get("force_full_rebuild") and len(prepared_imports) != len(
-                pending_selected
-            ):
+            pending_selected = [batch for batch in batches if not batch.get("imported_at")]
+            if manifest.get("force_full_rebuild") and len(prepared_imports) != len(pending_selected):
                 openai_batch.save_manifest(manifest)
                 return stats
 
-            if (
-                manifest.get("force_full_rebuild")
-                and not already_imported
-                and prepared_imports
-            ):
+            if manifest.get("force_full_rebuild") and not already_imported and prepared_imports:
                 self.chroma_client.begin_staged_rebuild()
                 staged_batch_rebuild_active = True
 
@@ -4139,37 +3809,23 @@ class ZoteroSemanticSearch:
                 # point because one item's chunks may span multiple batch files.
                 metadata_only_path = manifest.get("metadata_only_records_path")
                 if metadata_only_path:
-                    metadata_only_records = openai_batch.read_jsonl(
-                        Path(metadata_only_path)
-                    )
+                    metadata_only_records = openai_batch.read_jsonl(Path(metadata_only_path))
                     if metadata_only_records:
                         self.chroma_client.update_metadatas(
                             [record["id"] for record in metadata_only_records],
-                            [
-                                record["metadata"]
-                                for record in metadata_only_records
-                            ],
+                            [record["metadata"] for record in metadata_only_records],
                         )
-                        stats["reused_embeddings"] = len(
-                            metadata_only_records
-                        )
+                        stats["reused_embeddings"] = len(metadata_only_records)
                 manifest_expected = manifest.get("expected_ids_by_item") or {}
                 expected_ids_by_item: dict[str, set[str]] = {
-                    parent: set(ids)
-                    for parent, ids in manifest_expected.items()
+                    parent: set(ids) for parent, ids in manifest_expected.items()
                 }
                 if not expected_ids_by_item:
                     for batch in all_batches:
-                        for record in openai_batch.read_jsonl(
-                            Path(batch["records_path"])
-                        ):
+                        for record in openai_batch.read_jsonl(Path(batch["records_path"])):
                             doc_id = record["id"]
-                            parent = record.get("metadata", {}).get(
-                                "parent_item_key"
-                            ) or doc_id.split("#", 1)[0]
-                            expected_ids_by_item.setdefault(parent, set()).add(
-                                doc_id
-                            )
+                            parent = record.get("metadata", {}).get("parent_item_key") or doc_id.split("#", 1)[0]
+                            expected_ids_by_item.setdefault(parent, set()).add(doc_id)
                 if hasattr(self.chroma_client, "reconcile_item_records"):
                     for parent, expected_ids in expected_ids_by_item.items():
                         self.chroma_client.reconcile_item_records(
@@ -4180,9 +3836,7 @@ class ZoteroSemanticSearch:
                 self._save_update_config(
                     last_sync_version=manifest.get("target_sync_version"),
                     indexed_fulltext=manifest.get("fulltext"),
-                    indexed_content_signature=manifest.get(
-                        "content_signature"
-                    ),
+                    indexed_content_signature=manifest.get("content_signature"),
                 )
             return stats
         finally:
@@ -4196,10 +3850,7 @@ class ZoteroSemanticSearch:
                     )
             lock_cm.__exit__(None, None, None)
 
-    def search(self,
-               query: str,
-               limit: int = 10,
-               filters: dict[str, Any] | None = None) -> dict[str, Any]:
+    def search(self, query: str, limit: int = 10, filters: dict[str, Any] | None = None) -> dict[str, Any]:
         """
         Perform semantic search over the Zotero library.
 
@@ -4338,9 +3989,7 @@ class ZoteroSemanticSearch:
                 similarity = 1 - distance
             meta = meta if isinstance(meta, dict) else {}
             global_start = (
-                int(meta["char_start"]) + passage_offset
-                if isinstance(meta.get("char_start"), int)
-                else passage_offset
+                int(meta["char_start"]) + passage_offset if isinstance(meta.get("char_start"), int) else passage_offset
             )
             grouped.setdefault(item_key, []).append(
                 {
@@ -4367,18 +4016,19 @@ class ZoteroSemanticSearch:
                         break
                     if candidate["similarity"] < max(0, best_score - 0.15):
                         continue
-                    if any(
-                        _passages_overlap(candidate, chosen)
-                        for chosen in selected
-                    ):
+                    if any(_passages_overlap(candidate, chosen) for chosen in selected):
                         continue
                     selected.append(candidate)
 
             support_weights = (0.10, 0.05)
-            support_bonus = sum(
-                weight * min(1.0, max(0.0, candidate["similarity"]) / best_score)
-                for weight, candidate in zip(support_weights, selected[1:])
-            ) if best_score > 0 else 0.0
+            support_bonus = (
+                sum(
+                    weight * min(1.0, max(0.0, candidate["similarity"]) / best_score)
+                    for weight, candidate in zip(support_weights, selected[1:])
+                )
+                if best_score > 0
+                else 0.0
+            )
             aggregate_score = min(1.0, best_score * (1.0 + min(0.15, support_bonus)))
 
             enriched_result: dict[str, Any] = {
@@ -4391,14 +4041,10 @@ class ZoteroSemanticSearch:
             }
             if is_chunked:
                 enriched_result["chunk_id"] = best["raw_id"]
-                enriched_result["content_hash"] = _embedding_content_hash(
-                    best["document"]
-                )
+                enriched_result["content_hash"] = _embedding_content_hash(best["document"])
                 enriched_result["best_chunk_similarity_score"] = best_score
                 enriched_result["supporting_chunk_count"] = len(selected) - 1
-                enriched_result["matched_passages"] = [
-                    _passage_result(candidate) for candidate in selected
-                ]
+                enriched_result["matched_passages"] = [_passage_result(candidate) for candidate in selected]
             # Passage provenance — present only on a chunk-indexed collection.
             for mk in ("chunk_index", "n_chunks", "char_start", "char_end", "page"):
                 if mk in best["meta"]:

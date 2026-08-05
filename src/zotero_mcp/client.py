@@ -5,6 +5,7 @@ Zotero client wrapper for MCP server.
 import functools
 import os
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,40 @@ _zotero_api_lock = threading.RLock()
 _DEFAULT_LOCK_TIMEOUT = 45.0
 
 
+class _SerializedCallProxy:
+    """Serialize callable access to a wrapped Zotero/httpx client.
+
+    Tool-level decorators are useful for keeping multi-call workflows ordered,
+    but they are too easy to omit.  Wrapping the clients themselves makes the
+    fundamental guarantee true even for new tools and direct ``client.patch``
+    calls.  Existing decorators remain safe because the lock is reentrant.
+    """
+
+    __slots__ = ("_wrapped",)
+
+    def __init__(self, wrapped: Any):
+        object.__setattr__(self, "_wrapped", wrapped)
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(object.__getattribute__(self, "_wrapped"), name)
+        if name == "client" and value is not None:
+            return _SerializedCallProxy(value)
+        if not callable(value):
+            return value
+
+        @functools.wraps(value)
+        def locked_call(*args, **kwargs):
+            return _call_with_zotero_api_lock(value, *args, **kwargs)
+
+        return locked_call
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_wrapped"), name, value)
+
+    def __repr__(self) -> str:
+        return repr(object.__getattribute__(self, "_wrapped"))
+
+
 def _lock_timeout() -> float:
     raw = os.getenv("ZOTERO_MCP_LOCK_TIMEOUT", "").strip()
     if not raw:
@@ -60,6 +95,27 @@ class ZoteroApiBusyError(RuntimeError):
     """
 
 
+def _call_with_zotero_api_lock(func, *args, **kwargs):
+    """Call ``func`` while holding the bounded reentrant API lock."""
+    timeout = _lock_timeout()
+    if timeout <= 0:
+        with _zotero_api_lock:
+            return func(*args, **kwargs)
+    acquired = _zotero_api_lock.acquire(timeout=timeout)
+    if not acquired:
+        raise ZoteroApiBusyError(
+            f"Another Zotero API operation is still in progress and did not "
+            f"release within {timeout:.0f}s. This usually means a previous "
+            f"call is slow or stuck (e.g. a large PDF upload or an "
+            f"unreachable Zotero cloud). Please retry shortly; if it "
+            f"persists, restart the Zotero MCP server."
+        )
+    try:
+        return func(*args, **kwargs)
+    finally:
+        _zotero_api_lock.release()
+
+
 def with_zotero_api_lock(func):
     """Serialize Zotero API access across concurrent MCP tool threads.
 
@@ -68,49 +124,102 @@ def with_zotero_api_lock(func):
     nested decorated calls on the same thread (e.g. add_by_url -> add_by_doi)
     acquire instantly and are never blocked by this bound.
     """
+
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        timeout = _lock_timeout()
-        if timeout <= 0:
-            # Opt-out: original unbounded behaviour.
-            with _zotero_api_lock:
-                return func(*args, **kwargs)
-        acquired = _zotero_api_lock.acquire(timeout=timeout)
-        if not acquired:
-            raise ZoteroApiBusyError(
-                f"Another Zotero API operation is still in progress and did not "
-                f"release within {timeout:.0f}s. This usually means a previous "
-                f"call is slow or stuck (e.g. a large PDF upload or an "
-                f"unreachable Zotero cloud). Please retry shortly; if it "
-                f"persists, restart the Zotero MCP server."
-            )
-        try:
-            return func(*args, **kwargs)
-        finally:
-            _zotero_api_lock.release()
+        return _call_with_zotero_api_lock(func, *args, **kwargs)
+
     return wrapper
 
 
-# Runtime library override state — set by zotero_switch_library tool.
-# When non-empty, these values override the corresponding environment variables
-# in get_zotero_client(). Keys: "library_id", "library_type".
+# Direct-call fallback used by the standalone CLI and unit tests, where no MCP
+# session exists. Real MCP calls use the bounded session map below.
 _active_library_override: dict[str, str] = {}
 
-
-def set_active_library(library_id: str, library_type: str) -> None:
-    """Set runtime library override for all subsequent get_zotero_client() calls."""
-    _active_library_override["library_id"] = library_id
-    _active_library_override["library_type"] = library_type
+_session_library_overrides: OrderedDict[str, dict[str, str]] = OrderedDict()
+_session_library_lock = threading.Lock()
+_MAX_SESSION_LIBRARY_OVERRIDES = 1024
 
 
-def clear_active_library() -> None:
-    """Clear runtime library override, reverting to environment variable defaults."""
-    _active_library_override.clear()
+def _current_mcp_session_id() -> str | None:
+    """Return the active FastMCP session ID, or ``None`` outside a request."""
+    try:
+        from fastmcp.server.dependencies import get_context
+
+        return get_context().session_id
+    except Exception:
+        return None
 
 
-def get_active_library() -> dict[str, str]:
-    """Return the current active library override (empty dict if using defaults)."""
-    return dict(_active_library_override)
+def _normalize_library_type(library_type: str) -> str:
+    value = (library_type or "user").strip().lower()
+    return {"users": "user", "groups": "group", "feeds": "feed"}.get(value, value)
+
+
+def get_default_library() -> dict[str, str]:
+    """Return the process configuration's fixed default library identity."""
+    local = os.getenv("ZOTERO_LOCAL", "").lower() in {"true", "yes", "1"}
+    return {
+        "library_id": os.getenv("ZOTERO_LIBRARY_ID") or ("0" if local else ""),
+        "library_type": _normalize_library_type(os.getenv("ZOTERO_LIBRARY_TYPE", "user")),
+    }
+
+
+def library_identity(library: dict[str, str] | None = None) -> str:
+    """Return a stable identity suitable for index/config namespacing."""
+    current = library if library is not None else get_current_library()
+    return f"{_normalize_library_type(current.get('library_type', 'user'))}:{current.get('library_id', '')}"
+
+
+def set_active_library(
+    library_id: str,
+    library_type: str,
+    *,
+    session_id: str | None = None,
+) -> None:
+    """Set a session-local library override, or the direct-call fallback."""
+    override = {
+        "library_id": str(library_id),
+        "library_type": _normalize_library_type(library_type),
+    }
+    sid = session_id or _current_mcp_session_id()
+    if sid is None:
+        _active_library_override.clear()
+        _active_library_override.update(override)
+        return
+    with _session_library_lock:
+        _session_library_overrides.pop(sid, None)
+        _session_library_overrides[sid] = override
+        while len(_session_library_overrides) > _MAX_SESSION_LIBRARY_OVERRIDES:
+            _session_library_overrides.popitem(last=False)
+
+
+def clear_active_library(*, session_id: str | None = None) -> None:
+    """Clear the current session override and return to configured defaults."""
+    sid = session_id or _current_mcp_session_id()
+    if sid is None:
+        _active_library_override.clear()
+        return
+    with _session_library_lock:
+        _session_library_overrides.pop(sid, None)
+
+
+def get_active_library(*, session_id: str | None = None) -> dict[str, str]:
+    """Return the current session override (empty when defaults are active)."""
+    sid = session_id or _current_mcp_session_id()
+    if sid is None:
+        return dict(_active_library_override)
+    with _session_library_lock:
+        override = _session_library_overrides.get(sid)
+        if override is None:
+            return {}
+        _session_library_overrides.move_to_end(sid)
+        return dict(override)
+
+
+def get_current_library() -> dict[str, str]:
+    """Return the effective library identity for the current request."""
+    return get_active_library() or get_default_library()
 
 
 def _make_local_http_client() -> httpx.Client:
@@ -161,7 +270,7 @@ def get_zotero_client() -> zotero.Zotero:
         ValueError: If required environment variables are missing.
     """
     # Runtime overrides take precedence over environment variables
-    override = _active_library_override
+    override = get_active_library()
     library_id = override.get("library_id") or os.getenv("ZOTERO_LIBRARY_ID")
     library_type = override.get("library_type") or os.getenv("ZOTERO_LIBRARY_TYPE", "user")
     api_key = os.getenv("ZOTERO_API_KEY")
@@ -178,12 +287,14 @@ def get_zotero_client() -> zotero.Zotero:
             "or use ZOTERO_LOCAL=true for local Zotero instance."
         )
 
-    return zotero.Zotero(
-        library_id=library_id,
-        library_type=library_type,
-        api_key=api_key,
-        local=local,
-        client=_make_local_http_client() if local else None,
+    return _SerializedCallProxy(
+        zotero.Zotero(
+            library_id=library_id,
+            library_type=library_type,
+            api_key=api_key,
+            local=local,
+            client=_make_local_http_client() if local else None,
+        )
     )
 
 
@@ -202,12 +313,14 @@ def get_local_zotero_client() -> zotero.Zotero | None:
         # Create a local client - library_id 0 is the default for local.
         # HTTP/1.1-only transport for compatibility with Zotero 8's local
         # server (#160) — httpx default HTTP/2 negotiation returns 502.
-        client = zotero.Zotero(
-            library_id="0",
-            library_type="user",
-            api_key=None,
-            local=True,
-            client=_make_local_http_client(),
+        client = _SerializedCallProxy(
+            zotero.Zotero(
+                library_id="0",
+                library_type="user",
+                api_key=None,
+                local=True,
+                client=_make_local_http_client(),
+            )
         )
         # Test connection by making a simple request
         client.items(limit=1)
@@ -226,18 +339,21 @@ def get_web_zotero_client() -> zotero.Zotero | None:
     Returns:
         A web API Zotero client instance, or None if credentials are not available.
     """
-    library_id = os.getenv("ZOTERO_LIBRARY_ID")
-    library_type = os.getenv("ZOTERO_LIBRARY_TYPE", "user")
+    current = get_current_library()
+    library_id = current.get("library_id") or os.getenv("ZOTERO_LIBRARY_ID")
+    library_type = current.get("library_type") or os.getenv("ZOTERO_LIBRARY_TYPE", "user")
     api_key = os.getenv("ZOTERO_API_KEY")
 
     if not library_id or not api_key:
         return None
 
-    return zotero.Zotero(
-        library_id=library_id,
-        library_type=library_type,
-        api_key=api_key,
-        local=False,
+    return _SerializedCallProxy(
+        zotero.Zotero(
+            library_id=library_id,
+            library_type=library_type,
+            api_key=api_key,
+            local=False,
+        )
     )
 
 
@@ -378,6 +494,7 @@ def generate_bibtex(item: dict[str, Any]) -> str:
     # Try Better BibTeX first
     try:
         from zotero_mcp.better_bibtex_client import ZoteroBetterBibTexAPI
+
         bibtex = ZoteroBetterBibTexAPI()
 
         if bibtex.is_zotero_running():
@@ -402,7 +519,7 @@ def generate_bibtex(item: dict[str, Any]) -> str:
         "thesis": "phdthesis",
         "report": "techreport",
         "webpage": "misc",
-        "manuscript": "unpublished"
+        "manuscript": "unpublished",
     }
 
     # Create citation key
@@ -431,14 +548,14 @@ def generate_bibtex(item: dict[str, Any]) -> str:
         ("place", "address"),
         ("DOI", "doi"),
         ("url", "url"),
-        ("abstractNote", "abstract")
+        ("abstractNote", "abstract"),
     ]
 
     for zotero_field, bibtex_field in field_mappings:
         if value := data.get(zotero_field):
             # Escape special characters
             value = value.replace("{", "\\{").replace("}", "\\}")
-            lines.append(f'  {bibtex_field} = {{{value}}},')
+            lines.append(f"  {bibtex_field} = {{{value}}},")
 
     # Add authors
     if creators:
@@ -450,23 +567,21 @@ def generate_bibtex(item: dict[str, Any]) -> str:
                 elif "name" in creator:
                     authors.append(creator["name"])
         if authors:
-            lines.append(f'  author = {{{" and ".join(authors)}}},')
+            lines.append(f"  author = {{{' and '.join(authors)}}},")
 
     # Add year
     if year != "nodate":
-        lines.append(f'  year = {{{year}}},')
+        lines.append(f"  year = {{{year}}},")
 
     # Remove trailing comma from last field and close entry
-    if lines[-1].endswith(','):
+    if lines[-1].endswith(","):
         lines[-1] = lines[-1][:-1]
     lines.append("}")
 
     return "\n".join(lines)
 
 
-def get_attachment_details(
-    zot: zotero.Zotero, item: dict[str, Any]
-) -> AttachmentDetails | None:
+def get_attachment_details(zot: zotero.Zotero, item: dict[str, Any]) -> AttachmentDetails | None:
     """
     Get attachment details for a Zotero item, finding the most relevant attachment.
 

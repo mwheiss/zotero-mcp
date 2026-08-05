@@ -14,8 +14,9 @@ import pytest
 from zotero_mcp import client as _client
 from zotero_mcp.client import (
     ZoteroApiBusyError,
-    with_zotero_api_lock,
+    _SerializedCallProxy,
     _zotero_api_lock,
+    with_zotero_api_lock,
 )
 
 
@@ -147,3 +148,54 @@ def test_zero_timeout_opt_out_blocks_until_free(monkeypatch):
     w.join(timeout=5)
     t.join(timeout=5)
     assert result.get("ran") is True
+
+
+def test_client_proxy_serializes_direct_calls(monkeypatch):
+    """Client methods are serialized even when a tool omits the decorator."""
+    monkeypatch.setenv("ZOTERO_MCP_LOCK_TIMEOUT", "5")
+    state_lock = threading.Lock()
+
+    class FakeClient:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+
+        def item(self, key):
+            with state_lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.05)
+            with state_lock:
+                self.active -= 1
+            return key
+
+    raw = FakeClient()
+    client = _SerializedCallProxy(raw)
+    threads = [threading.Thread(target=client.item, args=(str(i),)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert raw.max_active == 1
+
+
+def test_library_overrides_are_session_scoped(monkeypatch):
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "default-id")
+    monkeypatch.setenv("ZOTERO_LIBRARY_TYPE", "user")
+
+    _client.set_active_library("group-a", "group", session_id="session-a")
+    _client.set_active_library("feed-b", "feed", session_id="session-b")
+    try:
+        assert _client.get_active_library(session_id="session-a") == {
+            "library_id": "group-a",
+            "library_type": "group",
+        }
+        assert _client.get_active_library(session_id="session-b") == {
+            "library_id": "feed-b",
+            "library_type": "feed",
+        }
+        assert _client.get_active_library(session_id="unrelated") == {}
+    finally:
+        _client.clear_active_library(session_id="session-a")
+        _client.clear_active_library(session_id="session-b")

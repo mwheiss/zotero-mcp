@@ -42,9 +42,7 @@ _BETTERISSA_ARTIFACT_TITLES = frozenset(
         _BETTERISSA_REFERENCES_TITLE,
     }
 )
-_BETTERISSA_SELECTABLE_TITLES = (
-    _BETTERISSA_ARTIFACT_TITLES - {_BETTERISSA_REFERENCES_TITLE}
-)
+_BETTERISSA_SELECTABLE_TITLES = _BETTERISSA_ARTIFACT_TITLES - {_BETTERISSA_REFERENCES_TITLE}
 
 
 def _extract_pdf_worker(file_path: str, maxpages: int, result_queue):
@@ -57,14 +55,15 @@ def _extract_pdf_worker(file_path: str, maxpages: int, result_queue):
     """
     try:
         import logging as _logging
+
         _logging.getLogger("pdfminer").setLevel(_logging.ERROR)
 
         from pdfminer.high_level import extract_text
+
         text = extract_text(file_path, maxpages=maxpages) or ""
         result_queue.put(text)
     except Exception:
         result_queue.put("")
-
 
 
 def _read_string_pref(prefs_path: Path, pref: str) -> str | None:
@@ -131,6 +130,7 @@ def _data_dirs_from_profiles() -> list[Path]:
 @dataclass
 class ZoteroItem:
     """Represents a Zotero item with text content for semantic search."""
+
     item_id: int
     key: str
     item_type_id: int
@@ -241,15 +241,11 @@ class LocalZoteroReader:
             db_path = Path(env_path).expanduser()
             if db_path.is_file():
                 return str(db_path)
-            raise FileNotFoundError(
-                f"ZOTERO_DB_PATH is set to {db_path}, but no file exists there."
-            )
+            raise FileNotFoundError(f"ZOTERO_DB_PATH is set to {db_path}, but no file exists there.")
 
         # A data directory configured in Zotero's own preferences is
         # authoritative; a leftover ~/Zotero from an old install is not.
-        candidates = [
-            data_dir / "zotero.sqlite" for data_dir in _data_dirs_from_profiles()
-        ]
+        candidates = [data_dir / "zotero.sqlite" for data_dir in _data_dirs_from_profiles()]
         candidates.append(Path.home() / "Zotero" / "zotero.sqlite")
         if platform.system() == "Windows":
             # Fallback to XP/2000 location
@@ -309,9 +305,7 @@ class LocalZoteroReader:
         for prefs_path in prefs_files:
             if not prefs_path.exists():
                 continue
-            value = _read_string_pref(
-                prefs_path, "extensions.zotero.baseAttachmentPath"
-            )
+            value = _read_string_pref(prefs_path, "extensions.zotero.baseAttachmentPath")
             if value:
                 return Path(value)
         return None
@@ -319,8 +313,7 @@ class LocalZoteroReader:
     def _iter_parent_attachments(self, parent_item_id: int):
         """Yield tuples (attachment_key, path, content_type) for a parent item."""
         conn = self._get_connection()
-        query = (
-            """
+        query = """
             SELECT ia.itemID as attachmentItemID,
                    ia.parentItemID as parentItemID,
                    ia.path as path,
@@ -330,17 +323,16 @@ class LocalZoteroReader:
             JOIN items att ON att.itemID = ia.itemID
             WHERE ia.parentItemID = ?
             """
-        )
         for row in conn.execute(query, (parent_item_id,)):
             yield row["attachmentKey"], row["path"], row["contentType"]
 
-    def _get_attachment_selection_metadata(
-        self, parent_item_id: int
-    ) -> dict[str, dict[str, Any]]:
+    def _get_attachment_selection_metadata(self, parent_item_id: int) -> dict[str, dict[str, Any]]:
         """Return attachment titles and timestamps without changing the iterator API."""
         try:
-            rows = self._get_connection().execute(
-                """
+            rows = (
+                self._get_connection()
+                .execute(
+                    """
                 SELECT att.key AS attachmentKey,
                        att.itemID AS attachmentItemID,
                        att.dateModified AS dateModified,
@@ -357,8 +349,10 @@ class LocalZoteroReader:
                   ON idv.valueID = id.valueID
                 WHERE ia.parentItemID = ?
                 """,
-                (parent_item_id,),
-            ).fetchall()
+                    (parent_item_id,),
+                )
+                .fetchall()
+            )
         except (OSError, sqlite3.Error):
             # Some test readers and old/minimal snapshots do not expose all
             # metadata tables. Attachment paths still provide useful labels.
@@ -379,26 +373,14 @@ class LocalZoteroReader:
         return re.sub(r"\s+", " ", (title or "").casefold()).strip()
 
     @staticmethod
-    def _uses_named_attachment_precedence(
-        title: str, path: str, content_type: str | None
-    ) -> bool:
+    def _uses_named_attachment_precedence(title: str, path: str, content_type: str | None) -> bool:
         """Return whether attachment selection policy can affect this item."""
         normalized_title = LocalZoteroReader._normalize_attachment_title(title)
         filename = path.rsplit("/", 1)[-1]
-        words = re.sub(
-            r"[^a-z0-9]+", " ", f"{title} {filename}".casefold()
-        ).split()
-        is_pdf = (
-            (content_type or "").lower() == "application/pdf"
-            or path.lower().endswith(".pdf")
-        )
-        is_xml = (
-            (content_type or "").lower() in {"application/xml", "text/xml"}
-            or path.lower().endswith(".xml")
-        )
-        is_fulltext = "fulltext" in words or (
-            "full" in words and "text" in words
-        )
+        words = re.sub(r"[^a-z0-9]+", " ", f"{title} {filename}".casefold()).split()
+        is_pdf = (content_type or "").lower() == "application/pdf" or path.lower().endswith(".pdf")
+        is_xml = (content_type or "").lower() in {"application/xml", "text/xml"} or path.lower().endswith(".xml")
+        is_fulltext = "fulltext" in words or ("full" in words and "text" in words)
         is_betterissa = "betterissa" in words
         return (
             normalized_title in _BETTERISSA_SELECTABLE_TITLES
@@ -439,6 +421,7 @@ class LocalZoteroReader:
         # Linked file as URL: 'file:///path/to/file.pdf'
         if zotero_path.startswith("file://"):
             from urllib.parse import unquote, urlparse
+
             parsed = urlparse(zotero_path)
             decoded_path = unquote(parsed.path or "")
             # file:///C:/... on Windows
@@ -576,6 +559,7 @@ class LocalZoteroReader:
         # Try markitdown first
         try:
             from markitdown import MarkItDown
+
             md = MarkItDown()
             result = md.convert(str(file_path))
             return result.text_content or ""
@@ -584,6 +568,7 @@ class LocalZoteroReader:
         # Fallback using a simple parser
         try:
             from bs4 import BeautifulSoup  # type: ignore
+
             html = file_path.read_text(errors="ignore")
             return BeautifulSoup(html, "html.parser").get_text(" ")
         except Exception:
@@ -594,15 +579,36 @@ class LocalZoteroReader:
     # the fulltext extractor. Binary formats (.docx, .pptx, .epub, video,
     # etc.) are intentionally excluded — ``read_text`` returns garbage for
     # those and we don't want to pollute the semantic index with it.
-    _TEXTUAL_SUFFIXES = frozenset({
-        ".txt", ".vtt", ".srt", ".sbv", ".md", ".markdown", ".rst",
-        ".csv", ".tsv", ".json", ".xml", ".log", ".text",
-    })
-    _TEXTUAL_CONTENT_TYPES = frozenset({
-        "text/plain", "text/vtt", "text/markdown", "text/csv",
-        "text/tab-separated-values", "text/srt", "application/json",
-        "application/xml", "text/xml",
-    })
+    _TEXTUAL_SUFFIXES = frozenset(
+        {
+            ".txt",
+            ".vtt",
+            ".srt",
+            ".sbv",
+            ".md",
+            ".markdown",
+            ".rst",
+            ".csv",
+            ".tsv",
+            ".json",
+            ".xml",
+            ".log",
+            ".text",
+        }
+    )
+    _TEXTUAL_CONTENT_TYPES = frozenset(
+        {
+            "text/plain",
+            "text/vtt",
+            "text/markdown",
+            "text/csv",
+            "text/tab-separated-values",
+            "text/srt",
+            "application/json",
+            "application/xml",
+            "text/xml",
+        }
+    )
 
     @classmethod
     def _is_extractable_attachment(cls, file_path: Path, ctype: str | None) -> bool:
@@ -655,20 +661,13 @@ class LocalZoteroReader:
         abstracts: list[str] = []
         for element in root.iter():
             is_abstract = local_name(element) == "abstract"
-            is_abstract_div = (
-                local_name(element) == "div"
-                and element.attrib.get("type", "").lower() == "abstract"
-            )
+            is_abstract_div = local_name(element) == "div" and element.attrib.get("type", "").lower() == "abstract"
             if is_abstract or is_abstract_div:
                 text = self._normalize_xml_text(element)
                 if text and text not in abstracts:
                     abstracts.append(text)
 
-        bodies = [
-            self._normalize_xml_text(element)
-            for element in root.iter()
-            if local_name(element) == "body"
-        ]
+        bodies = [self._normalize_xml_text(element) for element in root.iter() if local_name(element) == "body"]
         bodies = [text for text in bodies if text]
         if not bodies:
             return ""
@@ -747,10 +746,7 @@ class LocalZoteroReader:
     ):
         meta = []
         for key, path, ctype in self._iter_parent_attachments(item_id):
-            if (
-                allowed_attachment_keys is not None
-                and key not in allowed_attachment_keys
-            ):
+            if allowed_attachment_keys is not None and key not in allowed_attachment_keys:
                 continue
             meta.append([key, path, ctype])
 
@@ -805,19 +801,13 @@ class LocalZoteroReader:
         uses_named_precedence = False
         for row in rows:
             key = row["attachmentKey"]
-            if (
-                allowed_attachment_keys is not None
-                and key not in allowed_attachment_keys
-            ):
+            if allowed_attachment_keys is not None and key not in allowed_attachment_keys:
                 continue
             content_type = row["contentType"]
             zotero_path = row["path"] or ""
             title = selection_metadata.get(key, {}).get("title", "")
-            uses_named_precedence = (
-                uses_named_precedence
-                or self._uses_named_attachment_precedence(
-                    title, zotero_path, content_type
-                )
+            uses_named_precedence = uses_named_precedence or self._uses_named_attachment_precedence(
+                title, zotero_path, content_type
             )
             resolved = self._resolve_attachment_path(key, zotero_path)
             if not resolved or not resolved.exists():
@@ -846,9 +836,7 @@ class LocalZoteroReader:
                 "attachments": attachments,
                 "selection_version": _ATTACHMENT_SELECTION_VERSION,
             }
-        encoded = json.dumps(
-            signature_data, sort_keys=True, separators=(",", ":"), default=str
-        )
+        encoded = json.dumps(signature_data, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _read_zotero_ft_cache(self, attachment_key: str) -> str | None:
@@ -875,9 +863,7 @@ class LocalZoteroReader:
             return None
         return text or None
 
-    def _scan_storage_for_attachment(
-        self, attachment_key: str, ctype: str | None
-    ) -> Path | None:
+    def _scan_storage_for_attachment(self, attachment_key: str, ctype: str | None) -> Path | None:
         """Fallback path resolver: find a likely attachment file on disk.
 
         ``itemAttachments.path`` in the Zotero sqlite is the filename Zotero
@@ -908,8 +894,7 @@ class LocalZoteroReader:
             return None
 
         candidates: list[Path] = [
-            child for child in attachment_dir.iterdir()
-            if child.is_file() and child.suffix.lower() in wanted_suffixes
+            child for child in attachment_dir.iterdir() if child.is_file() and child.suffix.lower() in wanted_suffixes
         ]
         if not candidates:
             return None
@@ -940,13 +925,8 @@ class LocalZoteroReader:
         self.last_extraction_details: dict[str, Any] | None = None
         metadata = self._get_attachment_selection_metadata(item_id)
         candidates = []
-        for index, (key, path, ctype) in enumerate(
-            self._iter_parent_attachments(item_id)
-        ):
-            if (
-                allowed_attachment_keys is not None
-                and key not in allowed_attachment_keys
-            ):
+        for index, (key, path, ctype) in enumerate(self._iter_parent_attachments(item_id)):
+            if allowed_attachment_keys is not None and key not in allowed_attachment_keys:
                 continue
             details = metadata.get(key, {})
             candidates.append(
@@ -974,28 +954,24 @@ class LocalZoteroReader:
             return self._normalize_attachment_title(candidate.title)
 
         def is_pdf(candidate: _AttachmentCandidate) -> bool:
-            return (
-                (candidate.content_type or "").lower() == "application/pdf"
-                or candidate.path.lower().endswith(".pdf")
+            return (candidate.content_type or "").lower() == "application/pdf" or candidate.path.lower().endswith(
+                ".pdf"
             )
 
         def is_xml(candidate: _AttachmentCandidate) -> bool:
-            return (
-                (candidate.content_type or "").lower()
-                in {"application/xml", "text/xml"}
-                or candidate.path.lower().endswith(".xml")
-            )
+            return (candidate.content_type or "").lower() in {
+                "application/xml",
+                "text/xml",
+            } or candidate.path.lower().endswith(".xml")
 
         def is_json(candidate: _AttachmentCandidate) -> bool:
-            return (
-                (candidate.content_type or "").lower() == "application/json"
-                or candidate.path.lower().endswith(".json")
+            return (candidate.content_type or "").lower() == "application/json" or candidate.path.lower().endswith(
+                ".json"
             )
 
         def is_html(candidate: _AttachmentCandidate) -> bool:
-            return (
-                (candidate.content_type or "").lower().startswith("text/html")
-                or candidate.path.lower().endswith((".html", ".htm"))
+            return (candidate.content_type or "").lower().startswith("text/html") or candidate.path.lower().endswith(
+                (".html", ".htm")
             )
 
         def is_named(candidate: _AttachmentCandidate, word: str) -> bool:
@@ -1027,9 +1003,7 @@ class LocalZoteroReader:
 
         def is_fulltext(candidate: _AttachmentCandidate) -> bool:
             words = label(candidate).split()
-            return "fulltext" in words or (
-                "full" in words and "text" in words
-            )
+            return "fulltext" in words or ("full" in words and "text" in words)
 
         def is_betterissa_indexing(candidate: _AttachmentCandidate) -> bool:
             return (
@@ -1049,9 +1023,7 @@ class LocalZoteroReader:
                 and not has_betterissa_auxiliary_marker(candidate)
                 and (
                     normalized_title(candidate) == _BETTERISSA_SEMANTIC_TITLE
-                    or has_words(
-                        candidate, "betterissa", "semantic", "document"
-                    )
+                    or has_words(candidate, "betterissa", "semantic", "document")
                 )
             )
 
@@ -1072,8 +1044,7 @@ class LocalZoteroReader:
                 is_html(candidate)
                 and not has_betterissa_auxiliary_marker(candidate)
                 and (
-                    normalized_title(candidate)
-                    == _BETTERISSA_READING_VIEW_TITLE
+                    normalized_title(candidate) == _BETTERISSA_READING_VIEW_TITLE
                     or has_words(candidate, "betterissa", "reading", "view")
                 )
             )
@@ -1105,35 +1076,19 @@ class LocalZoteroReader:
         groups = [
             (
                 "betterissa-indexing",
-                [
-                    candidate
-                    for candidate in candidates
-                    if is_betterissa_indexing(candidate)
-                ],
+                [candidate for candidate in candidates if is_betterissa_indexing(candidate)],
             ),
             (
                 "betterissa-semantic",
-                [
-                    candidate
-                    for candidate in candidates
-                    if is_betterissa_semantic(candidate)
-                ],
+                [candidate for candidate in candidates if is_betterissa_semantic(candidate)],
             ),
             (
                 "betterissa-ocr",
-                [
-                    candidate
-                    for candidate in candidates
-                    if is_betterissa_ocr(candidate)
-                ],
+                [candidate for candidate in candidates if is_betterissa_ocr(candidate)],
             ),
             (
                 "betterissa-reading-view",
-                [
-                    candidate
-                    for candidate in candidates
-                    if is_betterissa_reading_view(candidate)
-                ],
+                [candidate for candidate in candidates if is_betterissa_reading_view(candidate)],
             ),
             (
                 "grobid-tei",
@@ -1142,10 +1097,7 @@ class LocalZoteroReader:
                     for candidate in candidates
                     if not has_betterissa_auxiliary_marker(candidate)
                     and is_xml(candidate)
-                    and (
-                        is_named(candidate, "grobid")
-                        or is_named(candidate, "tei")
-                    )
+                    and (is_named(candidate, "grobid") or is_named(candidate, "tei"))
                 ],
             ),
             (
@@ -1174,9 +1126,7 @@ class LocalZoteroReader:
                 [
                     candidate
                     for candidate in candidates
-                    if not has_betterissa_auxiliary_marker(candidate)
-                    and is_pdf(candidate)
-                    and is_fulltext(candidate)
+                    if not has_betterissa_auxiliary_marker(candidate) and is_pdf(candidate) and is_fulltext(candidate)
                 ],
             ),
             (
@@ -1184,17 +1134,12 @@ class LocalZoteroReader:
                 [
                     candidate
                     for candidate in candidates
-                    if not has_betterissa_auxiliary_marker(candidate)
-                    and is_pdf(candidate)
+                    if not has_betterissa_auxiliary_marker(candidate) and is_pdf(candidate)
                 ],
             ),
             (
                 "file",
-                [
-                    candidate
-                    for candidate in candidates
-                    if not is_betterissa_auxiliary(candidate)
-                ],
+                [candidate for candidate in candidates if not is_betterissa_auxiliary(candidate)],
             ),
         ]
 
@@ -1205,13 +1150,9 @@ class LocalZoteroReader:
                     continue
                 attempted.add(candidate.key)
 
-                resolved = self._resolve_attachment_path(
-                    candidate.key, candidate.path
-                )
+                resolved = self._resolve_attachment_path(candidate.key, candidate.path)
                 if not resolved or not resolved.exists():
-                    resolved = self._scan_storage_for_attachment(
-                        candidate.key, candidate.content_type
-                    )
+                    resolved = self._scan_storage_for_attachment(candidate.key, candidate.content_type)
 
                 if source == "grobid-tei":
                     if not resolved or not resolved.exists():
@@ -1241,9 +1182,7 @@ class LocalZoteroReader:
                     if (
                         not resolved
                         or not resolved.exists()
-                        or not self._is_extractable_attachment(
-                            resolved, candidate.content_type
-                        )
+                        or not self._is_extractable_attachment(resolved, candidate.content_type)
                     ):
                         continue
                     text = self._extract_text_from_file(resolved)
@@ -1263,16 +1202,8 @@ class LocalZoteroReader:
                         "attachment_key": candidate.key,
                         "is_pdf": is_pdf(candidate),
                         "used_zotero_cache": False,
-                        "page_count": (
-                            self._get_pdf_page_count(resolved)
-                            if is_pdf(candidate) and resolved
-                            else None
-                        ),
-                        "page_cap": (
-                            self._effective_pdf_max_pages()
-                            if is_pdf(candidate)
-                            else None
-                        ),
+                        "page_count": (self._get_pdf_page_count(resolved) if is_pdf(candidate) and resolved else None),
+                        "page_cap": (self._effective_pdf_max_pages() if is_pdf(candidate) else None),
                     }
                     return text, source
         return None
@@ -1343,9 +1274,7 @@ class LocalZoteroReader:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_feed_items(
-        self, library_id: int, limit: int = 20
-    ) -> list[dict[str, Any]]:
+    def get_feed_items(self, library_id: int, limit: int = 20) -> list[dict[str, Any]]:
         """Get items from a specific RSS feed by its libraryID."""
         conn = self._get_connection()
         rows = conn.execute(
@@ -1412,7 +1341,7 @@ class LocalZoteroReader:
         )
         return cursor.fetchone()[0]
 
-    def get_all_item_keys(self) -> set[str]:
+    def get_all_item_keys(self, library_id: int | None = None) -> set[str]:
         """
         Get the keys of every item in the database, regardless of type.
 
@@ -1421,10 +1350,64 @@ class LocalZoteroReader:
         in an un-checkpointed WAL file).
         """
         conn = self._get_connection()
-        rows = conn.execute("SELECT key FROM items").fetchall()
+        if library_id is None:
+            rows = conn.execute("SELECT key FROM items").fetchall()
+        else:
+            rows = conn.execute("SELECT key FROM items WHERE libraryID = ?", (library_id,)).fetchall()
         return {row[0] for row in rows}
 
-    def get_items_with_text(self, limit: int | None = None, include_fulltext: bool = False, key_filter: str | None = None, collection_keys: list[str] | None = None) -> list[ZoteroItem]:
+    def resolve_library_id(self, library_id: str, library_type: str) -> int | None:
+        """Map an MCP/API library identity to Zotero's internal libraryID."""
+        conn = self._get_connection()
+        kind = {
+            "users": "user",
+            "groups": "group",
+            "feeds": "feed",
+        }.get((library_type or "user").lower(), (library_type or "user").lower())
+        if kind == "group":
+            row = conn.execute(
+                "SELECT libraryID FROM groups WHERE groupID = ?",
+                (library_id,),
+            ).fetchone()
+            return int(row[0]) if row else None
+        if kind == "feed":
+            row = conn.execute(
+                "SELECT libraryID FROM libraries WHERE libraryID = ? AND type = 'feed'",
+                (library_id,),
+            ).fetchone()
+            return int(row[0]) if row else None
+
+        # Zotero's local HTTP API identifies the personal library as 0 while
+        # zotero.sqlite normally stores it under an internal positive ID.
+        if str(library_id) not in {"", "0"}:
+            row = conn.execute(
+                "SELECT libraryID FROM libraries WHERE libraryID = ? AND type = 'user'",
+                (library_id,),
+            ).fetchone()
+            if row:
+                return int(row[0])
+        try:
+            row = conn.execute(
+                "SELECT libraryID FROM libraries WHERE type = 'user' ORDER BY libraryID LIMIT 1"
+            ).fetchone()
+            return int(row[0]) if row else None
+        except sqlite3.OperationalError as exc:
+            # Small fixture/legacy snapshots may omit the libraries table. A
+            # single distinct libraryID is still unambiguous; multiple IDs are
+            # deliberately refused so callers never scan across libraries.
+            if "no such table" not in str(exc).lower():
+                raise
+            rows = conn.execute("SELECT DISTINCT libraryID FROM items ORDER BY libraryID LIMIT 2").fetchall()
+            return int(rows[0][0]) if len(rows) == 1 else None
+
+    def get_items_with_text(
+        self,
+        limit: int | None = None,
+        include_fulltext: bool = False,
+        key_filter: str | None = None,
+        collection_keys: list[str] | None = None,
+        library_id: int | None = None,
+    ) -> list[ZoteroItem]:
         """
         Get all items with their text content for semantic search.
 
@@ -1494,21 +1477,35 @@ class LocalZoteroReader:
         """
 
         params = []
+        if library_id is not None:
+            query += " AND i.libraryID = ?"
+            params.append(library_id)
         if collection_keys:
             # Restrict the corpus to the configured collections, including
             # all of their subcollections (resolved recursively).
             all_collection_ids = []
             for ckey in collection_keys:
-                root = conn.execute("SELECT collectionID FROM collections WHERE key = ?", (ckey,)).fetchone()
+                if library_id is None:
+                    root = conn.execute(
+                        "SELECT collectionID FROM collections WHERE key = ?",
+                        (ckey,),
+                    ).fetchone()
+                else:
+                    root = conn.execute(
+                        "SELECT collectionID FROM collections WHERE key = ? AND libraryID = ?",
+                        (ckey, library_id),
+                    ).fetchone()
                 if root:
                     to_process = [root[0]]
                     while to_process:
                         cid = to_process.pop()
                         all_collection_ids.append(cid)
-                        for sub in conn.execute("SELECT collectionID FROM collections WHERE parentCollectionID = ?", (cid,)).fetchall():
+                        for sub in conn.execute(
+                            "SELECT collectionID FROM collections WHERE parentCollectionID = ?", (cid,)
+                        ).fetchall():
                             to_process.append(sub[0])
             if all_collection_ids:
-                placeholders = ','.join('?' * len(all_collection_ids))
+                placeholders = ",".join("?" * len(all_collection_ids))
                 query += f" AND i.itemID IN (SELECT DISTINCT itemID FROM collectionItems WHERE collectionID IN ({placeholders}))"
                 params.extend(all_collection_ids)
 
@@ -1532,20 +1529,21 @@ class LocalZoteroReader:
 
         for row in cursor:
             item = ZoteroItem(
-                item_id=row['itemID'],
-                key=row['key'],
-                item_type_id=row['itemTypeID'],
-                item_type=row['item_type'],
-                doi=row['doi'],
-                title=row['title'],
-                abstract=row['abstract'],
-                creators=row['creators'],
-                fulltext=(res := (self._extract_fulltext_for_item(row['itemID']) if include_fulltext else None)) and res[0],
+                item_id=row["itemID"],
+                key=row["key"],
+                item_type_id=row["itemTypeID"],
+                item_type=row["item_type"],
+                doi=row["doi"],
+                title=row["title"],
+                abstract=row["abstract"],
+                creators=row["creators"],
+                fulltext=(res := (self._extract_fulltext_for_item(row["itemID"]) if include_fulltext else None))
+                and res[0],
                 fulltext_source=res[1] if include_fulltext and res else None,
-                notes=row['notes'],
-                extra=row['extra'],
-                date_added=row['dateAdded'],
-                date_modified=row['dateModified']
+                notes=row["notes"],
+                extra=row["extra"],
+                date_added=row["dateAdded"],
+                date_modified=row["dateModified"],
             )
             items.append(item)
 
@@ -1568,29 +1566,34 @@ class LocalZoteroReader:
     ) -> tuple[str, str] | None:
         return self._extract_fulltext_for_item(item_id, allowed_attachment_keys)
 
-    def get_attachment_paths(self, parent_key: str) -> list[dict]:
+    def get_attachment_paths(self, parent_key: str, library_id: int | None = None) -> list[dict]:
         """Return resolved filesystem paths for a parent item's attachments.
 
         Each entry has: ``key`` (attachment key), ``content_type``, ``zotero_path``
         (the raw stored path like ``storage:foo.pdf``), ``resolved_path`` (a
         ``Path`` or ``None`` if it could not be resolved), and ``exists`` (bool).
         """
-        item = self.get_item_by_key(parent_key)
+        if library_id is None:
+            item = self.get_item_by_key(parent_key)
+        else:
+            item = self.get_item_by_key(parent_key, library_id=library_id)
         if not item:
             return []
         out: list[dict] = []
         for att_key, zotero_path, ctype in self._iter_parent_attachments(item.item_id):
             resolved = self._resolve_attachment_path(att_key, zotero_path or "")
-            out.append({
-                "key": att_key,
-                "content_type": ctype,
-                "zotero_path": zotero_path,
-                "resolved_path": resolved,
-                "exists": bool(resolved and resolved.exists()),
-            })
+            out.append(
+                {
+                    "key": att_key,
+                    "content_type": ctype,
+                    "zotero_path": zotero_path,
+                    "resolved_path": resolved,
+                    "exists": bool(resolved and resolved.exists()),
+                }
+            )
         return out
 
-    def get_item_by_key(self, key: str) -> ZoteroItem | None:
+    def get_item_by_key(self, key: str, library_id: int | None = None) -> ZoteroItem | None:
         """
         Get a specific item by its Zotero key.
 
@@ -1600,7 +1603,7 @@ class LocalZoteroReader:
         Returns:
             ZoteroItem if found, None otherwise.
         """
-        items = self.get_items_with_text(key_filter=key)
+        items = self.get_items_with_text(key_filter=key, library_id=library_id)
         return items[0] if items else None
 
     def search_items_by_text(self, query: str, limit: int = 50) -> list[ZoteroItem]:
@@ -1633,7 +1636,8 @@ class LocalZoteroReader:
         conn = self._get_connection()
         cursor = conn.cursor()
         pattern = f"%{query}%"
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT i.key, n.note, n.title,
                    pi.key as parentKey,
                    pdv.value as parentTitle
@@ -1645,24 +1649,29 @@ class LocalZoteroReader:
             WHERE n.note LIKE ?
             AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
             LIMIT ?
-        """, (pattern, limit))
+        """,
+            (pattern, limit),
+        )
 
         results = []
         for row in cursor.fetchall():
             note_html = row[1] or ""
             # Post-filter: skip if query only matches HTML tags, not content
             from zotero_mcp.utils import clean_html
+
             clean_text = clean_html(note_html)
             if query.lower() not in clean_text.lower():
                 continue
-            results.append({
-                "type": "note",
-                "key": row[0],
-                "text": note_html,
-                "parent_key": row[3],
-                "parent_title": row[4] or ("Unknown" if row[3] else None),
-                "tags": [],  # Tags require a separate query; omitted for speed
-            })
+            results.append(
+                {
+                    "type": "note",
+                    "key": row[0],
+                    "text": note_html,
+                    "parent_key": row[3],
+                    "parent_title": row[4] or ("Unknown" if row[3] else None),
+                    "tags": [],  # Tags require a separate query; omitted for speed
+                }
+            )
         return results
 
     def search_annotations_local(self, query: str, limit: int = 20) -> list[dict]:
@@ -1671,7 +1680,8 @@ class LocalZoteroReader:
         cursor = conn.cursor()
         pattern = f"%{query}%"
         # Two-hop join: annotation -> attachment -> grandparent item (for title)
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT i.key, ia.text, ia.comment, ia.type, ia.color, ia.pageLabel,
                    att.key as attachmentKey,
                    gpi.key as parentKey,
@@ -1686,25 +1696,29 @@ class LocalZoteroReader:
             WHERE (ia.text LIKE ? OR ia.comment LIKE ?)
             AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
             LIMIT ?
-        """, (pattern, pattern, limit))
+        """,
+            (pattern, pattern, limit),
+        )
 
         # Map integer annotation types to names
         type_map = {1: "highlight", 2: "note", 3: "image", 4: "ink", 5: "underline"}
 
         results = []
         for row in cursor.fetchall():
-            results.append({
-                "type": "annotation",
-                "key": row[0],
-                "text": row[1] or "",
-                "comment": row[2] or "",
-                "annotation_type": type_map.get(row[3], "unknown"),
-                "color": row[4] or "",
-                "page_label": row[5] or None,
-                "attachment_key": row[6],
-                "parent_key": row[7],
-                "parent_title": row[8] or ("Unknown" if row[7] else None),
-            })
+            results.append(
+                {
+                    "type": "annotation",
+                    "key": row[0],
+                    "text": row[1] or "",
+                    "comment": row[2] or "",
+                    "annotation_type": type_map.get(row[3], "unknown"),
+                    "color": row[4] or "",
+                    "page_label": row[5] or None,
+                    "attachment_key": row[6],
+                    "parent_key": row[7],
+                    "parent_title": row[8] or ("Unknown" if row[7] else None),
+                }
+            )
         return results
 
 

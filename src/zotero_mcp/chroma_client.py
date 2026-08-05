@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import uuid
@@ -25,8 +26,7 @@ try:
     from chromadb.utils.embedding_functions import register_embedding_function
 except ImportError as e:
     raise ImportError(
-        "chromadb is required for semantic search. "
-        "Install it with: pip install 'zotero-mcp-server[semantic]'"
+        "chromadb is required for semantic search. Install it with: pip install 'zotero-mcp-server[semantic]'"
     ) from e
 
 from zotero_mcp._atomic_io import atomic_write_json, durable_unlink
@@ -36,8 +36,7 @@ from zotero_mcp.utils import suppress_stdout
 logger = logging.getLogger(__name__)
 
 DEFAULT_QWEN_QUERY_INSTRUCTION = (
-    "Given a scientific literature search query, retrieve relevant passages "
-    "that identify papers addressing the query"
+    "Given a scientific literature search query, retrieve relevant passages that identify papers addressing the query"
 )
 
 INDEX_LIFECYCLE_LOCK_NAME = ".zotero-mcp-index-lifecycle.lock"
@@ -141,11 +140,17 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
     # portable; real OpenAI users can raise embedding_config.request_batch_size.
     DEFAULT_REQUEST_BATCH_SIZE = 64
 
-    def __init__(self, model_name: str = "text-embedding-3-small", api_key: str | None = None,
-                 base_url: str | None = None, request_batch_size: int | None = None,
-                 rate_limit_rps: float | None = None,
-                 query_instruction: str | None = None):
+    def __init__(
+        self,
+        model_name: str = "text-embedding-3-small",
+        api_key: str | None = None,
+        base_url: str | None = None,
+        request_batch_size: int | None = None,
+        rate_limit_rps: float | None = None,
+        query_instruction: str | None = None,
+    ):
         import threading
+
         self.model_name = model_name
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
@@ -159,6 +164,7 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
 
         try:
             import openai
+
             client_kwargs = {"api_key": self.api_key}
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
@@ -198,6 +204,7 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         if not rps or rps <= 0:
             return
         import time
+
         with self._rate_lock:
             min_interval = 1.0 / rps
             wait = min_interval - (time.monotonic() - self._last_request_ts)
@@ -221,7 +228,7 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
             cancel_event = getattr(self, "_zotero_mcp_cancel_event", None)
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("Embedding update cancellation requested")
-            sub = input[i:i + batch_size]
+            sub = input[i : i + batch_size]
             self._wait_for_rate_limit()
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("Embedding update cancellation requested")
@@ -241,7 +248,8 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         """Truncate using tiktoken cl100k_base (correct for OpenAI models)."""
         try:
             import tiktoken
-            if not hasattr(self, '_tokenizer'):
+
+            if not hasattr(self, "_tokenizer"):
                 self._tokenizer = tiktoken.get_encoding("cl100k_base")
             tokens = self._tokenizer.encode(text, disallowed_special=())
             if len(tokens) > max_tokens:
@@ -287,7 +295,9 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
     # prefix tokens are reserved separately (see V2_PREFIX_TOKEN_BUDGET).
     max_input_tokens = 2000
 
-    def __init__(self, model_name: str = "gemini-embedding-001", api_key: str | None = None, base_url: str | None = None):
+    def __init__(
+        self, model_name: str = "gemini-embedding-001", api_key: str | None = None, base_url: str | None = None
+    ):
         self.model_name = model_name
         # Model-aware token limit. For v2 models, derive from:
         #   hard_cap (8192) - safety_margin (192, for char-based truncation
@@ -306,6 +316,7 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
         try:
             from google import genai
             from google.genai import types
+
             client_kwargs = {"api_key": self.api_key}
             if self.base_url:
                 http_options = types.HttpOptions(baseUrl=self.base_url)
@@ -357,7 +368,7 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
 
         embeddings: list = []
         for start in range(0, len(prepared), self.GEMINI_MAX_BATCH):
-            batch = prepared[start:start + self.GEMINI_MAX_BATCH]
+            batch = prepared[start : start + self.GEMINI_MAX_BATCH]
             if is_v2:
                 response = self.client.models.embed_content(
                     model=self.model_name,
@@ -429,10 +440,13 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
 
         try:
             from sentence_transformers import SentenceTransformer
+
             logger.info(f"Loading embedding model: {model_name}")
             self.model = SentenceTransformer(model_name, trust_remote_code=True)
         except ImportError:
-            raise ImportError("sentence-transformers package is required for HuggingFace embeddings. Install with: pip install sentence-transformers")
+            raise ImportError(
+                "sentence-transformers package is required for HuggingFace embeddings. Install with: pip install sentence-transformers"
+            )
 
         # Read limit from model metadata; conservative fallback
         self.max_input_tokens = getattr(self.model, "max_seq_length", 500)
@@ -461,7 +475,7 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
 
     def truncate(self, text: str, max_tokens: int) -> str:
         """Truncate using the model's own tokenizer."""
-        tokenizer = getattr(self.model, 'tokenizer', None)
+        tokenizer = getattr(self.model, "tokenizer", None)
         if tokenizer is not None:
             encoded = tokenizer.encode(text, add_special_tokens=False)
             if len(encoded) > max_tokens:
@@ -539,9 +553,7 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
         data = response.json()
         embeddings = data.get("embeddings")
         if embeddings is None:
-            raise ValueError(
-                f"Ollama /api/embed returned no 'embeddings' field: {data}"
-            )
+            raise ValueError(f"Ollama /api/embed returned no 'embeddings' field: {data}")
         return embeddings
 
     def embed_query(self, text: str) -> list[float]:
@@ -559,12 +571,14 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
 class ChromaClient:
     """ChromaDB client for Zotero semantic search."""
 
-    def __init__(self,
-                 collection_name: str = "zotero_library",
-                 persist_directory: str | None = None,
-                 embedding_model: str = "default",
-                 embedding_config: dict[str, Any] | None = None,
-                 allow_embedding_mismatch: bool = False):
+    def __init__(
+        self,
+        collection_name: str = "zotero_library",
+        persist_directory: str | None = None,
+        embedding_model: str = "default",
+        embedding_config: dict[str, Any] | None = None,
+        allow_embedding_mismatch: bool = False,
+    ):
         """
         Initialize ChromaDB client.
 
@@ -591,24 +605,15 @@ class ChromaClient:
             persist_directory = str(config_dir / "chroma_db")
 
         self.persist_directory = persist_directory
-        marker_token = hashlib.sha256(
-            self.collection_name.encode("utf-8")
-        ).hexdigest()[:16]
-        self._rebuild_marker_path = (
-            Path(self.persist_directory)
-            / f".zotero-mcp-rebuild-{marker_token}.json"
-        )
+        marker_token = hashlib.sha256(self.collection_name.encode("utf-8")).hexdigest()[:16]
+        self._rebuild_marker_path = Path(self.persist_directory) / f".zotero-mcp-rebuild-{marker_token}.json"
 
         # Model construction can involve network or local model loading, so it
         # deliberately happens outside the short-lived persistence lock.
         with suppress_stdout():
             with index_lifecycle_lock(self.persist_directory, exclusive=False):
                 self.client = chromadb.PersistentClient(
-                    path=self.persist_directory,
-                    settings=Settings(
-                        anonymized_telemetry=False,
-                        allow_reset=True
-                    )
+                    path=self.persist_directory, settings=Settings(anonymized_telemetry=False, allow_reset=True)
                 )
             self.embedding_function = self._create_embedding_function()
 
@@ -639,14 +644,11 @@ class ChromaClient:
                 configured_model = getattr(self.embedding_function, "model_name", None)
                 if stored_model and configured_model and stored_model != configured_model:
                     self._handle_embedding_mismatch(
-                        f"stored model '{stored_model}' differs from configured "
-                        f"model '{configured_model}'",
+                        f"stored model '{stored_model}' differs from configured model '{configured_model}'",
                         allow_embedding_mismatch,
                     )
 
-                stored_identity = (getattr(self.collection, "metadata", {}) or {}).get(
-                    "zotero_mcp_embedding_identity"
-                )
+                stored_identity = (getattr(self.collection, "metadata", {}) or {}).get("zotero_mcp_embedding_identity")
                 if stored_identity and stored_identity != self.embedding_identity:
                     self._handle_embedding_mismatch(
                         f"stored identity '{stored_identity}' differs from configured "
@@ -710,9 +712,7 @@ class ChromaClient:
                 return None
             raw = getattr(rows[0], "config_json_str", None) or "{}"
             cfg = json.loads(raw)
-            return cfg.get("embedding_function", {}).get("config", {}).get(
-                "model_name"
-            )
+            return cfg.get("embedding_function", {}).get("config", {}).get("model_name")
         except Exception as e:
             logger.debug("Could not inspect stored embedding model: %s", e)
             return None
@@ -764,7 +764,9 @@ class ChromaClient:
             api_key = self.embedding_config.get("api_key")
             base_url = self.embedding_config.get("base_url")
             return OpenAIEmbeddingFunction(
-                model_name=model_name, api_key=api_key, base_url=base_url,
+                model_name=model_name,
+                api_key=api_key,
+                base_url=base_url,
                 request_batch_size=self.embedding_config.get("request_batch_size"),
                 rate_limit_rps=self.embedding_config.get("rate_limit_rps"),
                 query_instruction=query_instruction,
@@ -825,11 +827,12 @@ class ChromaClient:
         """
         if max_tokens is None:
             max_tokens = self.embedding_max_tokens
-        if hasattr(self.embedding_function, 'truncate'):
+        if hasattr(self.embedding_function, "truncate"):
             return self.embedding_function.truncate(text, max_tokens)
         # Fallback for default ChromaDB embedding function
         try:
             import tiktoken
+
             enc = tiktoken.get_encoding("cl100k_base")
             tokens = enc.encode(text, disallowed_special=())
             if len(tokens) > max_tokens:
@@ -842,10 +845,7 @@ class ChromaClient:
         return text
 
     @_with_index_lifecycle_lock(exclusive=False)
-    def add_documents(self,
-                     documents: list[str],
-                     metadatas: list[dict[str, Any]],
-                     ids: list[str]) -> None:
+    def add_documents(self, documents: list[str], metadatas: list[dict[str, Any]], ids: list[str]) -> None:
         """
         Add documents to the collection.
 
@@ -856,21 +856,14 @@ class ChromaClient:
         """
         self._ensure_live_collection()
         try:
-            self.collection.add(
-                documents=documents,
-                metadatas=metadatas,
-                ids=ids
-            )
+            self.collection.add(documents=documents, metadatas=metadatas, ids=ids)
             logger.info(f"Added {len(documents)} documents to ChromaDB collection")
         except Exception as e:
             logger.error(f"Error adding documents to ChromaDB: {e}")
             raise
 
     @_with_index_lifecycle_lock(exclusive=False)
-    def upsert_documents(self,
-                        documents: list[str],
-                        metadatas: list[dict[str, Any]],
-                        ids: list[str]) -> None:
+    def upsert_documents(self, documents: list[str], metadatas: list[dict[str, Any]], ids: list[str]) -> None:
         """
         Upsert (update or insert) documents to the collection.
 
@@ -890,9 +883,9 @@ class ChromaClient:
                 max_batch = 5000
             for i in range(0, len(ids), max_batch):
                 self.collection.upsert(
-                    documents=documents[i:i + max_batch],
-                    metadatas=metadatas[i:i + max_batch],
-                    ids=ids[i:i + max_batch]
+                    documents=documents[i : i + max_batch],
+                    metadatas=metadatas[i : i + max_batch],
+                    ids=ids[i : i + max_batch],
                 )
             logger.info(f"Upserted {len(documents)} documents to ChromaDB collection")
         except Exception as e:
@@ -907,10 +900,7 @@ class ChromaClient:
             self._embedding_cancel_event,
         )
         embeddings = self.embedding_function(documents)
-        return [
-            embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
-            for embedding in embeddings
-        ]
+        return [embedding.tolist() if hasattr(embedding, "tolist") else list(embedding) for embedding in embeddings]
 
     def set_embedding_cancel_event(self, event) -> None:
         """Set cooperative cancellation for realtime embedding requests."""
@@ -918,11 +908,9 @@ class ChromaClient:
         setattr(self.embedding_function, "_zotero_mcp_cancel_event", event)
 
     @_with_index_lifecycle_lock(exclusive=False)
-    def upsert_embeddings(self,
-                         documents: list[str],
-                         metadatas: list[dict[str, Any]],
-                         ids: list[str],
-                         embeddings: list[list[float]]) -> None:
+    def upsert_embeddings(
+        self, documents: list[str], metadatas: list[dict[str, Any]], ids: list[str], embeddings: list[list[float]]
+    ) -> None:
         """
         Upsert documents with precomputed embeddings.
 
@@ -937,10 +925,10 @@ class ChromaClient:
                 max_batch = 5000
             for i in range(0, len(ids), max_batch):
                 self.collection.upsert(
-                    documents=documents[i:i + max_batch],
-                    metadatas=metadatas[i:i + max_batch],
-                    ids=ids[i:i + max_batch],
-                    embeddings=embeddings[i:i + max_batch],
+                    documents=documents[i : i + max_batch],
+                    metadatas=metadatas[i : i + max_batch],
+                    ids=ids[i : i + max_batch],
+                    embeddings=embeddings[i : i + max_batch],
                 )
             logger.info(f"Upserted {len(documents)} precomputed embeddings to ChromaDB collection")
         except Exception as e:
@@ -991,8 +979,8 @@ class ChromaClient:
                 max_batch = 5000
             for i in range(0, len(ids), max_batch):
                 self.collection.update(
-                    ids=ids[i:i + max_batch],
-                    metadatas=metadatas[i:i + max_batch],
+                    ids=ids[i : i + max_batch],
+                    metadatas=metadatas[i : i + max_batch],
                 )
             logger.info("Updated metadata for %s existing documents", len(ids))
         except Exception as e:
@@ -1033,11 +1021,13 @@ class ChromaClient:
         return len(update_ids)
 
     @_with_index_lifecycle_lock(exclusive=False)
-    def search(self,
-               query_texts: list[str],
-               n_results: int = 10,
-               where: dict[str, Any] | None = None,
-               where_document: dict[str, Any] | None = None) -> dict[str, Any]:
+    def search(
+        self,
+        query_texts: list[str],
+        n_results: int = 10,
+        where: dict[str, Any] | None = None,
+        where_document: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """
         Search for similar documents.
 
@@ -1064,14 +1054,19 @@ class ChromaClient:
             # its embed_query returns chunked results, not a single vector.
             _is_custom_ef = isinstance(
                 self.embedding_function,
-                (OpenAIEmbeddingFunction, GeminiEmbeddingFunction, HuggingFaceEmbeddingFunction, OllamaEmbeddingFunction),
+                (
+                    OpenAIEmbeddingFunction,
+                    GeminiEmbeddingFunction,
+                    HuggingFaceEmbeddingFunction,
+                    OllamaEmbeddingFunction,
+                ),
             )
-            if _is_custom_ef and hasattr(self.embedding_function, 'embed_query') and query_texts:
+            if _is_custom_ef and hasattr(self.embedding_function, "embed_query") and query_texts:
                 query_embeddings = []
                 for qt in query_texts:
                     emb = self.embedding_function.embed_query(qt)
                     # Ensure plain Python floats (some providers return numpy)
-                    if hasattr(emb, 'tolist'):
+                    if hasattr(emb, "tolist"):
                         emb = emb.tolist()
                     query_embeddings.append(emb)
                 query_kwargs["query_embeddings"] = query_embeddings
@@ -1153,18 +1148,12 @@ class ChromaClient:
         identities: dict[str, str] = {}
         for index, doc_id in enumerate(result.get("ids", [])):
             metadata = metadatas[index] if index < len(metadatas) else None
-            stored_hash = (
-                metadata.get("embedding_content_sha256")
-                if isinstance(metadata, dict)
-                else None
-            )
+            stored_hash = metadata.get("embedding_content_sha256") if isinstance(metadata, dict) else None
             if stored_hash:
                 identities[doc_id] = str(stored_hash)
                 continue
             document = documents[index] if index < len(documents) else ""
-            identities[doc_id] = hashlib.sha256(
-                (document or "").encode("utf-8")
-            ).hexdigest()
+            identities[doc_id] = hashlib.sha256((document or "").encode("utf-8")).hexdigest()
         return identities
 
     @_with_index_lifecycle_lock(exclusive=False)
@@ -1282,9 +1271,7 @@ class ChromaClient:
                 uri=True,
             )
             try:
-                referenced_ids = {
-                    row[0] for row in connection.execute("SELECT id FROM segments")
-                }
+                referenced_ids = {row[0] for row in connection.execute("SELECT id FROM segments")}
             finally:
                 connection.close()
         except Exception as error:
@@ -1313,9 +1300,7 @@ class ChromaClient:
                 logger.warning("Could not remove orphan Chroma segment %s: %s", path, error)
 
         try:
-            (persist_directory / ".zotero-mcp-orphan-segments.json").unlink(
-                missing_ok=True
-            )
+            (persist_directory / ".zotero-mcp-orphan-segments.json").unlink(missing_ok=True)
         except OSError as error:
             result["errors"] += 1
             logger.warning("Could not remove obsolete orphan-segment ledger: %s", error)
@@ -1470,21 +1455,14 @@ class ChromaClient:
 
     def _recover_unmarked_collection_gap(self) -> None:
         """Restore a lone backup if a power loss dropped the swap marker."""
-        names = {
-            getattr(collection, "name", collection)
-            for collection in self.client.list_collections()
-        }
+        names = {getattr(collection, "name", collection) for collection in self.client.list_collections()}
         if self.collection_name in names:
             return
 
         backup_prefix = f"{self.collection_name}__replaced_"
         staging_prefix = f"{self.collection_name}__rebuild_"
-        backups = sorted(
-            name for name in names if isinstance(name, str) and name.startswith(backup_prefix)
-        )
-        stagings = sorted(
-            name for name in names if isinstance(name, str) and name.startswith(staging_prefix)
-        )
+        backups = sorted(name for name in names if isinstance(name, str) and name.startswith(backup_prefix))
+        stagings = sorted(name for name in names if isinstance(name, str) and name.startswith(staging_prefix))
         if len(backups) == 1:
             backup = self.client.get_collection(
                 name=backups[0],
@@ -1510,27 +1488,20 @@ class ChromaClient:
         if not self._rebuild_marker_path.exists():
             return
         try:
-            marker = json.loads(
-                self._rebuild_marker_path.read_text(encoding="utf-8")
-            )
+            marker = json.loads(self._rebuild_marker_path.read_text(encoding="utf-8"))
             if marker.get("collection_name") != self.collection_name:
                 raise ValueError("marker collection name does not match")
             staging_name = str(marker["staging_name"])
             backup_name = str(marker["backup_name"])
             expected_staging = f"{self.collection_name}__rebuild_"
             expected_backup = f"{self.collection_name}__replaced_"
-            if not staging_name.startswith(expected_staging) or not backup_name.startswith(
-                expected_backup
-            ):
+            if not staging_name.startswith(expected_staging) or not backup_name.startswith(expected_backup):
                 raise ValueError("marker contains unsafe collection names")
         except Exception as e:
             logger.error("Invalid rebuild recovery marker: %s", e)
             raise RuntimeError("Invalid semantic-index rebuild recovery marker") from e
 
-        names = {
-            getattr(collection, "name", collection)
-            for collection in self.client.list_collections()
-        }
+        names = {getattr(collection, "name", collection) for collection in self.client.list_collections()}
         live_exists = self.collection_name in names
         staging_exists = staging_name in names
         backup_exists = backup_name in names
@@ -1554,9 +1525,7 @@ class ChromaClient:
             )
             staging.modify(name=self.collection_name)
         else:
-            raise RuntimeError(
-                "Interrupted semantic-index swap has no recoverable collection"
-            )
+            raise RuntimeError("Interrupted semantic-index swap has no recoverable collection")
         self._prune_orphan_segment_directories_unlocked(allow_during_swap=True)
         self._clear_rebuild_marker()
         logger.warning(
@@ -1624,10 +1593,31 @@ class ChromaClient:
             raise
 
 
+def scoped_collection_name(
+    base_name: str,
+    *,
+    scope_identity: str | None = None,
+) -> str:
+    """Return the Chroma collection for the effective Zotero library.
+
+    The configured default library keeps the historical collection name so an
+    upgrade never strands a useful existing index. Switched libraries receive
+    isolated collections; Zotero item keys are unique only within a library.
+    """
+    from .client import get_default_library, library_identity
+
+    identity = scope_identity or library_identity()
+    if identity == library_identity(get_default_library()):
+        return base_name
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", identity).strip("_") or "library"
+    return f"{base_name}__{slug}"
+
+
 def create_chroma_client(
     config_path: str | None = None,
     *,
     allow_embedding_mismatch: bool = False,
+    scope_identity: str | None = None,
 ) -> ChromaClient:
     """
     Create a ChromaClient instance from configuration.
@@ -1639,11 +1629,7 @@ def create_chroma_client(
         Configured ChromaClient instance
     """
     # Default configuration
-    config = {
-        "collection_name": "zotero_library",
-        "embedding_model": "default",
-        "embedding_config": {}
-    }
+    config = {"collection_name": "zotero_library", "embedding_model": "default", "embedding_config": {}}
 
     # Load configuration from file if it exists
     if config_path and os.path.exists(config_path):
@@ -1682,9 +1668,7 @@ def create_chroma_client(
             if env_key:
                 ec["api_key"] = env_key
         if not ec.get("model_name"):
-            ec["model_name"] = os.getenv(
-                "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
-            )
+            ec["model_name"] = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
         if not ec.get("base_url"):
             env_base = os.getenv("OPENAI_BASE_URL")
             if env_base:
@@ -1699,9 +1683,7 @@ def create_chroma_client(
             if env_key:
                 ec["api_key"] = env_key
         if not ec.get("model_name"):
-            ec["model_name"] = os.getenv(
-                "GEMINI_EMBEDDING_MODEL", "gemini-embedding-001"
-            )
+            ec["model_name"] = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
         if not ec.get("base_url"):
             env_base = os.getenv("GEMINI_BASE_URL")
             if env_base:
@@ -1719,8 +1701,12 @@ def create_chroma_client(
                 ec["base_url"] = env_base
         config["embedding_config"] = ec
 
+    collection_name = scoped_collection_name(
+        config.get("collection_name") or "zotero_library",
+        scope_identity=scope_identity,
+    )
     return ChromaClient(
-        collection_name=config["collection_name"],
+        collection_name=collection_name,
         embedding_model=config["embedding_model"],
         embedding_config=config["embedding_config"],
         allow_embedding_mismatch=allow_embedding_mismatch,
@@ -1762,6 +1748,7 @@ def read_collection_status(
     config_path: str | None = None,
     *,
     persist_directory: str | None = None,
+    scope_identity: str | None = None,
 ) -> dict[str, Any]:
     """Read ChromaDB collection stats WITHOUT loading an embedding model.
 
@@ -1796,6 +1783,10 @@ def read_collection_status(
 
     if persist_directory is None:
         persist_directory = str(Path.home() / ".config" / "zotero-mcp" / "chroma_db")
+    collection_name = scoped_collection_name(
+        collection_name or "zotero_library",
+        scope_identity=scope_identity,
+    )
     base = {
         "name": collection_name,
         "embedding_model": embedding_model,
