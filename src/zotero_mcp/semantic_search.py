@@ -935,7 +935,9 @@ class ZoteroSemanticSearch:
         state = library_states.setdefault(identity, {})
         state["library_id"] = library.get("library_id", "")
         state["library_type"] = library.get("library_type", "user")
-        collection_name = getattr(self.chroma_client, "collection_name", None)
+        collection_name = getattr(
+            getattr(self, "chroma_client", None), "collection_name", None
+        )
         if collection_name:
             state["collection_name"] = collection_name
         state["last_update"] = self.update_config.get("last_update")

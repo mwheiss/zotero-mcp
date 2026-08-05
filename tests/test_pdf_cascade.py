@@ -1,10 +1,9 @@
 """Unit tests for the PDF attachment cascade (_try_unpaywall, _try_arxiv_from_crossref,
 _try_semantic_scholar, _try_pmc, _download_and_attach_pdf, _try_attach_oa_pdf)."""
 
-import json
 
-import pytest
 import requests
+from conftest import FakeZotero
 
 from zotero_mcp.server import (
     _download_and_attach_pdf,
@@ -14,8 +13,6 @@ from zotero_mcp.server import (
     _try_semantic_scholar,
     _try_unpaywall,
 )
-from conftest import DummyContext, FakeZotero
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -336,6 +333,7 @@ class TestTryAttachOaPdf:
         zot = _AttachZotero()
         doi = "10.1234/cascade"
         call_log = []
+        _allow_ssrf_guard(monkeypatch)
 
         # Make Unpaywall, S2 return nothing; arXiv has no crossref metadata
         def fake_get(url, **kwargs):

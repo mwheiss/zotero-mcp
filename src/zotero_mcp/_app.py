@@ -1,10 +1,10 @@
 """FastMCP application instance and server lifecycle."""
 
-import asyncio
 import json
 import logging
 import os
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -59,25 +59,29 @@ async def server_lifespan(server: FastMCP):
     """Manage server startup and shutdown lifecycle.
 
     Semantic search initialization (ChromaDB + embedding model) is
-    offloaded to a worker thread so it cannot block the event loop.
+    offloaded to a daemon thread so it cannot block the event loop.
     The previous synchronous call prevented FastMCP from responding
     to the MCP ``initialize`` request within the 60-second client
     timeout.
 
-    On shutdown the worker thread is left to finish on its own —
-    ``asyncio.to_thread`` threads cannot be interrupted, and
-    ChromaDB (SQLite WAL) is crash-safe, so an unfinished update
-    simply resumes on the next startup.
+    On shutdown the worker thread is left to finish on its own. ChromaDB
+    (SQLite WAL) is crash-safe, so an unfinished update simply resumes on the
+    next startup. A dedicated daemon avoids making event-loop shutdown wait on
+    Python's default executor.
     """
     sys.stderr.write("Starting Zotero MCP server...\n")
 
-    async def _background_update():
+    def _background_update():
         try:
-            await asyncio.to_thread(_sync_semantic_update)
+            _sync_semantic_update()
         except Exception as e:
             sys.stderr.write(f"Warning: Could not check semantic search auto-update: {e}\n")
 
-    asyncio.create_task(_background_update())
+    threading.Thread(
+        target=_background_update,
+        name="zotero-mcp-semantic-auto-update",
+        daemon=True,
+    ).start()
 
     yield {}
 

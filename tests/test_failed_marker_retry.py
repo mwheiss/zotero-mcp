@@ -66,10 +66,23 @@ class FakeReader:
     def __exit__(self, *exc):
         return False
 
-    def get_all_item_keys(self):
+    def resolve_library_id(self, library_id, library_type):
+        assert library_type == "user"
+        return 1
+
+    def get_all_item_keys(self, library_id=None):
+        assert library_id == 1
         return {"ITEMKEY1"}
 
-    def get_items_with_text(self, limit=None, include_fulltext=False, key_filter=None, collection_keys=None):
+    def get_items_with_text(
+        self,
+        limit=None,
+        include_fulltext=False,
+        key_filter=None,
+        collection_keys=None,
+        library_id=None,
+    ):
+        assert library_id == 1
         return [FakeItem()]
 
     def get_fulltext_meta_for_item(self, item_id, allowed_attachment_keys=None):
