@@ -1,4 +1,12 @@
-from zotero_mcp.chroma_client import ChromaClient, scoped_collection_name
+import chromadb
+from chromadb.config import Settings
+
+from zotero_mcp.chroma_client import (
+    ChromaClient,
+    _existing_collection_owner,
+    _NoEmbeddingFunction,
+    scoped_collection_name,
+)
 
 
 def test_default_library_keeps_historical_collection(monkeypatch):
@@ -40,3 +48,33 @@ def test_new_collection_metadata_records_library_owner():
     assert client._new_collection_metadata()["zotero_mcp_library_identity"] == (
         "group:5910265"
     )
+
+
+def test_claiming_legacy_owner_preserves_cosine_configuration(tmp_path):
+    persist_directory = str(tmp_path / "chroma")
+    raw_client = chromadb.PersistentClient(
+        path=persist_directory,
+        settings=Settings(anonymized_telemetry=False, allow_reset=True),
+    )
+    raw_client.get_or_create_collection(
+        "zotero_library",
+        embedding_function=_NoEmbeddingFunction(),
+        metadata={"hnsw:space": "cosine", "marker": "preserved"},
+    )
+
+    owner = _existing_collection_owner(
+        "zotero_library",
+        persist_directory,
+        claim_identity="user:0",
+    )
+    collection = raw_client.get_collection(
+        "zotero_library",
+        embedding_function=_NoEmbeddingFunction(),
+    )
+
+    assert owner == "user:0"
+    assert collection.metadata == {
+        "marker": "preserved",
+        "zotero_mcp_library_identity": "user:0",
+    }
+    assert collection.configuration_json["hnsw"]["space"] == "cosine"

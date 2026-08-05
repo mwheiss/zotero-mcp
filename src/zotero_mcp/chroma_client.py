@@ -680,7 +680,11 @@ class ChromaClient:
                     collection_metadata["zotero_mcp_library_identity"] = (
                         self.library_identity
                     )
-                    self.collection.modify(metadata=collection_metadata)
+                    self.collection.modify(
+                        metadata=_modifiable_collection_metadata(
+                            collection_metadata
+                        )
+                    )
 
                 self._require_cosine_collection(allow_embedding_mismatch)
 
@@ -771,6 +775,13 @@ class ChromaClient:
         """Reject indexes whose distances do not match search scoring."""
         metadata = getattr(self.collection, "metadata", {}) or {}
         metric = str(metadata.get("hnsw:space") or "").lower()
+        if not metric:
+            configuration = (
+                getattr(self.collection, "configuration_json", {}) or {}
+            )
+            metric = str(
+                (configuration.get("hnsw") or {}).get("space") or ""
+            ).lower()
         if metric == "cosine":
             return
 
@@ -1817,11 +1828,22 @@ def _existing_collection_owner(
                 owner = metadata.get("zotero_mcp_library_identity")
                 if not owner and claim_identity:
                     metadata["zotero_mcp_library_identity"] = claim_identity
-                    collection.modify(metadata=metadata)
+                    collection.modify(
+                        metadata=_modifiable_collection_metadata(metadata)
+                    )
                     owner = claim_identity
         return str(owner) if owner else None
     except NotFoundError:
         return None
+
+
+def _modifiable_collection_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Drop immutable HNSW creation keys before Chroma metadata updates."""
+    return {
+        key: value
+        for key, value in metadata.items()
+        if not key.startswith("hnsw:")
+    }
 
 
 def resolve_scoped_collection_name(
