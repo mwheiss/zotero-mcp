@@ -1,6 +1,8 @@
 import asyncio
 
+import pytest
 from conftest import DummyContext
+from fastmcp.exceptions import ToolError
 
 from zotero_mcp.server import get_capabilities, get_search_database_health, mcp
 from zotero_mcp.tool_profiles import (
@@ -103,3 +105,40 @@ def test_health_tool_scopes_audit_to_active_library(monkeypatch):
         "library_type": "group",
     }
     assert captured["full_integrity"] is False
+
+
+def test_connector_and_admin_profiles_hide_non_tool_surfaces(monkeypatch):
+    middleware = ToolProfileMiddleware()
+
+    async def listed(_context):
+        return ["registered"]
+
+    for profile in ("connector", "admin"):
+        monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", profile)
+        assert asyncio.run(middleware.on_list_prompts(None, listed)) == []
+        assert asyncio.run(middleware.on_list_resources(None, listed)) == []
+        assert asyncio.run(middleware.on_list_resource_templates(None, listed)) == []
+
+
+def test_research_profile_keeps_prompts_and_resources(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "research")
+    middleware = ToolProfileMiddleware()
+
+    async def listed(_context):
+        return ["registered"]
+
+    assert asyncio.run(middleware.on_list_prompts(None, listed)) == ["registered"]
+    assert asyncio.run(middleware.on_list_resources(None, listed)) == ["registered"]
+
+
+def test_hidden_resource_and_prompt_calls_are_rejected(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "connector")
+    middleware = ToolProfileMiddleware()
+
+    async def call_next(_context):
+        raise AssertionError("hidden surface must not be reached")
+
+    with pytest.raises(ToolError, match="Prompts are unavailable"):
+        asyncio.run(middleware.on_get_prompt(None, call_next))
+    with pytest.raises(ToolError, match="Resources are unavailable"):
+        asyncio.run(middleware.on_read_resource(None, call_next))

@@ -123,6 +123,28 @@ class ToolProfileMiddleware(Middleware):
         profile = effective_tool_profile()
         return [tool for tool in tools if tool_visible(tool.name, profile)]
 
+    async def on_list_prompts(self, context, call_next):
+        prompts = await call_next(context)
+        return [] if effective_tool_profile() in {"connector", "admin"} else prompts
+
+    async def on_list_resources(self, context, call_next):
+        resources = await call_next(context)
+        return [] if effective_tool_profile() in {"connector", "admin"} else resources
+
+    async def on_list_resource_templates(self, context, call_next):
+        templates = await call_next(context)
+        return [] if effective_tool_profile() in {"connector", "admin"} else templates
+
+    async def on_get_prompt(self, context, call_next):
+        if effective_tool_profile() in {"connector", "admin"}:
+            raise ToolError("Prompts are unavailable in this tool profile.")
+        return await call_next(context)
+
+    async def on_read_resource(self, context, call_next):
+        if effective_tool_profile() in {"connector", "admin"}:
+            raise ToolError("Resources are unavailable in this tool profile.")
+        return await call_next(context)
+
     async def on_call_tool(
         self,
         context: MiddlewareContext,

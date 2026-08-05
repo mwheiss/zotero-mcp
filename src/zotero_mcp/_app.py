@@ -10,6 +10,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from zotero_mcp.tool_contract import ToolContractMiddleware
 from zotero_mcp.tool_profiles import ToolProfileMiddleware
 
 # Configure logging from environment variable
@@ -96,3 +97,4 @@ mcp = FastMCP(
     lifespan=server_lifespan,
 )
 mcp.add_middleware(ToolProfileMiddleware())
+mcp.add_middleware(ToolContractMiddleware())

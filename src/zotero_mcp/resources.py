@@ -20,7 +20,7 @@ from zotero_mcp.tools import _helpers
 @mcp.resource(
     "zotero://collections",
     name="Zotero collections",
-    description="All collections in the active Zotero library (name, key, item count).",
+    description="All collections in the active Zotero library (name, key, and parent key).",
     mime_type="text/markdown",
 )
 @with_zotero_api_lock
@@ -47,7 +47,10 @@ def collections_resource() -> str:
 @mcp.resource(
     "zotero://items/{item_key}",
     name="Zotero item",
-    description="Full metadata for a single Zotero item by its 8-char key.",
+    description=(
+        "Summary bibliographic metadata for one Zotero item by its 8-character "
+        "key. This resource does not include attachment full text."
+    ),
     mime_type="text/markdown",
 )
 @with_zotero_api_lock
@@ -71,7 +74,10 @@ def item_resource(item_key: str) -> str:
 @mcp.resource(
     "zotero://collections/{collection_key}/items",
     name="Zotero collection items",
-    description="The items contained in a Zotero collection, by collection key.",
+    description=(
+        "Summary metadata for up to 200 items in a Zotero collection, by "
+        "collection key. Attachment full text is not included."
+    ),
     mime_type="text/markdown",
 )
 @with_zotero_api_lock

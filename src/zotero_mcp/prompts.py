@@ -27,12 +27,14 @@ def literature_review(topic: str, depth: str = "standard") -> str:
     steps = [
         f"Conduct a literature review on: **{topic}**.",
         "",
-        "Work through these steps, citing item keys and quoting matched passages:",
+        "Work through these steps, citing item keys and grounding claims in indexed passages:",
         f"1. Run `zotero_semantic_search(query='{topic}', limit=12)` to find the most "
         "relevant papers already in the library. Note each paper's key and the "
-        "matched passage.",
-        "2. Cluster the results into themes. For each theme, name the key papers and "
-        "summarize their contribution in 1-2 sentences with the supporting quote.",
+        "matched passage and Chunk ID.",
+        "2. For the strongest result in each theme, call "
+        "`zotero_get_semantic_context(chunk_id=<Chunk ID>, content_hash=<Chunk Hash>)` "
+        "before quoting or making a detailed claim. Then cluster the papers into "
+        "themes and summarize each contribution with the verified passage.",
     ]
     if depth in ("standard", "deep"):
         steps.append(
@@ -43,9 +45,11 @@ def literature_review(topic: str, depth: str = "standard") -> str:
         )
     if depth == "deep":
         steps.append(
-            "4. Run `zotero_library_coverage()` (or scoped to the relevant collection) "
-            "to list on-topic items missing a PDF, and offer to fetch them via "
-            "`zotero_add_by_doi`."
+            "4. If the review is collection-scoped, run "
+            "`zotero_library_coverage(collection_key=<key>)` to identify source-quality "
+            "gaps in that collection. Otherwise inspect children only for the result "
+            "items that matter; library-wide coverage is not a topic filter. Report "
+            "missing full text without creating duplicate records."
         )
     steps += [
         "",
@@ -72,7 +76,7 @@ def synthesize_my_notes(scope: str) -> str:
             f"Synthesize my own reading notes and highlights for: **{scope}**.",
             "",
             "1. Call `zotero_synthesize_annotations` (pass `collection_key` or `tag` if "
-            f"'{scope}' names one; otherwise gather library-wide and filter to the topic). "
+            f"'{scope}' names one; otherwise the tool must scan a bounded library-wide digest). "
             "This returns a per-paper digest of my highlights and notes.",
             "2. Read the digest and identify cross-cutting THEMES — points multiple "
             "papers agree on — and TENSIONS — where my highlighted sources disagree.",
@@ -99,8 +103,9 @@ def find_contradicting_evidence(claim: str) -> str:
             "2. `zotero_semantic_search` again with an INVERTED / skeptical phrasing of "
             "the claim (e.g. limitations, null results, criticisms) to surface "
             "disconfirming work.",
-            "3. Sort the results into SUPPORTS / CONTRADICTS / MIXED, quoting the matched "
-            "passage and citing the item key for each.",
+            "3. For evidence you will quote, call `zotero_get_semantic_context` with "
+            "the result's Chunk ID and Chunk Hash. Sort verified evidence into "
+            "SUPPORTS / CONTRADICTS / MIXED and cite the item key for each.",
             "4. Weigh the evidence: note study quality signals where visible (sample, "
             "method, recency) and state how well-supported the claim is overall.",
             "",
@@ -128,8 +133,9 @@ def expand_from_paper(identifier: str) -> str:
             "(follow-ups).",
             "2. Rank the related papers by relevance to my interests and by citation "
             "count. Highlight the ones already flagged as NOT in my library.",
-            "3. For the top not-in-library papers, offer to add them with "
-            "`zotero_add_by_doi` (which also tries to attach an open-access PDF).",
+            "3. For top papers not already in the library, ask before writing, then "
+            "use `zotero_add_by_doi(if_exists='reuse')`. Never use duplicate mode "
+            "unless the user explicitly requests another record.",
             "4. Summarize how the seed paper sits in its citation neighborhood: what it "
             "builds on, and how later work extended or challenged it.",
         ]
