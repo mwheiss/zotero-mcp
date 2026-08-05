@@ -697,8 +697,9 @@ class ChromaClient:
             "zotero_mcp_embedding_identity": self.embedding_identity,
             "hnsw:space": "cosine",
         }
-        if self.library_identity:
-            metadata["zotero_mcp_library_identity"] = self.library_identity
+        library_owner = getattr(self, "library_identity", None)
+        if library_owner:
+            metadata["zotero_mcp_library_identity"] = library_owner
         return metadata
 
     def _wait_for_collection_swap(self) -> None:
