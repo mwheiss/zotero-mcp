@@ -91,7 +91,11 @@ def _is_error_marker(line: str) -> bool:
             r"could not\b|"
             r"unable to\b|"
             r"unsupported\b|"
-            r"missing\b)",
+            r"missing\b|"
+            r"(?:collection|feed|group)\b.*\bnot found\b|"
+            r"arxiv api error\b|"
+            r".*\bcurrently unreachable\b|"
+            r"semantic chunk\b.*\bchanged after\b)",
             marker,
             re.I,
         )
@@ -114,8 +118,22 @@ def _is_blocked_marker(line: str) -> bool:
     marker = _marker_text(line)
     return bool(
         re.match(
-            r"^(?:update not started\b|.*\brequires?\s+(?:local mode|web api credentials|explicit confirmation)\b|"
+            r"^(?:.*\bnot started\b|semantic search\b.*\bnot available\b|"
+            r"rss feed items?\b.*\bonly accessible\b|rss feeds?\b.*\bonly accessible\b|"
+            r".*\brequires?\s+(?:local mode|web api credentials|explicit confirmation)\b|"
             r".*\bcredentials required\b|.*\bis required for\b|.*\bis required\.?(?:\s|$))",
+            marker,
+            re.I,
+        )
+    )
+
+
+def _is_empty_marker(line: str) -> bool:
+    marker = _marker_text(line)
+    return bool(
+        re.match(
+            r"^(?:no\b|none of\b|doi\b.*\bnot found\b|isbn\b.*\bnot found\b|"
+            r"relation\b.*\bnot found\b)",
             marker,
             re.I,
         )
@@ -144,6 +162,7 @@ def classify_result(
         for line in stripped.splitlines()
         if _is_warning_marker(line)
     ]
+    empty = [line.strip() for line in stripped.splitlines() if _is_empty_marker(line)]
     has_partial_failure = "partial failure" in lowered
     has_positive_result = bool(
         re.search(
@@ -157,7 +176,7 @@ def classify_result(
         status = "error"
     elif blocked:
         status = "blocked"
-    elif lowered.startswith("no ") or "\n\nno " in lowered:
+    elif empty:
         status = "empty"
     else:
         status = "success"

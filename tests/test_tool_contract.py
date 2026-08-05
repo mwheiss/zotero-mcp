@@ -67,6 +67,11 @@ def test_result_classification_recognizes_formatted_failures_and_warnings():
         "Unable to read the requested attachment.",
         "Unsupported operation 'containsAny'.",
         "Missing item key.",
+        "Group '999' not found. Available groups: 123.",
+        "Collection 'missing' not found.",
+        "arXiv API error for 1234.5678: timeout",
+        "arXiv is currently unreachable and its fallback failed.",
+        "Semantic chunk `ABCD1234#0` changed after the search result was produced.",
     ]
 
     for failure in failures:
@@ -86,12 +91,30 @@ def test_result_classification_recognizes_blocked_capabilities():
         "Error: zotero_get_attachment_path requires local mode (set ZOTERO_LOCAL=true).",
         "Error: Web API credentials required for creating annotations.",
         "Update not started: requires explicit confirmation.",
+        "# Force Rebuild Not Started\n\nThe user has not confirmed it.",
+        "Semantic search is not available. Install the semantic extra.",
+        "RSS feeds are only accessible in local mode (ZOTERO_LOCAL=true).",
     ]
 
     for message in blocked:
         outcome = classify_result(message)
         assert outcome["ok"] is False
         assert outcome["status"] == "blocked"
+
+
+def test_result_classification_recognizes_empty_resolver_results():
+    empty = [
+        "No matching items found.",
+        "None of the 10 items have DOIs - cannot check Scite.",
+        "DOI not found on CrossRef: 10.1000/missing",
+        "ISBN not found on Open Library or Google Books: 1234567890",
+        "Relation not found: 'ABCD1234' is not related to 'WXYZ5678'.",
+    ]
+
+    for message in empty:
+        outcome = classify_result(message)
+        assert outcome["ok"] is True
+        assert outcome["status"] == "empty"
 
 
 def test_call_middleware_preserves_text_and_adds_structured_result():
