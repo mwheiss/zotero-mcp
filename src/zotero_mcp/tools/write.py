@@ -16,7 +16,7 @@ from zotero_mcp import citation_import as _citation_import
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
-from zotero_mcp._context import Context
+from zotero_mcp._context import Context, context_error, context_info, context_warning
 from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
 
@@ -60,7 +60,13 @@ def _collections_status(coll_keys: list[str], missing: list[str]) -> str:
     return f"Filed in {coll_keys}"
 
 
-_IF_EXISTS_VALUES = ("duplicate", "file", "skip")
+_IF_EXISTS_VALUES = ("reuse", "merge", "duplicate", "skip", "file")
+_ATTACH_MODE_VALUES = ("auto", "none", "linked_url", "required")
+
+
+def _normalize_if_exists(value: str) -> str:
+    """Map legacy policy names to the public convergent contract."""
+    return {"reuse": "skip", "merge": "file"}.get(value, value)
 
 
 def _converge_existing_item(write_zot, item, coll_keys, tags, ctx) -> dict:
@@ -96,7 +102,7 @@ def _converge_existing_item(write_zot, item, coll_keys, tags, ctx) -> dict:
         except Exception as e:
             tags_failed = True
             if ctx is not None:
-                ctx.warning(f"Could not add tags to {item_key}: {e}")
+                context_warning(ctx, f"Could not add tags to {item_key}: {e}")
 
     colls_failed = _helpers.ensure_collection_membership(
         write_zot, item_key, to_add, ctx=ctx
@@ -116,7 +122,7 @@ def _converge_existing_item(write_zot, item, coll_keys, tags, ctx) -> dict:
 
 def _handle_existing_item(write_zot, existing, coll_keys, tags, if_exists,
                           matched_by, ctx) -> str:
-    """Render the if_exists='file'/'skip' outcome for a single-item add tool.
+    """Render the normalized merge/reuse outcome for a single-item add tool.
 
     The report keeps the ``Item key: `KEY``` line that callers (and
     add_from_file's key extraction) rely on.
@@ -139,7 +145,7 @@ def _handle_existing_item(write_zot, existing, coll_keys, tags, if_exists,
     )
 
     if if_exists == "skip":
-        return header + "No changes made (if_exists='skip')." + note
+        return header + "No changes made (if_exists='reuse')." + note
 
     summary = _converge_existing_item(write_zot, item, coll_keys, tags, ctx)
 
@@ -228,7 +234,7 @@ def batch_update_tags(
         if not add_tags and not remove_tags:
             return "Error: After parsing, no valid tags were provided to add or remove"
 
-        ctx.info(f"Batch updating tags for items matching '{query}'")
+        context_info(ctx, f"Batch updating tags for items matching '{query}'")
         zot = _client.get_zotero_client()
 
         # Use shared hybrid-mode helper for correct library override propagation
@@ -329,24 +335,24 @@ def batch_update_tags(
                         try:
                             web_item = write_zot.item(item_key)
                             web_item["data"]["tags"] = current_tags
-                            ctx.info(f"Updating item {item_key} via web API with tags: {current_tags}")
+                            context_info(ctx, f"Updating item {item_key} via web API with tags: {current_tags}")
                             result = write_zot.update_item(web_item)
                         except Exception as e:
-                            ctx.error(f"Failed to fetch/update item {item_key} via web API: {str(e)}")
+                            context_error(ctx, f"Failed to fetch/update item {item_key} via web API: {str(e)}")
                             skipped_count += 1
                             continue
                     else:
                         item["data"]["tags"] = current_tags
-                        ctx.info(f"Updating item {item_key} with tags: {current_tags}")
+                        context_info(ctx, f"Updating item {item_key} with tags: {current_tags}")
                         result = write_zot.update_item(item)
 
                     if _helpers._handle_write_response(result, ctx):
                         updated_count += 1
                     else:
-                        ctx.error(f"Update may have failed for item {item_key}: {result}")
+                        context_error(ctx, f"Update may have failed for item {item_key}: {result}")
                         skipped_count += 1
                 except Exception as e:
-                    ctx.error(f"Failed to update item {item.get('key', 'unknown')}: {str(e)}")
+                    context_error(ctx, f"Failed to update item {item.get('key', 'unknown')}: {str(e)}")
                     # Continue with other items instead of failing completely
                     skipped_count += 1
             else:
@@ -372,7 +378,7 @@ def batch_update_tags(
         return "\n".join(response)
 
     except Exception as e:
-        ctx.error(f"Error in batch tag update: {str(e)}")
+        context_error(ctx, f"Error in batch tag update: {str(e)}")
         return f"Error in batch tag update: {str(e)}"
 
 
@@ -509,7 +515,7 @@ def batch_update_extra(
         if replace and remove_keys:
             return "Error: replace=True is incompatible with remove_keys"
 
-        ctx.info(f"Batch updating Extra field for {len(item_keys)} item(s)")
+        context_info(ctx, f"Batch updating Extra field for {len(item_keys)} item(s)")
         zot = _client.get_zotero_client()
 
         try:
@@ -524,7 +530,7 @@ def batch_update_extra(
             try:
                 item = zot.item(item_key)
             except Exception as e:
-                ctx.error(f"Failed to fetch item {item_key}: {str(e)}")
+                context_error(ctx, f"Failed to fetch item {item_key}: {str(e)}")
                 skipped_count += 1
                 continue
             if not item:
@@ -557,10 +563,10 @@ def batch_update_extra(
                 if _helpers._handle_write_response(result, ctx):
                     updated_count += 1
                 else:
-                    ctx.error(f"Update may have failed for item {item_key}: {result}")
+                    context_error(ctx, f"Update may have failed for item {item_key}: {result}")
                     skipped_count += 1
             except Exception as e:
-                ctx.error(f"Failed to update item {item_key}: {str(e)}")
+                context_error(ctx, f"Failed to update item {item_key}: {str(e)}")
                 skipped_count += 1
 
         response = ["# Batch Extra Update Results", ""]
@@ -582,7 +588,7 @@ def batch_update_extra(
         return "\n".join(response)
 
     except Exception as e:
-        ctx.error(f"Error in batch extra update: {str(e)}")
+        context_error(ctx, f"Error in batch extra update: {str(e)}")
         return f"Error in batch extra update: {str(e)}"
 
 
@@ -608,7 +614,7 @@ def create_collection(
         return str(e)
 
     try:
-        ctx.info(f"Creating collection '{name}'")
+        context_info(ctx, f"Creating collection '{name}'")
 
         # Resolve parent_collection name if it doesn't look like a key
         parent_key = parent_collection
@@ -637,7 +643,7 @@ def create_collection(
         return f"Failed to create collection: {result}"
 
     except Exception as e:
-        ctx.error(f"Error creating collection: {e}")
+        context_error(ctx, f"Error creating collection: {e}")
         return f"Error creating collection: {e}"
 
 
@@ -665,7 +671,7 @@ def delete_collection(
         return str(e)
 
     try:
-        ctx.info(f"Deleting collection {collection_key}")
+        context_info(ctx, f"Deleting collection {collection_key}")
 
         try:
             coll = write_zot.collection(collection_key)
@@ -679,7 +685,7 @@ def delete_collection(
         return f"Failed to delete collection `{collection_key}`: {resp}"
 
     except Exception as e:
-        ctx.error(f"Error deleting collection: {e}")
+        context_error(ctx, f"Error deleting collection: {e}")
         return f"Error deleting collection: {e}"
 
 
@@ -715,7 +721,7 @@ def search_collections(
 ) -> str:
     try:
         zot = _client.get_zotero_client()
-        ctx.info(f"Searching collections for '{query}'")
+        context_info(ctx, f"Searching collections for '{query}'")
 
         collections = _helpers._paginate(zot.collections)
         trashed_keys: set[str] = set()
@@ -758,7 +764,7 @@ def search_collections(
         return "\n".join(lines)
 
     except Exception as e:
-        ctx.error(f"Error searching collections: {e}")
+        context_error(ctx, f"Error searching collections: {e}")
         return f"Error searching collections: {e}"
 
 
@@ -846,7 +852,7 @@ def manage_collections(
     except ValueError as e:
         return f"Input error: {e}"
     except Exception as e:
-        ctx.error(f"Error managing collections: {e}")
+        context_error(ctx, f"Error managing collections: {e}")
         return f"Error managing collections: {e}"
 
 
@@ -868,17 +874,17 @@ def manage_collections(
         "specs fail the call with suggestions instead of producing an "
         "unfiled item. "
         "tags: optional list of tag strings to attach. "
-        "if_exists: 'duplicate' (default) always creates a new item; "
-        "'file' makes the call idempotent — when an item with this DOI "
-        "already exists it is reused, filed into any missing collections "
-        "and given any missing tags (nothing is ever removed); 'skip' "
-        "leaves an existing match untouched. "
+        "if_exists: 'reuse' (default) returns an existing DOI match without "
+        "changes; 'merge' reuses it, files it into any missing collections "
+        "and given any missing tags (nothing is ever removed); 'duplicate' "
+        "explicitly creates another item. Legacy aliases: skip=reuse, file=merge. "
         "create_missing_collections: when True, collection specs that "
         "don't resolve are created (including path chains) instead of "
         "failing. "
         "attach_mode: 'auto' (default) downloads a PDF if CrossRef links "
         "one and storage is available; 'none' skips PDF download; "
-        "'required' fails if no PDF can be attached. PDF uploads may fail "
+        "'linked_url' stores a URL attachment; 'required' reports a partial "
+        "failure if no PDF is attached (the metadata item remains). PDF uploads may fail "
         "on the Zotero cloud free-tier 300MB quota — metadata still lands "
         "even when the upload fails. "
         "Requires a writable library (web API key or hybrid mode); fails "
@@ -893,8 +899,8 @@ def add_by_doi(
     doi: str,
     collections: list[str] | str | None = None,
     tags: list[str] | str | None = None,
-    attach_mode: str = "auto",
-    if_exists: Literal["duplicate", "file", "skip"] = "duplicate",
+    attach_mode: Literal["auto", "none", "linked_url", "required"] = "auto",
+    if_exists: Literal["reuse", "merge", "duplicate", "skip", "file"] = "reuse",
     create_missing_collections: bool = False,
     *,
     ctx: Context
@@ -907,6 +913,9 @@ def add_by_doi(
     try:
         if if_exists not in _IF_EXISTS_VALUES:
             return f"Error: if_exists must be one of {_IF_EXISTS_VALUES}."
+        if attach_mode not in _ATTACH_MODE_VALUES:
+            return f"Error: attach_mode must be one of {_ATTACH_MODE_VALUES}."
+        if_exists = _normalize_if_exists(if_exists)
         normalized = _helpers._normalize_doi(doi)
         if not normalized:
             return f"Error: '{doi}' does not appear to be a valid DOI."
@@ -929,7 +938,7 @@ def add_by_doi(
                     matched_by=f"DOI {normalized}", ctx=ctx,
                 )
 
-        ctx.info(f"Fetching metadata for DOI: {normalized}")
+        context_info(ctx, f"Fetching metadata for DOI: {normalized}")
 
         # CrossRef "polite pool": identifying via mailto gives higher rate limits
         # and priority routing. See https://api.crossref.org/swagger-ui/index.html
@@ -1049,9 +1058,25 @@ def add_by_doi(
             collections_status = _collections_status(coll_keys, missing)
 
             # Attempt open-access PDF attachment (pass CrossRef metadata for arXiv fallback)
-            pdf_status = _helpers._try_attach_oa_pdf(write_zot, item_key, normalized, ctx,
-                                            crossref_metadata=cr,
-                                            attach_mode=attach_mode)
+            if attach_mode == "none":
+                pdf_status = "skipped (attach_mode=none)"
+            else:
+                pdf_status = _helpers._try_attach_oa_pdf(
+                    write_zot,
+                    item_key,
+                    normalized,
+                    ctx,
+                    crossref_metadata=cr,
+                    attach_mode=attach_mode,
+                )
+            requirement_warning = ""
+            if attach_mode == "required" and not pdf_status.startswith(
+                "PDF attached"
+            ):
+                requirement_warning = (
+                    "\nPartial failure: attach_mode='required' was not satisfied; "
+                    "the metadata item was created and retained."
+                )
 
             return (
                 f"Successfully added: **{title}**\n\n"
@@ -1059,7 +1084,7 @@ def add_by_doi(
                 f"Type: {zot_type}\n"
                 f"DOI: {normalized}\n"
                 f"Collections: {collections_status}\n"
-                f"PDF: {pdf_status}\n\n"
+                f"PDF: {pdf_status}{requirement_warning}\n\n"
                 "_Note: To include this item in semantic search, run "
                 "zotero_update_search_database._"
             )
@@ -1070,7 +1095,7 @@ def add_by_doi(
     except requests.RequestException as e:
         return f"Error fetching from CrossRef: {e}"
     except Exception as e:
-        ctx.error(f"Error adding by DOI: {e}")
+        context_error(ctx, f"Error adding by DOI: {e}")
         return f"Error adding by DOI: {e}"
 
 
@@ -1089,14 +1114,15 @@ def add_by_doi(
         "'/'-separated paths — resolved and validated before the item is "
         "created; unknown or ambiguous specs fail the call. "
         "tags: optional list of tag strings to attach. "
-        "if_exists: 'duplicate' (default) always creates; 'file' reuses "
-        "an existing item matching the arXiv ID / DOI / URL, filing it "
-        "into missing collections and adding missing tags; 'skip' leaves "
-        "a match untouched. create_missing_collections: create unknown "
+        "if_exists: 'reuse' (default) returns an existing arXiv/DOI/URL "
+        "match unchanged; 'merge' also adds missing collections/tags; "
+        "'duplicate' explicitly creates another item. Legacy aliases are "
+        "skip=reuse and file=merge. create_missing_collections: create unknown "
         "collection specs instead of failing. "
         "attach_mode: 'auto' (default) attaches a PDF if one is "
-        "available; 'none' skips; 'required' fails if no PDF can be "
-        "attached. PDF uploads may fail on the Zotero cloud free-tier "
+        "available; 'none' skips; 'linked_url' stores a URL attachment; "
+        "'required' reports a partial failure if attachment fails, while the "
+        "metadata item remains. PDF uploads may fail on the Zotero cloud free-tier "
         "300MB quota — metadata still lands even when the upload fails. "
         "WARNING: for bibliography use, a general web-page URL produces "
         "a 'webpage' itemType that often isn't acceptable as a citation; "
@@ -1113,8 +1139,8 @@ def add_by_url(
     url: str,
     collections: list[str] | str | None = None,
     tags: list[str] | str | None = None,
-    attach_mode: str = "auto",
-    if_exists: Literal["duplicate", "file", "skip"] = "duplicate",
+    attach_mode: Literal["auto", "none", "linked_url", "required"] = "auto",
+    if_exists: Literal["reuse", "merge", "duplicate", "skip", "file"] = "reuse",
     create_missing_collections: bool = False,
     *,
     ctx: Context
@@ -1127,6 +1153,9 @@ def add_by_url(
     try:
         if if_exists not in _IF_EXISTS_VALUES:
             return f"Error: if_exists must be one of {_IF_EXISTS_VALUES}."
+        if attach_mode not in _ATTACH_MODE_VALUES:
+            return f"Error: attach_mode must be one of {_ATTACH_MODE_VALUES}."
+        if_exists = _normalize_if_exists(if_exists)
         url = (url or "").strip()
         if not url:
             return "Error: No URL provided."
@@ -1148,6 +1177,11 @@ def add_by_url(
                                  create_missing_collections=create_missing_collections)
 
         # Generic webpage
+        if attach_mode == "required":
+            return (
+                "Error: attach_mode='required' is not supported for a generic "
+                "webpage URL because no PDF source is known. Use a DOI or arXiv URL."
+            )
         try:
             coll_keys = _resolve_collections_arg(
                 read_zot, collections, ctx,
@@ -1164,7 +1198,7 @@ def add_by_url(
                     matched_by=f"URL {url}", ctx=ctx,
                 )
 
-        ctx.info(f"Creating webpage item for: {url}")
+        context_info(ctx, f"Creating webpage item for: {url}")
         template = write_zot.item_template("webpage")
         template["url"] = url
         template["title"] = url
@@ -1191,7 +1225,7 @@ def add_by_url(
         return f"Failed to create item: {result}"
 
     except Exception as e:
-        ctx.error(f"Error adding by URL: {e}")
+        context_error(ctx, f"Error adding by URL: {e}")
         return f"Error adding by URL: {e}"
 
 
@@ -1228,7 +1262,7 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
                 matched_by=f"arXiv ID {arxiv_id}", ctx=ctx,
             )
 
-    ctx.info(f"Fetching arXiv metadata for: {arxiv_id}")
+    context_info(ctx, f"Fetching arXiv metadata for: {arxiv_id}")
 
     resp = None
     last_error = None
@@ -1245,7 +1279,7 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
             resp = None
             if attempt < 2:
                 wait = 3 * (2 ** attempt)  # 3s, 6s
-                ctx.info(
+                context_info(ctx,
                     f"arXiv API unreachable ({e}); retrying in {wait}s "
                     f"({attempt + 1}/3)..."
                 )
@@ -1256,7 +1290,7 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
             last_error = f"HTTP {resp.status_code}"
             if attempt < 2:
                 wait = 5 * (2 ** attempt)  # 5s, 10s
-                ctx.info(
+                context_info(ctx,
                     f"arXiv API returned {resp.status_code}; retrying in {wait}s "
                     f"({attempt + 1}/3)..."
                 )
@@ -1266,7 +1300,7 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
 
     # arXiv exhausted its retries — fall back to CrossRef (independent infra).
     if resp is None or resp.status_code == 429 or resp.status_code >= 500:
-        ctx.info(
+        context_info(ctx,
             f"arXiv unreachable after retries ({last_error}); "
             f"falling back to CrossRef via the arXiv DOI."
         )
@@ -1282,7 +1316,7 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
             )
         except Exception as e:  # noqa: BLE001 — fallback must not raise
             result = None
-            ctx.info(f"CrossRef fallback errored: {e}")
+            context_info(ctx, f"CrossRef fallback errored: {e}")
         # add_by_doi returns a human string; treat "not found"/"Error" as a miss.
         if result and not result.startswith(("DOI not found", "Error")):
             return result
@@ -1374,7 +1408,7 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
                 else:
                     pdf_status = "linked URL attachment failed"
             except Exception as e:
-                ctx.info(f"arXiv linked URL attachment failed (non-fatal): {e}")
+                context_info(ctx, f"arXiv linked URL attachment failed (non-fatal): {e}")
                 pdf_status = f"no PDF attached ({e})"
         else:
             try:
@@ -1396,8 +1430,14 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
                     )
                 pdf_status = "PDF attached" + webdav_suffix
             except Exception as e:
-                ctx.info(f"arXiv PDF attachment failed (non-fatal): {e}")
+                context_info(ctx, f"arXiv PDF attachment failed (non-fatal): {e}")
                 pdf_status = f"no PDF attached ({e})"
+
+        if attach_mode == "required" and not pdf_status.startswith("PDF attached"):
+            pdf_status += (
+                "; Partial failure: required PDF attachment was not satisfied "
+                "and the metadata item remains"
+            )
 
         return (
             f"Successfully added arXiv paper: **{title}**\n\n"
@@ -1477,10 +1517,10 @@ def _lookup_isbn_openlibrary(isbn, ctx):
             "url": (record.get("url") or "").strip(),
         }
     except requests.RequestException as e:
-        ctx.info(f"Open Library lookup failed (non-fatal): {e}")
+        context_info(ctx, f"Open Library lookup failed (non-fatal): {e}")
         return None
     except Exception as e:
-        ctx.info(f"Open Library parse failed (non-fatal): {e}")
+        context_info(ctx, f"Open Library parse failed (non-fatal): {e}")
         return None
 
 
@@ -1532,10 +1572,10 @@ def _lookup_isbn_google_books(isbn, ctx):
             "url": (info.get("infoLink") or info.get("canonicalVolumeLink") or "").strip(),
         }
     except requests.RequestException as e:
-        ctx.info(f"Google Books lookup failed (non-fatal): {e}")
+        context_info(ctx, f"Google Books lookup failed (non-fatal): {e}")
         return None
     except Exception as e:
-        ctx.info(f"Google Books parse failed (non-fatal): {e}")
+        context_info(ctx, f"Google Books parse failed (non-fatal): {e}")
         return None
 
 
@@ -1547,9 +1587,9 @@ def _lookup_isbn_google_books(isbn, ctx):
         "ISBN-13, with or without hyphens, or a URL/isbn: prefix. Response "
         "includes the resolver source so you can audit metadata quality. "
         "collections accepts keys, names, or '/'-paths (validated before "
-        "create). if_exists: 'duplicate' (default) | 'file' (reuse an "
-        "existing item with this ISBN — add missing collections/tags) | "
-        "'skip'. create_missing_collections: create unknown collection "
+        "create). if_exists: 'reuse' (default, no changes) | 'merge' "
+        "(reuse and add missing collections/tags) | 'duplicate'. Legacy "
+        "aliases: skip=reuse, file=merge. create_missing_collections: create unknown collection "
         "specs instead of failing."
     )
 )
@@ -1557,7 +1597,7 @@ def add_by_isbn(
     isbn: str,
     collections: list[str] | str | None = None,
     tags: list[str] | str | None = None,
-    if_exists: Literal["duplicate", "file", "skip"] = "duplicate",
+    if_exists: Literal["reuse", "merge", "duplicate", "skip", "file"] = "reuse",
     create_missing_collections: bool = False,
     *,
     ctx: Context
@@ -1570,6 +1610,7 @@ def add_by_isbn(
     try:
         if if_exists not in _IF_EXISTS_VALUES:
             return f"Error: if_exists must be one of {_IF_EXISTS_VALUES}."
+        if_exists = _normalize_if_exists(if_exists)
         normalized = _helpers._normalize_isbn(isbn)
         if not normalized:
             return (
@@ -1593,10 +1634,10 @@ def add_by_isbn(
                     matched_by=f"ISBN {normalized}", ctx=ctx,
                 )
 
-        ctx.info(f"Resolving ISBN {normalized} via Open Library...")
+        context_info(ctx, f"Resolving ISBN {normalized} via Open Library...")
         meta = _lookup_isbn_openlibrary(normalized, ctx)
         if not meta:
-            ctx.info("Open Library miss — falling back to Google Books...")
+            context_info(ctx, "Open Library miss — falling back to Google Books...")
             meta = _lookup_isbn_google_books(normalized, ctx)
         if not meta:
             return (
@@ -1651,7 +1692,7 @@ def add_by_isbn(
         return f"Failed to create item: {result}"
 
     except Exception as e:
-        ctx.error(f"Error adding by ISBN: {e}")
+        context_error(ctx, f"Error adding by ISBN: {e}")
         return f"Error adding by ISBN: {e}"
 
 
@@ -1793,7 +1834,7 @@ def update_item(
                 "'add_tags'/'remove_tags' (incremental). Use one approach or the other."
             )
 
-        ctx.info(f"Updating item {item_key}")
+        context_info(ctx, f"Updating item {item_key}")
 
         # Fetch current item from write client for correct version
         item = _helpers._strip_unwritable_fields(write_zot.item(item_key))
@@ -1966,7 +2007,7 @@ def update_item(
     except ValueError as e:
         return f"Input error: {e}"
     except Exception as e:
-        ctx.error(f"Error updating item: {e}")
+        context_error(ctx, f"Error updating item: {e}")
         return f"Error updating item: {e}"
 
 
@@ -2006,7 +2047,7 @@ def delete_item(
         return str(e)
 
     try:
-        ctx.info(f"Trashing item {item_key}")
+        context_info(ctx, f"Trashing item {item_key}")
 
         try:
             item = write_zot.item(item_key)
@@ -2046,7 +2087,7 @@ def delete_item(
         )
 
     except Exception as e:
-        ctx.error(f"Error trashing item: {str(e)}")
+        context_error(ctx, f"Error trashing item: {str(e)}")
         return f"Error trashing item: {str(e)}"
 
 
@@ -2087,7 +2128,7 @@ def find_duplicates(
     try:
         zot = _client.get_zotero_client()
         limit = _helpers._normalize_limit(limit, default=50)
-        ctx.info(f"Searching for duplicates (method={method})")
+        context_info(ctx, f"Searching for duplicates (method={method})")
 
         # Paginate manually instead of using zot.everything() which can
         # cause "cannot pickle '_thread.RLock' object" in MCP contexts.
@@ -2176,7 +2217,7 @@ def find_duplicates(
         return "\n".join(lines)
 
     except Exception as e:
-        ctx.error(f"Error finding duplicates: {e}")
+        context_error(ctx, f"Error finding duplicates: {e}")
         return f"Error finding duplicates: {e}"
 
 
@@ -2225,7 +2266,7 @@ def merge_duplicates(
         # Safety: remove keeper from duplicates
         if keeper_key in dup_keys:
             dup_keys.remove(keeper_key)
-            ctx.warning(f"Keeper key '{keeper_key}' was in duplicate list — removed.")
+            context_warning(ctx, f"Keeper key '{keeper_key}' was in duplicate list — removed.")
 
         if not dup_keys:
             return "Error: No duplicate keys to merge (after removing keeper if present)."
@@ -2304,7 +2345,7 @@ def merge_duplicates(
             return "\n".join(lines)
 
         # EXECUTE MERGE
-        ctx.info(f"Merging {len(dup_keys)} duplicates into {keeper_key}")
+        context_info(ctx, f"Merging {len(dup_keys)} duplicates into {keeper_key}")
 
         # Step 3: Consolidate tags
         if new_tags:
@@ -2321,7 +2362,7 @@ def merge_duplicates(
         for coll_key in new_collections:
             resp = write_zot.addto_collection(coll_key, keeper)
             if not _helpers._handle_write_response(resp, ctx):
-                ctx.warning(f"Failed to add keeper to collection {coll_key}")
+                context_warning(ctx, f"Failed to add keeper to collection {coll_key}")
             keeper = write_zot.item(keeper_key)  # re-fetch for version
 
         # Step 5: Re-parent children (skip duplicate attachments)
@@ -2386,9 +2427,9 @@ def merge_duplicates(
                 if resp.status_code in (200, 204):
                     trashed.append(dup_key)
                 else:
-                    ctx.warning(f"Failed to trash {dup_key}: HTTP {resp.status_code}")
+                    context_warning(ctx, f"Failed to trash {dup_key}: HTTP {resp.status_code}")
             except Exception as e:
-                ctx.warning(f"Failed to trash {dup_key}: {e}")
+                context_warning(ctx, f"Failed to trash {dup_key}: {e}")
 
         skip_info = f" ({len(skipped_dupes)} duplicate attachments skipped)" if skipped_dupes else ""
         return (
@@ -2403,7 +2444,7 @@ def merge_duplicates(
     except ValueError as e:
         return f"Input error: {e}"
     except Exception as e:
-        ctx.error(f"Error merging duplicates: {e}")
+        context_error(ctx, f"Error merging duplicates: {e}")
         return f"Error merging duplicates: {e}"
 
 
@@ -2435,7 +2476,7 @@ def get_pdf_outline(
     ctx: Context
 ) -> str:
     try:
-        ctx.info(f"Getting PDF outline for item {item_key}")
+        context_info(ctx, f"Getting PDF outline for item {item_key}")
 
         try:
             import fitz
@@ -2474,7 +2515,7 @@ def get_pdf_outline(
         return "\n".join(lines)
 
     except Exception as e:
-        ctx.error(f"Error extracting PDF outline: {e}")
+        context_error(ctx, f"Error extracting PDF outline: {e}")
         return f"Error extracting PDF outline: {e}"
 
 
@@ -2497,10 +2538,12 @@ def get_pdf_outline(
         "'/'-separated paths to file under — resolved and validated "
         "before the item is created. "
         "tags: optional list of tag strings. "
-        "if_exists: 'duplicate' (default) | 'file' (when the extracted "
+        "if_exists: 'reuse' (default, leave an existing DOI match and its "
+        "attachments unchanged) | 'merge' (when the extracted "
         "DOI matches an existing item, reuse it: file into missing "
         "collections, attach the file to it unless an attachment with "
-        "the same filename exists) | 'skip' (no item, no attachment). "
+        "the same filename exists) | 'duplicate'. Legacy aliases: "
+        "skip=reuse, file=merge. "
         "create_missing_collections: create unknown collection specs. "
         "Requires a writable library (fails in local-only mode). PDF "
         "uploads may hit the 300MB Zotero cloud free-tier quota — "
@@ -2517,7 +2560,7 @@ def add_from_file(
     item_type: str = "document",
     collections: list[str] | str | None = None,
     tags: list[str] | str | None = None,
-    if_exists: Literal["duplicate", "file", "skip"] = "duplicate",
+    if_exists: Literal["reuse", "merge", "duplicate", "skip", "file"] = "reuse",
     create_missing_collections: bool = False,
     *,
     ctx: Context
@@ -2530,6 +2573,7 @@ def add_from_file(
     try:
         if if_exists not in _IF_EXISTS_VALUES:
             return f"Error: if_exists must be one of {_IF_EXISTS_VALUES}."
+        if_exists = _normalize_if_exists(if_exists)
         # Path validation — check symlink BEFORE resolving
         if os.path.islink(file_path):
             return "Error: Symlinks are not allowed for security reasons."
@@ -2553,7 +2597,7 @@ def add_from_file(
         if ext not in allowed_exts:
             return f"Error: Unsupported file type '{ext}'. Allowed: {', '.join(sorted(allowed_exts))}"
 
-        ctx.info(f"Adding file: {file_path}")
+        context_info(ctx, f"Adding file: {file_path}")
 
         # Try DOI extraction from PDF
         extracted_doi = None
@@ -2583,13 +2627,13 @@ def add_from_file(
 
                 doc.close()
             except Exception as e:
-                ctx.info(f"DOI extraction failed (non-fatal): {e}")
+                context_info(ctx, f"DOI extraction failed (non-fatal): {e}")
 
-        # Create the metadata item. With if_exists='file' and a known DOI,
+        # Create the metadata item. With if_exists='merge' and a known DOI,
         # add_by_doi reuses the existing item — the attachment below then
         # lands on it instead of on a fresh duplicate.
         if extracted_doi:
-            ctx.info(f"Found DOI: {extracted_doi}")
+            context_info(ctx, f"Found DOI: {extracted_doi}")
             result_msg = add_by_doi(doi=extracted_doi, collections=coll_keys,
                                     tags=tags, if_exists=if_exists, ctx=ctx)
             # Extract item key from result
@@ -2616,13 +2660,13 @@ def add_from_file(
                     write_zot, parent_key, coll_keys, ctx=ctx
                 )
                 if missing:
-                    ctx.warning(f"Failed to file {parent_key} in {missing}")
+                    context_warning(ctx, f"Failed to file {parent_key} in {missing}")
             else:
                 return f"Failed to create item: {result}"
 
         item_reused = bool(extracted_doi) and result_msg.startswith("Already in library")
         if item_reused and if_exists == "skip":
-            return result_msg + "\n\nFile NOT attached (if_exists='skip')."
+            return result_msg + "\n\nFile NOT attached (if_exists='reuse')."
 
         # Attach the file. When reusing an existing item, skip the upload if
         # an attachment with the same filename is already there — re-running
@@ -2665,7 +2709,7 @@ def add_from_file(
         )
 
     except Exception as e:
-        ctx.error(f"Error adding from file: {e}")
+        context_error(ctx, f"Error adding from file: {e}")
         return f"Error adding from file: {e}"
 
 
@@ -2714,7 +2758,7 @@ def _restore_relation_items(write_zot, originals: list[dict], ctx: Context) -> b
             restored = _helpers._handle_write_response(response, ctx) and restored
         except Exception as exc:
             restored = False
-            ctx.warning(
+            context_warning(ctx,
                 f"Could not restore relation state for `{original.get('key', '')}`: {exc}"
             )
     return restored
@@ -2760,7 +2804,7 @@ def add_item_relation(
         if item_key == related_item_key:
             return "Error: Cannot relate an item to itself."
 
-        ctx.info(f"Adding relation from {item_key} to {related_item_key}")
+        context_info(ctx, f"Adding relation from {item_key} to {related_item_key}")
 
         # Fetch the primary item
         try:
@@ -2861,7 +2905,7 @@ def add_item_relation(
         )
 
     except Exception as e:
-        ctx.error(f"Error adding item relation: {e}")
+        context_error(ctx, f"Error adding item relation: {e}")
         return f"Error adding item relation: {e}"
 
 
@@ -2902,7 +2946,7 @@ def remove_item_relation(
         return str(e)
 
     try:
-        ctx.info(f"Removing relation from {item_key} to {related_item_key}")
+        context_info(ctx, f"Removing relation from {item_key} to {related_item_key}")
 
         # Fetch the primary item
         try:
@@ -3000,7 +3044,7 @@ def remove_item_relation(
         )
 
     except Exception as e:
-        ctx.error(f"Error removing item relation: {e}")
+        context_error(ctx, f"Error removing item relation: {e}")
         return f"Error removing item relation: {e}"
 
 
@@ -3105,12 +3149,27 @@ def _create_and_attach(
 
     pdf_status = None
     if doi:
-        try:
-            pdf_status = _helpers._try_attach_oa_pdf(
-                write_zot, item_key, doi, ctx, attach_mode=attach_mode
+        if attach_mode == "none":
+            pdf_status = "skipped (attach_mode=none)"
+        else:
+            try:
+                pdf_status = _helpers._try_attach_oa_pdf(
+                    write_zot, item_key, doi, ctx, attach_mode=attach_mode
+                )
+            except Exception as e:
+                pdf_status = f"OA PDF attach failed: {e}"
+        if attach_mode == "required" and not (pdf_status or "").startswith(
+            "PDF attached"
+        ):
+            pdf_status = (
+                f"{pdf_status}; Partial failure: required PDF attachment was "
+                "not satisfied and the metadata item remains"
             )
-        except Exception as e:
-            pdf_status = f"OA PDF attach failed: {e}"
+    elif attach_mode == "required":
+        pdf_status = (
+            "Partial failure: required PDF attachment was not attempted because "
+            "the citation has no DOI; the metadata item remains"
+        )
 
     return {"ok": True, "key": item_key, "doi": doi, "pdf_status": pdf_status,
             "error": None, "title": title,
@@ -3121,8 +3180,8 @@ def _maybe_reuse_existing(read_zot, write_zot, item_data, coll_keys, tags,
                           if_exists, ctx) -> dict | None:
     """Batch-import dedup: reuse an existing item matching the entry's DOI.
 
-    Returns a result dict for _format_batch_result when if_exists is
-    'file'/'skip' and a DOI match exists; otherwise None (proceed to
+    Returns a result dict for _format_batch_result when normalized if_exists is
+    merge/reuse and a DOI match exists; otherwise None (proceed to
     create). Entries without a DOI always create — title matching is out
     of scope (#4).
     """
@@ -3143,7 +3202,7 @@ def _maybe_reuse_existing(read_zot, write_zot, item_data, coll_keys, tags,
             "pdf_status": None, "error": None,
             "title": item.get("data", {}).get("title") or "(untitled)",
             "collections_failed": [],
-            "existed": "skipped — already in library",
+            "existed": "reused unchanged — already in library",
         }
 
     summary = _converge_existing_item(write_zot, item, coll_keys, tags, ctx)
@@ -3225,10 +3284,9 @@ def _format_batch_result(header: str, results: list[dict]) -> str:
         "The citation key from each entry is preserved in the Extra field. "
         "If an entry has a DOI, an open-access PDF attachment is attempted. "
         "collections accepts keys, names, or '/'-paths (validated before "
-        "create). if_exists: 'duplicate' (default) | 'file' (entries whose "
-        "DOI already exists reuse that item — add missing collections/tags "
-        "instead of duplicating) | 'skip' (leave existing matches "
-        "untouched); entries without a DOI always create. "
+        "create). if_exists: 'reuse' (default, leave DOI matches unchanged) "
+        "| 'merge' (reuse and add missing collections/tags) | 'duplicate'. "
+        "Legacy aliases: skip=reuse, file=merge. Entries without a DOI always create. "
         "create_missing_collections: create unknown collection specs."
     )
 )
@@ -3237,8 +3295,8 @@ def add_by_bibtex(
     file_path: str | None = None,
     collections: list[str] | str | None = None,
     tags: list[str] | str | None = None,
-    attach_mode: str = "auto",
-    if_exists: Literal["duplicate", "file", "skip"] = "duplicate",
+    attach_mode: Literal["auto", "none", "linked_url", "required"] = "auto",
+    if_exists: Literal["reuse", "merge", "duplicate", "skip", "file"] = "reuse",
     create_missing_collections: bool = False,
     *,
     ctx: Context
@@ -3251,6 +3309,9 @@ def add_by_bibtex(
     try:
         if if_exists not in _IF_EXISTS_VALUES:
             return f"Error: if_exists must be one of {_IF_EXISTS_VALUES}."
+        if attach_mode not in _ATTACH_MODE_VALUES:
+            return f"Error: attach_mode must be one of {_ATTACH_MODE_VALUES}."
+        if_exists = _normalize_if_exists(if_exists)
         bibtex_provided = bool((bibtex or "").strip())
         if bibtex_provided and file_path:
             return "Error: Provide either `bibtex` or `file_path`, not both."
@@ -3264,7 +3325,7 @@ def add_by_bibtex(
                 )
             except ValueError as e:
                 return f"Error: {e}"
-            ctx.info(f"Loaded BibTeX from {file_path} ({len(bibtex)} bytes)")
+            context_info(ctx, f"Loaded BibTeX from {file_path} ({len(bibtex)} bytes)")
 
         try:
             entries = _citation_import.parse_bibtex(bibtex)
@@ -3282,7 +3343,7 @@ def add_by_bibtex(
         except ValueError as e:
             return f"Error: {e}"
 
-        ctx.info(f"Parsed {len(entries)} BibTeX entries")
+        context_info(ctx, f"Parsed {len(entries)} BibTeX entries")
 
         results = []
         for entry in entries:
@@ -3311,7 +3372,7 @@ def add_by_bibtex(
         return _format_batch_result("# zotero_add_by_bibtex", results)
 
     except Exception as e:
-        ctx.error(f"Error adding by BibTeX: {e}")
+        context_error(ctx, f"Error adding by BibTeX: {e}")
         return f"Error adding by BibTeX: {e}"
 
 
@@ -3324,9 +3385,9 @@ def add_by_bibtex(
         "The `id` field is preserved in the Extra field as the Citation Key. "
         "If an entry has a DOI, an open-access PDF attachment is attempted. "
         "collections accepts keys, names, or '/'-paths (validated before "
-        "create). if_exists: 'duplicate' (default) | 'file' (entries whose "
-        "DOI already exists reuse that item — add missing collections/tags) "
-        "| 'skip'; entries without a DOI always create. "
+        "create). if_exists: 'reuse' (default, leave DOI matches unchanged) "
+        "| 'merge' (reuse and add missing collections/tags) | 'duplicate'. "
+        "Legacy aliases: skip=reuse, file=merge. Entries without a DOI always create. "
         "create_missing_collections: create unknown collection specs."
     )
 )
@@ -3335,8 +3396,8 @@ def add_by_csl_json(
     file_path: str | None = None,
     collections: list[str] | str | None = None,
     tags: list[str] | str | None = None,
-    attach_mode: str = "auto",
-    if_exists: Literal["duplicate", "file", "skip"] = "duplicate",
+    attach_mode: Literal["auto", "none", "linked_url", "required"] = "auto",
+    if_exists: Literal["reuse", "merge", "duplicate", "skip", "file"] = "reuse",
     create_missing_collections: bool = False,
     *,
     ctx: Context
@@ -3349,6 +3410,9 @@ def add_by_csl_json(
     try:
         if if_exists not in _IF_EXISTS_VALUES:
             return f"Error: if_exists must be one of {_IF_EXISTS_VALUES}."
+        if attach_mode not in _ATTACH_MODE_VALUES:
+            return f"Error: attach_mode must be one of {_ATTACH_MODE_VALUES}."
+        if_exists = _normalize_if_exists(if_exists)
         csl_provided = csl_json not in (None, "", [], {})
         if csl_provided and file_path:
             return "Error: Provide either `csl_json` or `file_path`, not both."
@@ -3362,7 +3426,7 @@ def add_by_csl_json(
                 )
             except ValueError as e:
                 return f"Error: {e}"
-            ctx.info(f"Loaded CSL JSON from {file_path} ({len(csl_json)} bytes)")
+            context_info(ctx, f"Loaded CSL JSON from {file_path} ({len(csl_json)} bytes)")
 
         try:
             entries = _citation_import.coerce_csl_json_input(csl_json)
@@ -3380,7 +3444,7 @@ def add_by_csl_json(
         except ValueError as e:
             return f"Error: {e}"
 
-        ctx.info(f"Processing {len(entries)} CSL JSON entries")
+        context_info(ctx, f"Processing {len(entries)} CSL JSON entries")
 
         results = []
         for entry in entries:
@@ -3409,5 +3473,5 @@ def add_by_csl_json(
         return _format_batch_result("# zotero_add_by_csl_json", results)
 
     except Exception as e:
-        ctx.error(f"Error adding by CSL JSON: {e}")
+        context_error(ctx, f"Error adding by CSL JSON: {e}")
         return f"Error adding by CSL JSON: {e}"

@@ -245,7 +245,7 @@ def cmd_add(args):
     ctx = _ctx(args)
     tags = args.tags.split(",") if args.tags else None
     collections = _collect_collection_specs(args)
-    if_exists = getattr(args, "if_exists", "file")
+    if_exists = getattr(args, "if_exists", "reuse")
     create_missing = getattr(args, "create_collections", False)
 
     if args.subcommand == "doi":
@@ -728,11 +728,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "commas work)")
         p.add_argument("--tags", help="Comma-separated tags")
         p.add_argument("--if-exists", dest="if_exists",
-                       choices=["file", "skip", "duplicate"], default="file",
-                       help="When the item already exists: 'file' (default) "
-                            "reuses it and adds missing collections/tags; "
-                            "'skip' leaves it untouched; 'duplicate' creates "
-                            "a new item anyway")
+                       choices=["reuse", "merge", "duplicate", "skip", "file"],
+                       default="reuse",
+                       help="When the item exists: 'reuse' (default) leaves it "
+                            "unchanged; 'merge' adds missing collections/tags; "
+                            "'duplicate' creates another item. Legacy aliases: "
+                            "skip=reuse, file=merge")
         p.add_argument("--create-collections", dest="create_collections",
                        action="store_true",
                        help="Create collections that don't exist yet "
@@ -741,11 +742,19 @@ def build_parser() -> argparse.ArgumentParser:
     adoi = add_sub.add_parser("doi", help="Add item by DOI")
     adoi.add_argument("doi")
     _add_common_flags(adoi)
-    adoi.add_argument("--attach-mode", choices=["auto", "linked_url", "import_file"], default="auto")
+    adoi.add_argument(
+        "--attach-mode",
+        choices=["auto", "none", "linked_url", "required"],
+        default="auto",
+    )
     aurl = add_sub.add_parser("url", help="Add item by URL")
     aurl.add_argument("url")
     _add_common_flags(aurl)
-    aurl.add_argument("--attach-mode", choices=["auto", "linked_url", "import_file"], default="auto")
+    aurl.add_argument(
+        "--attach-mode",
+        choices=["auto", "none", "linked_url", "required"],
+        default="auto",
+    )
     afil = add_sub.add_parser("file", help="Add item from local file (.pdf/.epub)")
     afil.add_argument("--filepath", required=True)
     afil.add_argument("--title", help="Override title if metadata extraction misses")
@@ -760,14 +769,14 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Inline BibTeX (use - to read from stdin)")
     abib.add_argument("--file", help="Path to a .bib/.bibtex file")
     _add_common_flags(abib)
-    abib.add_argument("--attach-mode", choices=["auto", "linked_url", "import_file"],
+    abib.add_argument("--attach-mode", choices=["auto", "none", "linked_url", "required"],
                       default="auto")
     acsl = add_sub.add_parser("csl-json", help="Add items from CSL JSON")
     acsl.add_argument("--json", dest="json",
                       help="Inline CSL JSON (use - to read from stdin)")
     acsl.add_argument("--file", help="Path to a .json/.csljson file")
     _add_common_flags(acsl)
-    acsl.add_argument("--attach-mode", choices=["auto", "linked_url", "import_file"],
+    acsl.add_argument("--attach-mode", choices=["auto", "none", "linked_url", "required"],
                       default="auto")
 
     # collections

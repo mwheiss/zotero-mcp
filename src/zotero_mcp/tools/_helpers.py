@@ -1032,7 +1032,7 @@ def _try_attach_oa_pdf(write_zot, item_key, doi, ctx, crossref_metadata=None,
                 if attach_mode == "linked_url":
                     if _attach_pdf_linked_url(write_zot, pdf_url, item_key, ctx):
                         return f"PDF linked (source: {source_name})"
-                else:  # "auto" or "import_file" — try download only
+                else:  # "auto" or "required" — download and import the PDF
                     webdav_suffix = _download_and_attach_pdf(
                         write_zot, item_key, pdf_url, doi, ctx
                     )

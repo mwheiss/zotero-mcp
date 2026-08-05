@@ -1,11 +1,11 @@
 """Tests for the standalone CLI module (zotero-cli entry point)."""
 
-import sys
 from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 
 import zotero_mcp.tools.write as write_tools
+from zotero_mcp._context import Context
 from zotero_mcp.cli_standalone import (
     CLIContext,
     build_parser,
@@ -15,8 +15,6 @@ from zotero_mcp.cli_standalone import (
     cmd_search,
     main,
 )
-from zotero_mcp._context import Context
-
 
 # ---------------------------------------------------------------------------
 # CLIContext
@@ -153,9 +151,9 @@ class TestParser:
                 "add", "file", "--filepath", "/tmp/x.pdf", "--parent-key", "ABC12345",
             ])
 
-    def test_add_doi_if_exists_defaults_to_file(self):
+    def test_add_doi_if_exists_defaults_to_reuse(self):
         args = self.parser.parse_args(["add", "doi", "10.1234/x"])
-        assert args.if_exists == "file"
+        assert args.if_exists == "reuse"
         assert args.create_collections is False
         assert args.collection is None
 
@@ -194,7 +192,7 @@ class TestParser:
         assert args.subcommand == "isbn"
         assert args.isbn == "9780262046305"
         assert args.collection == ["Books"]
-        assert args.if_exists == "file"
+        assert args.if_exists == "reuse"
 
     def test_add_bibtex_subcommand(self):
         args = self.parser.parse_args(
@@ -441,7 +439,7 @@ class TestCmdAdd:
     def _args(self, **kwargs):
         defaults = dict(
             verbose=False, collections=None, collection=None, tags=None,
-            if_exists="file", create_collections=False,
+            if_exists="reuse", create_collections=False,
         )
         defaults.update(kwargs)
         return MagicMock(**defaults)
@@ -515,13 +513,13 @@ class TestCmdAdd:
         assert call_kwargs["if_exists"] == "skip"
         assert call_kwargs["create_missing_collections"] is True
 
-    def test_add_doi_default_if_exists_is_file(self):
-        """The CLI defaults to convergent behavior; MCP keeps 'duplicate'."""
+    def test_add_doi_default_if_exists_is_reuse(self):
+        """Both CLI and MCP default to non-mutating duplicate reuse."""
         args = self._args(subcommand="doi", doi="10.1234/test",
                           attach_mode="auto")
         mock_write = self._run(args)
 
-        assert mock_write.add_by_doi.call_args.kwargs["if_exists"] == "file"
+        assert mock_write.add_by_doi.call_args.kwargs["if_exists"] == "reuse"
 
     def test_repeatable_collection_flag_merges_without_splitting(self):
         # -c values are single specs (never comma-split — names may contain
@@ -545,7 +543,7 @@ class TestCmdAdd:
         call_kwargs = mock_write.add_by_isbn.call_args.kwargs
         assert call_kwargs["isbn"] == "9780262046305"
         assert call_kwargs["collections"] == ["Books"]
-        assert call_kwargs["if_exists"] == "file"
+        assert call_kwargs["if_exists"] == "reuse"
 
     def test_add_bibtex_inline_matches_real_signature(self):
         args = self._args(subcommand="bibtex", bibtex="@article{x, title={T}}",

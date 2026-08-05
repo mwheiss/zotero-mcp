@@ -1,23 +1,23 @@
 """Tests for idempotent adds (#4): find_existing_items + if_exists semantics.
 
-if_exists contract on the add_by_* family:
+Public if_exists contract on the add_by_* family:
 
-- 'duplicate' (default): today's behavior — always create, even when an
-  identical identifier exists.
-- 'file': converge. Reuse the existing item, add it to any requested
+- 'reuse' (default): return an existing identifier match unchanged.
+- 'merge': converge. Reuse the existing item, add it to any requested
   collections it isn't in, add any missing tags. Nothing is ever removed.
   Re-running the same command is a no-op.
-- 'skip': report the existing item, change nothing.
+- 'duplicate': always create, even when an identical identifier exists.
+
+The old 'skip' and 'file' names remain accepted aliases for reuse and merge.
 """
 
 from unittest.mock import MagicMock
 
 import pytest
-
 from conftest import DummyContext, FakeZotero, _FakeResponse
+
 from zotero_mcp import server
 from zotero_mcp.tools import _helpers
-
 
 DOI = "10.1234/test.2024.001"
 
@@ -225,10 +225,20 @@ class TestAddByDoiIfExists:
         assert fake_zot.updated == []
         assert "No changes made" in result
 
-    def test_duplicate_default_still_creates(self, monkeypatch, fake_zot, dummy_ctx):
+    def test_reuse_default_touches_nothing(self, monkeypatch, fake_zot, dummy_ctx):
         _patch_clients(monkeypatch, fake_zot)
 
         result = server.add_by_doi(doi=DOI, ctx=dummy_ctx)
+
+        assert fake_zot.created == []
+        assert fake_zot.addto_calls == []
+        assert fake_zot.updated == []
+        assert "No changes made (if_exists='reuse')" in result
+
+    def test_duplicate_mode_explicitly_creates(self, monkeypatch, fake_zot, dummy_ctx):
+        _patch_clients(monkeypatch, fake_zot)
+
+        result = server.add_by_doi(doi=DOI, if_exists="duplicate", ctx=dummy_ctx)
 
         assert len(fake_zot.created) == 1
         assert "Successfully added" in result
@@ -249,6 +259,48 @@ class TestAddByDoiIfExists:
         result = server.add_by_doi(doi=DOI, if_exists="bogus", ctx=dummy_ctx)
         assert "if_exists" in result
         assert fake_zot.created == []
+
+    def test_none_attachment_mode_skips_attachment_discovery(
+        self, monkeypatch, fake_zot, dummy_ctx
+    ):
+        fake_zot._items = []
+        _patch_clients(monkeypatch, fake_zot)
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._try_attach_oa_pdf",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("attachment discovery must be skipped")
+            ),
+        )
+
+        result = server.add_by_doi(
+            doi=DOI,
+            attach_mode="none",
+            if_exists="duplicate",
+            ctx=dummy_ctx,
+        )
+
+        assert "skipped (attach_mode=none)" in result
+
+    def test_required_attachment_reports_retained_metadata_as_partial(
+        self, monkeypatch, fake_zot, dummy_ctx
+    ):
+        fake_zot._items = []
+        _patch_clients(monkeypatch, fake_zot)
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._try_attach_oa_pdf",
+            lambda *args, **kwargs: "no open-access PDF found",
+        )
+
+        result = server.add_by_doi(
+            doi=DOI,
+            attach_mode="required",
+            if_exists="duplicate",
+            ctx=dummy_ctx,
+        )
+
+        assert len(fake_zot.created) == 1
+        assert "Partial failure" in result
+        assert "metadata item was created and retained" in result
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +365,24 @@ class TestAddByUrlIfExists:
         assert fake_zot.created == []
         assert ("COLB0001", "PAGE0001") in fake_zot.addto_calls
         assert "Already in library" in result
+
+    def test_required_attachment_rejects_generic_webpage_before_create(
+        self, monkeypatch, fake_zot, dummy_ctx
+    ):
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client",
+            lambda ctx: (fake_zot, fake_zot),
+        )
+
+        result = server.add_by_url(
+            url="https://example.com/post",
+            attach_mode="required",
+            if_exists="duplicate",
+            ctx=dummy_ctx,
+        )
+
+        assert result.startswith("Error:")
+        assert fake_zot.created == []
 
 
 # ---------------------------------------------------------------------------
@@ -393,4 +463,4 @@ class TestAddByBibtexIfExists:
 
         assert fake_zot.created == []
         assert fake_zot.addto_calls == []
-        assert "skipped — already in library" in result
+        assert "reused unchanged — already in library" in result
