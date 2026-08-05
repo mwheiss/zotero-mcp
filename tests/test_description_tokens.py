@@ -37,6 +37,7 @@ TOOL_BUDGETS = {
     "zotero_create_annotation":        (130, 295),
     "zotero_create_area_annotation":   (175, 390),
     # tools/retrieval.py
+    "zotero_get_item_fulltext":        (135, 305),
     "zotero_get_tags":                 ( 85, 195),
     # tools/write.py
     "zotero_batch_update_tags":        (155, 350),
@@ -46,8 +47,8 @@ TOOL_BUDGETS = {
     "zotero_search_by_tag":            (115, 265),
     "zotero_search_by_citation_key":   (125, 280),
     "zotero_advanced_search":          (175, 400),
-    "zotero_semantic_search":          (130, 295),
-    "zotero_get_semantic_context":     (100, 245),
+    "zotero_semantic_search":          (170, 375),
+    "zotero_get_semantic_context":     (150, 335),
     "zotero_update_search_database":   (130, 295),
     "zotero_get_search_database_status": ( 75, 170),
 }
@@ -145,6 +146,27 @@ class TestGlobalCeiling:
             f"Tools over {PER_TOOL_HARD_MAX}-token hard cap: {over}. "
             f"Compact rubric-compliant descriptions rarely need more."
         )
+
+
+class TestSemanticReadingWorkflow:
+    """Keep the search, evidence, and whole-document routing explicit."""
+
+    def test_semantic_search_points_to_targeted_context(self, descriptions):
+        description = descriptions["zotero_semantic_search"]
+        assert "zotero_get_semantic_context" in description
+        assert "zotero_get_item_fulltext" in description
+
+    def test_semantic_context_points_to_whole_document_fallback(self, descriptions):
+        description = descriptions["zotero_get_semantic_context"]
+        assert "zotero_semantic_search" in description
+        assert "zotero_get_item_fulltext" in description
+        assert "Start with 0" in description
+
+    def test_fulltext_points_to_search_and_targeted_context(self, descriptions):
+        description = descriptions["zotero_get_item_fulltext"]
+        assert "zotero_semantic_search" in description
+        assert "zotero_get_semantic_context" in description
+        assert "Do not use it for topic discovery" in description
 
 
 class TestRubricFloor:

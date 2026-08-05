@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Semantic retrieval tools now advertise a three-tier reading workflow:** use semantic search for discovery, exact semantic context for targeted evidence, and full-text retrieval only for whole-document analysis. The descriptions include practical follow-up rules, stale-hash guidance, and token-cost safeguards so MCP clients can choose the appropriate tool reliably.
+
 ## [0.6.3] - 2026-08-05
 
 ### Added
