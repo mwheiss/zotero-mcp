@@ -12,7 +12,7 @@ from typing import Literal
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
-from zotero_mcp._context import Context
+from zotero_mcp._context import Context, context_error, context_info, context_warning
 from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
 
@@ -195,7 +195,7 @@ def search_items(
         if tag:
             tag_condition_str = f" with tags: '{', '.join(tag)}'"
 
-        ctx.info(f"Searching Zotero for '{query}'{tag_condition_str}")
+        context_info(ctx, f"Searching Zotero for '{query}'{tag_condition_str}")
         zot = _client.get_zotero_client()
 
         limit = _helpers._normalize_limit(limit, default=10)
@@ -232,11 +232,11 @@ def search_items(
                 if _time.monotonic() - _cascade_start > CASCADE_TIMEOUT:
                     _timed_out = True
                     _search_logger.debug("[CASCADE] Timeout — stopping cascade")
-                    ctx.info("Search took too long — returning best results found so far")
+                    context_info(ctx, "Search took too long — returning best results found so far")
                 return _timed_out
 
             if not items and query.strip() and fallback_mode != "none":
-                ctx.info("No results with original query, trying fallback strategies...")
+                context_info(ctx, "No results with original query, trying fallback strategies...")
                 words = query.strip().split()
 
                 # Strategy 1: Simplify to author + year (P2 fix)
@@ -254,7 +254,7 @@ def search_items(
                         simple_query = words[0]
 
                     t0 = _time.monotonic()
-                    ctx.info(f"Retry with simplified query: '{simple_query}'")
+                    context_info(ctx, f"Retry with simplified query: '{simple_query}'")
                     items = _search_with_variants(zot, simple_query, qmode, limit,
                                                   item_type=item_type, tag=tag,
                                                   cascade_start=_cascade_start,
@@ -267,7 +267,7 @@ def search_items(
                 if not _check_cascade_timeout() and not items and len(words) >= 2:
                     author_only = next((w for w in words if not re.match(r'^\d+$', w)), words[0])
                     t0 = _time.monotonic()
-                    ctx.info(f"Retry with author only: '{author_only}'")
+                    context_info(ctx, f"Retry with author only: '{author_only}'")
                     items = _search_with_variants(zot, author_only, qmode, limit,
                                                   item_type=item_type, tag=tag,
                                                   cascade_start=_cascade_start,
@@ -280,7 +280,7 @@ def search_items(
                 # Safe — no tokens consumed, only metadata returned
                 if not _check_cascade_timeout() and not items and qmode != "everything":
                     t0 = _time.monotonic()
-                    ctx.info(f"Retry with qmode='everything': '{query}'")
+                    context_info(ctx, f"Retry with qmode='everything': '{query}'")
                     items = _search_with_variants(zot, query, "everything", limit,
                                                   item_type=item_type, tag=tag,
                                                   cascade_start=_cascade_start,
@@ -299,7 +299,7 @@ def search_items(
                         from zotero_mcp.semantic_search import create_semantic_search
                         config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
                         if config_path.exists():
-                            ctx.info(f"Retry with semantic search: '{query}'")
+                            context_info(ctx, f"Retry with semantic search: '{query}'")
                             t0 = _time.monotonic()
                             sem_search = create_semantic_search(str(config_path))
                             _search_logger.debug(f"[CASCADE] semantic init: {_time.monotonic() - t0:.2f}s")
@@ -339,7 +339,7 @@ def search_items(
                                     fallback_strategy = "semantic search"
                     except Exception as e:
                         _search_logger.debug(f"[CASCADE] semantic failed: {e}")
-                        ctx.info(f"Semantic search fallback failed: {e}")
+                        context_info(ctx, f"Semantic search fallback failed: {e}")
 
             _search_logger.debug(f"[CASCADE] total: {_time.monotonic() - _cascade_start:.2f}s, fallback={fallback_strategy}")
 
@@ -376,7 +376,7 @@ def search_items(
         return _helpers._prepend_size_warning("\n".join(output))
 
     except Exception as e:
-        ctx.error(f"Error searching Zotero: {str(e)}")
+        context_error(ctx, f"Error searching Zotero: {str(e)}")
         return f"Error searching Zotero: {str(e)}"
 
 @mcp.tool(
@@ -435,7 +435,7 @@ def search_by_tag(
         if not tag:
             return "Error: Tag cannot be empty"
 
-        ctx.info(f"Searching Zotero for tag '{tag}'")
+        context_info(ctx, f"Searching Zotero for tag '{tag}'")
         zot = _client.get_zotero_client()
 
         limit = _helpers._normalize_limit(limit, default=10)
@@ -469,7 +469,7 @@ def search_by_tag(
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error searching Zotero: {str(e)}")
+        context_error(ctx, f"Error searching Zotero: {str(e)}")
         return f"Error searching Zotero: {str(e)}"
 
 
@@ -513,7 +513,7 @@ def search_by_citation_key(
             return "Error: Citation key cannot be empty"
 
         citekey = citekey.strip()
-        ctx.info(f"Looking up citation key: {citekey}")
+        context_info(ctx, f"Looking up citation key: {citekey}")
 
         # Strategy A: pyzotero search across all fields, then verify via Extra.
         # Note: the previous BetterBibTeX ``item.search`` JSON-RPC call was
@@ -534,7 +534,7 @@ def search_by_citation_key(
         return f"No item found with citation key: '{citekey}'"
 
     except Exception as e:
-        ctx.error(f"Error looking up citation key: {str(e)}")
+        context_error(ctx, f"Error looking up citation key: {str(e)}")
         return f"Error looking up citation key: {str(e)}"
 
 
@@ -612,7 +612,7 @@ def advanced_search(
 
         limit = _helpers._normalize_limit(limit, default=50, max_val=500)
 
-        ctx.info(f"Performing advanced search with {len(conditions)} conditions")
+        context_info(ctx, f"Performing advanced search with {len(conditions)} conditions")
         zot = _client.get_zotero_client()
 
         valid_operations = {
@@ -814,7 +814,7 @@ def advanced_search(
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error in advanced search: {str(e)}")
+        context_error(ctx, f"Error in advanced search: {str(e)}")
         return f"Error in advanced search: {str(e)}"
 
 
@@ -876,7 +876,7 @@ def semantic_search(
             if isinstance(filters, str):
                 try:
                     filters = json.loads(filters)
-                    ctx.info(f"Parsed JSON string filters: {filters}")
+                    context_info(ctx, f"Parsed JSON string filters: {filters}")
                 except json.JSONDecodeError as e:
                     return f"Error: Invalid JSON in filters parameter: {str(e)}"
 
@@ -889,7 +889,7 @@ def semantic_search(
             # Automatically translate common field names
             if "itemType" in filters:
                 filters["item_type"] = filters.pop("itemType")
-                ctx.info(f"Automatically translated 'itemType' to 'item_type': {filters}")
+                context_info(ctx, f"Automatically translated 'itemType' to 'item_type': {filters}")
 
         if item_key:
             normalized_key = item_key.strip()
@@ -918,7 +918,7 @@ def semantic_search(
                     ]
                 }
 
-        ctx.info(f"Performing semantic search for: '{query}'")
+        context_info(ctx, f"Performing semantic search for: '{query}'")
 
         # Import semantic search module
         try:
@@ -1020,7 +1020,7 @@ def semantic_search(
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error in semantic search: {str(e)}")
+        context_error(ctx, f"Error in semantic search: {str(e)}")
         return f"Error in semantic search: {str(e)}"
 
 
@@ -1102,7 +1102,7 @@ def get_semantic_context(
                 "zotero-mcp-server[semantic] first."
             )
 
-        ctx.info(f"Retrieving semantic context for {chunk_id}")
+        context_info(ctx, f"Retrieving semantic context for {chunk_id}")
         config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
         search = create_semantic_search(str(config_path))
         records = search.chroma_client.get_records(requested_ids)
@@ -1200,7 +1200,7 @@ def get_semantic_context(
             return f"Error: no readable semantic context found for `{chunk_id}`."
         return "\n".join(output).rstrip()
     except Exception as exc:
-        ctx.error(f"Error retrieving semantic context: {exc}")
+        context_error(ctx, f"Error retrieving semantic context: {exc}")
         return f"Error retrieving semantic context: {exc}"
 
 
@@ -1266,7 +1266,7 @@ def update_search_database(
         force_rebuild
         and confirm_force_rebuild != _MCP_FORCE_REBUILD_CONFIRMATION
     ):
-        ctx.warning("Blocked unconfirmed force rebuild.")
+        context_warning(ctx, "Blocked unconfirmed force rebuild.")
         return (
             "# Force Rebuild Not Started\n\n"
             "A full rebuild discards and re-embeds the entire semantic search "
@@ -1301,7 +1301,7 @@ def update_search_database(
         )
 
     try:
-        ctx.info("Starting semantic search database update...")
+        context_info(ctx, "Starting semantic search database update...")
 
         # Import semantic search module
         try:
@@ -1359,7 +1359,7 @@ def update_search_database(
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error updating search database: {str(e)}")
+        context_error(ctx, f"Error updating search database: {str(e)}")
         return f"Error updating search database: {str(e)}"
 
 
@@ -1398,7 +1398,7 @@ def get_search_database_status(*, ctx: Context) -> str:
         Database status information
     """
     try:
-        ctx.info("Getting semantic search database status...")
+        context_info(ctx, "Getting semantic search database status...")
 
         # Import the lightweight, model-free status readers. These live in the
         # semantic-search modules so they share the [semantic] extra's import
@@ -1471,5 +1471,5 @@ def get_search_database_status(*, ctx: Context) -> str:
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error getting database status: {str(e)}")
+        context_error(ctx, f"Error getting database status: {str(e)}")
         return f"Error getting database status: {str(e)}"

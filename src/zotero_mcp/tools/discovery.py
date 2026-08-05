@@ -8,7 +8,7 @@ import requests
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils  # noqa: F401  (kept for module-level conventions)
 from zotero_mcp._app import mcp
-from zotero_mcp._context import Context
+from zotero_mcp._context import Context, context_error, context_info
 from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
 
@@ -164,7 +164,7 @@ def find_related_papers(
         limit = _helpers._normalize_limit(limit, default=20, max_val=50)
         zot = _client.get_zotero_client()
 
-        ctx.info(f"Resolving identifier to DOI: {identifier}")
+        context_info(ctx, f"Resolving identifier to DOI: {identifier}")
         doi = _resolve_doi(identifier, zot)
         if not doi:
             return (
@@ -173,7 +173,7 @@ def find_related_papers(
                 "DOI in its metadata."
             )
 
-        ctx.info(f"Querying OpenAlex for DOI {doi}")
+        context_info(ctx, f"Querying OpenAlex for DOI {doi}")
         work = _openalex_get(f"{_OPENALEX_BASE}/works/https://doi.org/{doi}")
         if not work:
             return f"OpenAlex has no record for DOI '{doi}', or the lookup failed."
@@ -237,7 +237,7 @@ def find_related_papers(
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error finding related papers: {e}")
+        context_error(ctx, f"Error finding related papers: {e}")
         return f"Error finding related papers: {e}"
 
 
@@ -298,7 +298,7 @@ def library_coverage(
 
         skip_types = {"attachment", "note", "annotation"}
 
-        ctx.info("Scanning library for PDF coverage...")
+        context_info(ctx, "Scanning library for PDF coverage...")
         if collection_key:
             items = _helpers._paginate(
                 zot.collection_items,
@@ -372,5 +372,5 @@ def library_coverage(
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error computing library coverage: {e}")
+        context_error(ctx, f"Error computing library coverage: {e}")
         return f"Error computing library coverage: {e}"

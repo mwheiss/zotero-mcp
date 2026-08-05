@@ -7,7 +7,7 @@ import uuid
 
 import requests
 
-from zotero_mcp._context import Context
+from zotero_mcp._context import Context, context_error, context_info, context_warning
 from zotero_mcp._app import mcp
 from zotero_mcp import client as _client
 from zotero_mcp.client import with_zotero_api_lock
@@ -39,7 +39,7 @@ def _download_attachment_for_processing(
         web_client=web_client,
     )
     if download.path and download.path.exists():
-        ctx.info(f"Attachment downloaded via {download.source}")
+        context_info(ctx, f"Attachment downloaded via {download.source}")
         return str(download.path), None
 
     error_details = "\n".join(f"  - {err}" for err in download.errors) or "  - No download source succeeded"
@@ -127,7 +127,7 @@ def get_annotations(
             try:
                 parent = zot.item(item_key)
                 parent_title = parent["data"].get("title", "Untitled Item")
-                ctx.info(f"Fetching annotations for item: {parent_title}")
+                context_info(ctx, f"Fetching annotations for item: {parent_title}")
             except Exception:
                 return f"Error: No item found with key: {item_key}"
 
@@ -180,7 +180,7 @@ def get_annotations(
                                     citation_key = line.replace("citationkey:", "").strip()
                                     break
                         except Exception as e:
-                            ctx.warning(f"Error extracting citation key from Extra field: {e}")
+                            context_warning(ctx, f"Error extracting citation key from Extra field: {e}")
 
                         # Fallback to searching by title if no citation key found
                         if not citation_key:
@@ -192,14 +192,14 @@ def get_annotations(
 
                                     # Find the matching item
                                     for result in search_results:
-                                        ctx.info(f"Checking result: {result}")
+                                        context_info(ctx, f"Checking result: {result}")
 
                                         # Try to match with item key if possible
                                         if result.get('citekey'):
                                             citation_key = result['citekey']
                                             break
                             except Exception as e:
-                                ctx.warning(f"Error searching for citation key: {e}")
+                                context_warning(ctx, f"Error searching for citation key: {e}")
 
                         # Process annotations if citation key found
                         if citation_key:
@@ -242,11 +242,11 @@ def get_annotations(
                                             }
                                             better_bibtex_annotations.append(bibtex_anno)
 
-                                ctx.info(f"Retrieved {len(better_bibtex_annotations)} annotations via Better BibTeX")
+                                context_info(ctx, f"Retrieved {len(better_bibtex_annotations)} annotations via Better BibTeX")
                             except Exception as e:
-                                ctx.warning(f"Error processing Better BibTeX annotations: {e}")
+                                context_warning(ctx, f"Error processing Better BibTeX annotations: {e}")
                 except Exception as bibtex_error:
-                    ctx.warning(f"Error initializing Better BibTeX: {bibtex_error}")
+                    context_warning(ctx, f"Error initializing Better BibTeX: {bibtex_error}")
 
             # Fallback to Zotero API annotations.
             #
@@ -283,9 +283,9 @@ def get_annotations(
                                 if k and k not in seen:
                                     seen.add(k)
                                     zotero_api_annotations.append(a)
-                    ctx.info(f"Retrieved {len(zotero_api_annotations)} annotations via Zotero API")
+                    context_info(ctx, f"Retrieved {len(zotero_api_annotations)} annotations via Zotero API")
                 except Exception as api_error:
-                    ctx.warning(f"Error retrieving Zotero API annotations: {api_error}")
+                    context_warning(ctx, f"Error retrieving Zotero API annotations: {api_error}")
 
             # PDF Extraction fallback
             if use_pdf_extraction and not (better_bibtex_annotations or zotero_api_annotations):
@@ -343,9 +343,9 @@ def get_annotations(
 
                                         pdf_annotations.append(pdf_anno)
 
-                        ctx.info(f"Retrieved {len(pdf_annotations)} annotations via PDF extraction")
+                        context_info(ctx, f"Retrieved {len(pdf_annotations)} annotations via PDF extraction")
                 except Exception as pdf_error:
-                    ctx.warning(f"Error during PDF annotation extraction: {pdf_error}")
+                    context_warning(ctx, f"Error during PDF annotation extraction: {pdf_error}")
 
             # Combine annotations from all sources
             annotations = better_bibtex_annotations + zotero_api_annotations + pdf_annotations
@@ -462,7 +462,7 @@ def get_annotations(
         return result
 
     except Exception as e:
-        ctx.error(f"Error fetching annotations: {str(e)}")
+        context_error(ctx, f"Error fetching annotations: {str(e)}")
         return f"Error fetching annotations: {str(e)}"
 
 
@@ -511,7 +511,7 @@ def get_notes(
         Markdown-formatted list of notes
     """
     try:
-        ctx.info(f"Fetching notes{f' for item {item_key}' if item_key else ''}")
+        context_info(ctx, f"Fetching notes{f' for item {item_key}' if item_key else ''}")
         zot = _client.get_zotero_client()
 
         # Prepare search parameters
@@ -578,7 +578,7 @@ def get_notes(
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error fetching notes: {str(e)}")
+        context_error(ctx, f"Error fetching notes: {str(e)}")
         return f"Error fetching notes: {str(e)}"
 
 
@@ -601,7 +601,7 @@ def _batch_resolve_parent_titles(
             for item in items:
                 titles[item.get("key", "")] = item.get("data", {}).get("title", "Untitled")
         except Exception as e:
-            ctx.warning(f"Batch parent lookup failed: {e}")
+            context_warning(ctx, f"Batch parent lookup failed: {e}")
             for k in batch:
                 titles.setdefault(k, f"(parent key: {k})")
 
@@ -646,7 +646,7 @@ def _batch_resolve_grandparent_titles(
                 if gp_key and item.get("data", {}).get("itemType") == "attachment":
                     grandparent_keys.add(gp_key)
         except Exception as e:
-            ctx.info(f"Batch attachment lookup failed: {e}")
+            context_info(ctx, f"Batch attachment lookup failed: {e}")
 
     # Step 1b: Individual fallback for attachment keys the batch missed
     missing_attachments = [k for k in parent_keys if k not in attachment_data]
@@ -673,7 +673,7 @@ def _batch_resolve_grandparent_titles(
                     item.get("data", {}).get("title", "Untitled")
                 )
         except Exception as e:
-            ctx.info(f"Batch grandparent lookup failed: {e}")
+            context_info(ctx, f"Batch grandparent lookup failed: {e}")
 
     # Step 2b: Individual fallback for grandparent keys the batch missed
     missing_gp = [k for k in grandparent_keys if k not in grandparent_titles]
@@ -800,7 +800,7 @@ def search_notes(
     if not query or not query.strip():
         return "Error: Search query cannot be empty"
 
-    ctx.info(f"Searching Zotero notes for '{query}'")
+    context_info(ctx, f"Searching Zotero notes for '{query}'")
 
     limit = _helpers._normalize_limit(limit, default=20)
 
@@ -815,21 +815,21 @@ def search_notes(
             if reader:
                 try:
                     note_results = reader.search_notes_local(query, limit)
-                    ctx.info(f"Local note search: {len(note_results)} results")
+                    context_info(ctx, f"Local note search: {len(note_results)} results")
                 except Exception as e:
-                    ctx.warning(f"Local note search failed: {e}")
+                    context_warning(ctx, f"Local note search failed: {e}")
 
                 try:
                     annotation_results = reader.search_annotations_local(query, limit)
-                    ctx.info(f"Local annotation search: {len(annotation_results)} results")
+                    context_info(ctx, f"Local annotation search: {len(annotation_results)} results")
                 except Exception as e:
-                    ctx.warning(f"Local annotation search failed: {e}")
+                    context_warning(ctx, f"Local annotation search failed: {e}")
                 finally:
                     reader.close()
 
                 return _format_search_results(query, note_results, annotation_results, raw_html=raw_html)
         except Exception as e:
-            ctx.warning(f"Local search unavailable, falling back to API: {e}")
+            context_warning(ctx, f"Local search unavailable, falling back to API: {e}")
 
     # ---------- API mode: separate try/except blocks ----------
     zot = _client.get_zotero_client()
@@ -862,9 +862,9 @@ def search_notes(
                 "parent_key": parent_key,
                 "parent_title": parent_titles.get(parent_key) if parent_key else None,
             })
-        ctx.info(f"API note search: {len(note_results)} results")
+        context_info(ctx, f"API note search: {len(note_results)} results")
     except Exception as e:
-        ctx.warning(f"Note search failed: {e}")
+        context_warning(ctx, f"Note search failed: {e}")
 
     # Annotations — separate block so note results survive if this crashes
     try:
@@ -898,9 +898,9 @@ def search_notes(
                 "parent_key": parent_key,
                 "parent_title": anno_parent_titles.get(parent_key) if parent_key else None,
             })
-        ctx.info(f"API annotation search: {len(annotation_results)} results")
+        context_info(ctx, f"API annotation search: {len(annotation_results)} results")
     except Exception as e:
-        ctx.warning(f"Annotation search failed: {e}")
+        context_warning(ctx, f"Annotation search failed: {e}")
 
     return _format_search_results(query, note_results, annotation_results, raw_html=raw_html)
 
@@ -944,7 +944,7 @@ def create_note(
         Confirmation message with the new note key
     """
     try:
-        ctx.info(f"Creating note for item {item_key}")
+        context_info(ctx, f"Creating note for item {item_key}")
         # Normalize tags (LLMs often pass JSON strings instead of lists)
         tags = _helpers._normalize_str_list_input(tags, "tags") if tags is not None else []
         zot = _client.get_zotero_client()
@@ -1054,7 +1054,7 @@ def create_note(
                 return f"Failed to create note: {result.get('failed', 'Unknown error')}"
 
     except Exception as e:
-        ctx.error(f"Error creating note: {str(e)}")
+        context_error(ctx, f"Error creating note: {str(e)}")
         return f"Error creating note: {str(e)}"
 
 
@@ -1097,7 +1097,7 @@ def update_note(
         Confirmation message
     """
     try:
-        ctx.info(f"Updating note {item_key} (append={append})")
+        context_info(ctx, f"Updating note {item_key} (append={append})")
 
         zot, err = _get_note_write_client("updating notes")
         if err:
@@ -1123,7 +1123,7 @@ def update_note(
         return f"Failed to update note {item_key}"
 
     except Exception as e:
-        ctx.error(f"Error updating note: {str(e)}")
+        context_error(ctx, f"Error updating note: {str(e)}")
         return f"Error updating note: {str(e)}"
 
 
@@ -1160,7 +1160,7 @@ def delete_note(
         Confirmation message
     """
     try:
-        ctx.info(f"Trashing note {item_key}")
+        context_info(ctx, f"Trashing note {item_key}")
 
         zot, err = _get_note_write_client("deleting notes")
         if err:
@@ -1193,7 +1193,7 @@ def delete_note(
         return f"Failed to trash note {item_key} (HTTP {resp.status_code}): {resp.text[:200]}"
 
     except Exception as e:
-        ctx.error(f"Error trashing note: {str(e)}")
+        context_error(ctx, f"Error trashing note: {str(e)}")
         return f"Error trashing note: {str(e)}"
 
 
@@ -1258,7 +1258,7 @@ def create_annotation(
     )
 
     try:
-        ctx.info(f"Creating annotation on attachment {attachment_key}, page {page}")
+        context_info(ctx, f"Creating annotation on attachment {attachment_key}, page {page}")
 
         # Get clients for different operations
         local_client = _client.get_local_zotero_client()
@@ -1329,7 +1329,7 @@ def create_annotation(
             # Search for the text and get position data
             search_preview = text[:50] + "..." if len(text) > 50 else text
             location_type = "page" if file_type == "pdf" else "chapter"
-            ctx.info(f"Searching for text in {location_type} {page}: '{search_preview}'")
+            context_info(ctx, f"Searching for text in {location_type} {page}: '{search_preview}'")
 
             if file_type == "pdf":
                 position_data = find_text_position(file_path, page, text)
@@ -1435,7 +1435,7 @@ def create_annotation(
             if page_label:
                 annotation_data["annotationPageLabel"] = page_label
 
-            ctx.info(f"Creating annotation via Web API...")
+            context_info(ctx, f"Creating annotation via Web API...")
 
             # Create the annotation using web client
             result = web_client.create_items([annotation_data])
@@ -1472,7 +1472,7 @@ def create_annotation(
                 return f"Failed to create annotation: {failed_info}"
 
     except Exception as e:
-        ctx.error(f"Error creating annotation: {str(e)}")
+        context_error(ctx, f"Error creating annotation: {str(e)}")
         return f"Error creating annotation: {str(e)}"
 
 
@@ -1540,7 +1540,7 @@ def create_area_annotation(
     )
 
     try:
-        ctx.info(f"Creating area annotation on attachment {attachment_key}, page {page}")
+        context_info(ctx, f"Creating area annotation on attachment {attachment_key}, page {page}")
 
         values = {"x": x, "y": y, "width": width, "height": height}
         for name, value in values.items():
@@ -1633,7 +1633,7 @@ def create_area_annotation(
                 "tags": [{"tag": t} for t in tag_list],
             }
 
-            ctx.info("Creating area annotation via Web API...")
+            context_info(ctx, "Creating area annotation via Web API...")
             result = web_client.create_items([annotation_data])
 
             if "success" in result and result["success"]:
@@ -1657,7 +1657,7 @@ def create_area_annotation(
             return f"Failed to create annotation: {failed_info}"
 
     except Exception as e:
-        ctx.error(f"Error creating area annotation: {str(e)}")
+        context_error(ctx, f"Error creating area annotation: {str(e)}")
         return f"Error creating area annotation: {str(e)}"
 
 
@@ -1767,7 +1767,7 @@ def get_page_layout(
     from zotero_mcp import pdf_layout
 
     try:
-        ctx.info(f"Detecting page layout on attachment {attachment_key}, page {page}")
+        context_info(ctx, f"Detecting page layout on attachment {attachment_key}, page {page}")
 
         if not isinstance(page, int) or page < 1:
             return "Error: page must be a positive 1-indexed page number"
@@ -1814,7 +1814,7 @@ def get_page_layout(
             if error_message:
                 return error_message
 
-            ctx.info(f"Detecting regions on page {page}...")
+            context_info(ctx, f"Detecting regions on page {page}...")
             layout = pdf_layout.detect_page_regions(file_path, page)
 
         if "error" in layout:
@@ -1823,7 +1823,7 @@ def get_page_layout(
         return _format_page_layout(layout, attachment_key, page, filename)
 
     except Exception as e:
-        ctx.error(f"Error detecting page layout: {str(e)}")
+        context_error(ctx, f"Error detecting page layout: {str(e)}")
         return f"Error detecting page layout: {str(e)}"
 
 
@@ -1855,7 +1855,7 @@ def update_annotation(
                 "'add_tags'/'remove_tags' (incremental). Use one approach or the other."
             )
 
-        ctx.info(f"Updating annotation {annotation_key}")
+        context_info(ctx, f"Updating annotation {annotation_key}")
 
         zot, err = _get_note_write_client("updating annotations")
         if err:
@@ -1916,7 +1916,7 @@ def update_annotation(
     except ValueError as e:
         return f"Input error: {e}"
     except Exception as e:
-        ctx.error(f"Error updating annotation: {e}")
+        context_error(ctx, f"Error updating annotation: {e}")
         return f"Error updating annotation: {e}"
 
 
@@ -1933,7 +1933,7 @@ def delete_annotation(
     ctx: Context
 ) -> str:
     try:
-        ctx.info(f"Trashing annotation {annotation_key}")
+        context_info(ctx, f"Trashing annotation {annotation_key}")
 
         zot, err = _get_note_write_client("deleting annotations")
         if err:
@@ -1972,5 +1972,5 @@ def delete_annotation(
         )
 
     except Exception as e:
-        ctx.error(f"Error trashing annotation: {str(e)}")
+        context_error(ctx, f"Error trashing annotation: {str(e)}")
         return f"Error trashing annotation: {str(e)}"

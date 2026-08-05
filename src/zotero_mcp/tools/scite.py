@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 
-from zotero_mcp._context import Context
+from zotero_mcp._context import Context, context_error, context_info
 from zotero_mcp import client as _client
 from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp import scite_client as _scite
@@ -157,7 +157,7 @@ def enrich_item(
 
         # Resolve DOI from Zotero item if needed
         if not doi and item_key:
-            ctx.info(f"Looking up DOI for Zotero item {item_key}")
+            context_info(ctx, f"Looking up DOI for Zotero item {item_key}")
             zot = _client.get_zotero_client()
             item = zot.item(item_key)
             if not item:
@@ -167,7 +167,7 @@ def enrich_item(
                 return f"Error: no DOI found for Zotero item '{item_key}'"
 
         doi = _helpers._normalize_doi(doi) or doi
-        ctx.info(f"Fetching Scite data for {doi}")
+        context_info(ctx, f"Fetching Scite data for {doi}")
 
         # Fetch tally + paper metadata in parallel-ish (same thread, two requests)
         tally = _scite.get_tally(doi)
@@ -212,7 +212,7 @@ def enrich_item(
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error enriching item: {e}")
+        context_error(ctx, f"Error enriching item: {e}")
         return f"Error enriching item: {e}"
 
 
@@ -256,7 +256,7 @@ def enrich_search(
         zot = _client.get_zotero_client()
         limit_int = _helpers._normalize_limit(limit, default=10)
 
-        ctx.info(f"Searching Zotero for '{query}' and enriching with Scite data")
+        context_info(ctx, f"Searching Zotero for '{query}' and enriching with Scite data")
         zot.add_parameters(
             q=query,
             qmode="titleCreatorYear",
@@ -291,7 +291,7 @@ def enrich_search(
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error in enriched search: {e}")
+        context_error(ctx, f"Error in enriched search: {e}")
         return f"Error in enriched search: {e}"
 
 
@@ -337,7 +337,7 @@ def check_retractions(
 
         # Fetch items
         if collection:
-            ctx.info(f"Checking collection '{collection}' for retractions")
+            context_info(ctx, f"Checking collection '{collection}' for retractions")
             keys = _helpers._resolve_collection_names(zot, [collection], ctx)
             if not keys:
                 return f"Collection '{collection}' not found"
@@ -345,11 +345,11 @@ def check_retractions(
                 keys[0], limit=limit_int, itemType="-attachment"
             )
         elif tag:
-            ctx.info(f"Checking items tagged '{tag}' for retractions")
+            context_info(ctx, f"Checking items tagged '{tag}' for retractions")
             zot.add_parameters(tag=tag, itemType="-attachment", limit=limit_int)
             items = zot.items()
         else:
-            ctx.info("Checking recent items for retractions")
+            context_info(ctx, "Checking recent items for retractions")
             items = zot.items(
                 sort="dateModified",
                 direction="desc",
@@ -370,7 +370,7 @@ def check_retractions(
         if not doi_items:
             return f"None of the {len(items)} items have DOIs — cannot check Scite."
 
-        ctx.info(f"Checking {len(doi_items)} DOIs against Scite editorial notices")
+        context_info(ctx, f"Checking {len(doi_items)} DOIs against Scite editorial notices")
         papers = _scite.get_papers_batch(list(doi_items.keys()))
 
         if not papers:
@@ -421,5 +421,5 @@ def check_retractions(
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error checking retractions: {e}")
+        context_error(ctx, f"Error checking retractions: {e}")
         return f"Error checking retractions: {e}"

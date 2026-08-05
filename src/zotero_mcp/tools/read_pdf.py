@@ -5,11 +5,10 @@ import os
 import tempfile
 from pathlib import Path
 
-from fastmcp import Context
-
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
+from zotero_mcp._context import Context, context_error, context_info
 from zotero_mcp.tools import _helpers
 
 
@@ -146,7 +145,7 @@ def read_pdf_pages(
         if end_page is not None and end_page < start_page:
             return "Error: end_page must be greater than or equal to start_page."
 
-        ctx.info(f"Reading PDF pages {start_page}-{end_page or start_page} for item {item_key}")
+        context_info(ctx, f"Reading PDF pages {start_page}-{end_page or start_page} for item {item_key}")
 
         result = _get_pdf_path(item_key, ctx)
         if result is None:
@@ -210,5 +209,5 @@ def read_pdf_pages(
         )
 
     except Exception as e:
-        ctx.error(f"Error reading PDF pages: {str(e)}")
+        context_error(ctx, f"Error reading PDF pages: {str(e)}")
         return f"Error reading PDF pages: {str(e)}"

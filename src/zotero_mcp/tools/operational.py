@@ -9,7 +9,7 @@ from pathlib import Path
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
-from zotero_mcp._context import Context
+from zotero_mcp._context import Context, context_error, context_info
 from zotero_mcp.tool_profiles import effective_tool_profile, requested_tool_profile
 
 
@@ -24,7 +24,7 @@ from zotero_mcp.tool_profiles import effective_tool_profile, requested_tool_prof
     ),
 )
 def get_capabilities(*, ctx: Context) -> str:
-    ctx.info("Inspecting Zotero MCP capabilities")
+    context_info(ctx, "Inspecting Zotero MCP capabilities")
     library = _client.get_current_library()
     local_mode = _utils.is_local_mode()
     api_key = bool(os.getenv("ZOTERO_API_KEY"))
@@ -74,7 +74,7 @@ def get_search_database_health(
     *,
     ctx: Context,
 ) -> str:
-    ctx.info("Auditing semantic search database health")
+    context_info(ctx, "Auditing semantic search database health")
     try:
         from zotero_mcp.db_health import (
             audit_semantic_database,
@@ -90,5 +90,5 @@ def get_search_database_health(
         )
         return format_health_report(report)
     except Exception as exc:
-        ctx.error(f"Semantic database health audit failed: {exc}")
+        context_error(ctx, f"Semantic database health audit failed: {exc}")
         return f"Error: Semantic database health audit failed: {exc}"

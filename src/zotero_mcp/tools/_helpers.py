@@ -13,6 +13,7 @@ import requests
 
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
+from zotero_mcp._context import context_error, context_info, context_warning
 
 # ---------------------------------------------------------------------------
 # Config file
@@ -189,7 +190,7 @@ def _handle_write_response(response, ctx=None):
     if hasattr(response, "status_code"):
         ok = response.status_code in (200, 204)
         if not ok and ctx is not None:
-            ctx.error(f"Write failed ({response.status_code}): {response.text[:500]}")
+            context_error(ctx, f"Write failed ({response.status_code}): {response.text[:500]}")
         return ok
     if isinstance(response, dict):
         return bool(response.get("success"))
@@ -211,7 +212,7 @@ def ensure_collection_membership(write_zot, item_key: str, coll_keys: list[str],
         item = write_zot.item(item_key)
     except Exception as e:
         if ctx is not None:
-            ctx.warning(f"Could not re-fetch item {item_key} to verify collection membership: {e}")
+            context_warning(ctx, f"Could not re-fetch item {item_key} to verify collection membership: {e}")
         return list(coll_keys)
     actual = set(item.get("data", {}).get("collections") or [])
     failed: list[str] = []
@@ -224,7 +225,7 @@ def ensure_collection_membership(write_zot, item_key: str, coll_keys: list[str],
         except Exception as e:
             failed.append(coll_key)
             if ctx is not None:
-                ctx.warning(f"Could not file {item_key} in collection {coll_key}: {e}")
+                context_warning(ctx, f"Could not file {item_key} in collection {coll_key}: {e}")
     return failed
 
 
@@ -335,7 +336,7 @@ def _resolve_collection_names(zot, names, ctx=None):
         if not matches:
             raise ValueError(f"No collection found matching name '{name}'")
         if len(matches) > 1 and ctx is not None:
-            ctx.warning(
+            context_warning(ctx,
                 f"Multiple collections match '{name}': {matches}. "
                 "Using all. Pass collection keys directly to disambiguate."
             )
@@ -495,7 +496,7 @@ def _create_collection_path(write_zot, paths, spec, ctx=None) -> str:
         new_key = next(iter(result["success"].values()))
         paths[new_key] = (paths[parent_key] if parent_key else []) + [name]
         if ctx is not None:
-            ctx.info(f"Created collection '{'/'.join(paths[new_key])}' ({new_key})")
+            context_info(ctx, f"Created collection '{'/'.join(paths[new_key])}' ({new_key})")
         parent_key = new_key
     return parent_key
 
@@ -550,7 +551,7 @@ def find_existing_items(zot, *, doi=None, arxiv_id=None, isbn=None, url=None,
         )
     except Exception as e:
         if ctx is not None:
-            ctx.warning(f"Existing-item search failed (treating as no match): {e}")
+            context_warning(ctx, f"Existing-item search failed (treating as no match): {e}")
         return []
 
     matches = []
@@ -753,7 +754,7 @@ def _guarded_pdf_get(pdf_url, ctx):
     current = pdf_url
     for _ in range(_MAX_PDF_REDIRECTS + 1):
         if not _url_resolves_to_public_host(current):
-            ctx.info(f"PDF URL rejected by SSRF guard: {current}")
+            context_info(ctx, f"PDF URL rejected by SSRF guard: {current}")
             return None
         resp = requests.get(current, timeout=30, stream=True, allow_redirects=False)
         if resp.status_code in _REDIRECT_STATUSES:
@@ -767,7 +768,7 @@ def _guarded_pdf_get(pdf_url, ctx):
             current = urljoin(current, location)
             continue
         return resp
-    ctx.info("Too many redirects while fetching PDF")
+    context_info(ctx, "Too many redirects while fetching PDF")
     return None
 
 
@@ -791,7 +792,7 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
 
         content_type = pdf_resp.headers.get("Content-Type", "")
         if "pdf" not in content_type and "octet-stream" not in content_type:
-            ctx.info(f"URL did not return a PDF (Content-Type: {content_type})")
+            context_info(ctx, f"URL did not return a PDF (Content-Type: {content_type})")
             return None
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -802,7 +803,7 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
                     f.write(chunk)
 
             if os.path.getsize(filepath) < 1000:
-                ctx.info("Downloaded file too small, likely not a real PDF")
+                context_info(ctx, "Downloaded file too small, likely not a real PDF")
                 return None
 
             attach_result = write_zot.attachment_both(
@@ -812,7 +813,7 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
             # Must run inside the with-block — temp file disappears on exit.
             return _maybe_upload_to_webdav(attach_result, filepath, ctx)
     except Exception as e:
-        ctx.info(f"PDF download/attach failed: {e}")
+        context_info(ctx, f"PDF download/attach failed: {e}")
         return None
 
 
@@ -855,10 +856,10 @@ def _maybe_upload_to_webdav(attach_result, file_path, ctx):
             attachment_key=attachment_key,
             file_path=file_path,
         )
-        ctx.info(f"WebDAV PUT: {attachment_key}.zip uploaded")
+        context_info(ctx, f"WebDAV PUT: {attachment_key}.zip uploaded")
         return f" (uploaded to WebDAV as {attachment_key}.zip)"
     except Exception as e:
-        ctx.info(f"WebDAV PUT failed for {attachment_key}: {e}")
+        context_info(ctx, f"WebDAV PUT failed for {attachment_key}: {e}")
         return (
             f" (WARNING: WebDAV upload failed — {e}; "
             f"attachment {attachment_key} exists but has no file bytes on WebDAV)"
@@ -875,11 +876,11 @@ def _attach_pdf_linked_url(write_zot, pdf_url, parent_key, ctx):
         template["parentItem"] = parent_key
         result = write_zot.create_items([template])
         if result.get("success"):
-            ctx.info(f"Linked URL attachment created for {pdf_url}")
+            context_info(ctx, f"Linked URL attachment created for {pdf_url}")
             return True
         return False
     except Exception as e:
-        ctx.info(f"Linked URL attachment failed: {e}")
+        context_info(ctx, f"Linked URL attachment failed: {e}")
         return False
 
 
@@ -899,23 +900,23 @@ def _try_unpaywall(doi, ctx):
         best = oa_data.get("best_oa_location") or {}
         pdf_url = best.get("url_for_pdf")
         if pdf_url:
-            ctx.info("Unpaywall: found PDF via best_oa_location")
+            context_info(ctx, "Unpaywall: found PDF via best_oa_location")
             return pdf_url
 
         for loc in oa_data.get("oa_locations", []):
             pdf_url = loc.get("url_for_pdf")
             if pdf_url:
-                ctx.info("Unpaywall: found PDF via alternate oa_location")
+                context_info(ctx, "Unpaywall: found PDF via alternate oa_location")
                 return pdf_url
 
         landing = best.get("url")
         if landing:
-            ctx.info("Unpaywall: no direct PDF URL, trying landing page")
+            context_info(ctx, "Unpaywall: no direct PDF URL, trying landing page")
             return landing
 
         return None
     except Exception as e:
-        ctx.info(f"Unpaywall lookup failed: {e}")
+        context_info(ctx, f"Unpaywall lookup failed: {e}")
         return None
 
 
@@ -930,18 +931,18 @@ def _try_arxiv_from_crossref(crossref_metadata, ctx):
             for rel in relations.get(rel_type, []):
                 rel_id = rel.get("id", "")
                 if rel.get("id-type") == "arxiv" and rel_id:
-                    ctx.info(f"CrossRef relation contains arXiv ID: {rel_id}")
+                    context_info(ctx, f"CrossRef relation contains arXiv ID: {rel_id}")
                     return f"https://arxiv.org/pdf/{rel_id}.pdf"
                 if rel.get("id-type") == "doi" and "arxiv" in rel_id.lower():
                     m = re.search(r"arXiv\.(\d{4}\.\d{4,5}(?:v\d+)?)", rel_id, re.IGNORECASE)
                     if m:
                         arxiv_id = m.group(1)
-                        ctx.info(f"CrossRef relation contains arXiv DOI: {rel_id} -> {arxiv_id}")
+                        context_info(ctx, f"CrossRef relation contains arXiv DOI: {rel_id} -> {arxiv_id}")
                         return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
 
         for alt_id in crossref_metadata.get("alternative-id", []):
             if re.match(r"\d{4}\.\d{4,5}", str(alt_id)):
-                ctx.info(f"CrossRef alternative-id looks like arXiv: {alt_id}")
+                context_info(ctx, f"CrossRef alternative-id looks like arXiv: {alt_id}")
                 return f"https://arxiv.org/pdf/{alt_id}.pdf"
 
         for link in crossref_metadata.get("link", []):
@@ -949,12 +950,12 @@ def _try_arxiv_from_crossref(crossref_metadata, ctx):
             if "arxiv.org" in url:
                 m = re.search(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5}(?:v\d+)?)", url)
                 if m:
-                    ctx.info("CrossRef link contains arXiv URL")
+                    context_info(ctx, "CrossRef link contains arXiv URL")
                     return f"https://arxiv.org/pdf/{m.group(1)}.pdf"
 
         return None
     except Exception as e:
-        ctx.info(f"arXiv-from-CrossRef check failed: {e}")
+        context_info(ctx, f"arXiv-from-CrossRef check failed: {e}")
         return None
 
 
@@ -973,11 +974,11 @@ def _try_semantic_scholar(doi, ctx):
         oa_pdf = data.get("openAccessPdf") or {}
         pdf_url = oa_pdf.get("url")
         if pdf_url:
-            ctx.info("Semantic Scholar: found OA PDF")
+            context_info(ctx, "Semantic Scholar: found OA PDF")
             return pdf_url
         return None
     except Exception as e:
-        ctx.info(f"Semantic Scholar lookup failed: {e}")
+        context_info(ctx, f"Semantic Scholar lookup failed: {e}")
         return None
 
 
@@ -1001,11 +1002,11 @@ def _try_pmc(doi, ctx):
         if not pmcid:
             return None
 
-        ctx.info(f"PMC: found PMCID {pmcid}")
+        context_info(ctx, f"PMC: found PMCID {pmcid}")
         return f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
 
     except Exception as e:
-        ctx.info(f"PMC lookup failed: {e}")
+        context_info(ctx, f"PMC lookup failed: {e}")
         return None
 
 
@@ -1025,7 +1026,7 @@ def _try_attach_oa_pdf(write_zot, item_key, doi, ctx, crossref_metadata=None,
         try:
             pdf_url = find_url()
             if pdf_url:
-                ctx.info(f"Trying PDF from {source_name}: {pdf_url}")
+                context_info(ctx, f"Trying PDF from {source_name}: {pdf_url}")
                 found_urls.append((source_name, pdf_url))
 
                 if attach_mode == "linked_url":
@@ -1038,9 +1039,9 @@ def _try_attach_oa_pdf(write_zot, item_key, doi, ctx, crossref_metadata=None,
                     if webdav_suffix is not None:
                         return f"PDF attached (source: {source_name}){webdav_suffix}"
 
-                ctx.info(f"{source_name} URL didn't yield a valid PDF, trying next source")
+                context_info(ctx, f"{source_name} URL didn't yield a valid PDF, trying next source")
         except Exception as e:
-            ctx.info(f"{source_name} failed: {e}")
+            context_info(ctx, f"{source_name} failed: {e}")
 
     if found_urls:
         # URLs were found but couldn't be downloaded — report them so the user

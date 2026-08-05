@@ -5,7 +5,7 @@ import os
 import uuid
 from pathlib import Path
 
-from zotero_mcp._context import Context
+from zotero_mcp._context import Context, context_error
 from zotero_mcp._app import mcp
 from zotero_mcp import client as _client
 from zotero_mcp.client import with_zotero_api_lock
@@ -77,7 +77,7 @@ def chatgpt_connector_search(
 
         return json.dumps({"results": result_list}, separators=(",", ":"))
     except Exception as e:
-        ctx.error(f"Error in search wrapper: {str(e)}")
+        context_error(ctx, f"Error in search wrapper: {str(e)}")
         return json.dumps({"results": []}, separators=(",", ":"))
 
 
@@ -189,7 +189,7 @@ def connector_fetch(
             "metadata": metadata
         }, separators=(",", ":"))
     except Exception as e:
-        ctx.error(f"Error in fetch wrapper: {str(e)}")
+        context_error(ctx, f"Error in fetch wrapper: {str(e)}")
         return json.dumps({
             "id": id,
             "title": "",

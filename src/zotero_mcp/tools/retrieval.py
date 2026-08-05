@@ -11,7 +11,7 @@ from typing import Literal
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
-from zotero_mcp._context import Context
+from zotero_mcp._context import Context, context_error, context_info, context_warning
 from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
 
@@ -69,7 +69,7 @@ def get_item_metadata(
     """
     _ret_logger = _logging.getLogger("zotero_mcp.retrieval")
     try:
-        ctx.info(f"Fetching metadata for item {item_key} in {format} format")
+        context_info(ctx, f"Fetching metadata for item {item_key} in {format} format")
         zot = _client.get_zotero_client()
 
         t0 = _time.monotonic()
@@ -85,7 +85,7 @@ def get_item_metadata(
         return _client.format_item_metadata(item, include_abstract)
 
     except Exception as e:
-        ctx.error(f"Error fetching item metadata: {str(e)}")
+        context_error(ctx, f"Error fetching item metadata: {str(e)}")
         return f"Error fetching item metadata: {str(e)}"
 
 
@@ -131,7 +131,7 @@ def get_item_fulltext(
         Markdown-formatted item full text
     """
     try:
-        ctx.info(f"Fetching full text for item {item_key}")
+        context_info(ctx, f"Fetching full text for item {item_key}")
         zot = _client.get_zotero_client()
 
         # First get the item metadata
@@ -201,10 +201,10 @@ def get_item_fulltext(
                         if extracted and extracted[0]:
                             # Skip timeout sentinel — don't show "__EXTRACTION_TIMEOUT__" as content
                             if isinstance(extracted, tuple) and len(extracted) >= 2 and extracted[1] == "timeout":
-                                ctx.info("PDF extraction timed out — skipping local fulltext")
+                                context_info(ctx, "PDF extraction timed out — skipping local fulltext")
                             else:
                                 source = extracted[1] if len(extracted) > 1 else "file"
-                                ctx.info(f"Retrieved full text from local storage ({source})")
+                                context_info(ctx, f"Retrieved full text from local storage ({source})")
                                 source_line = f"**Selected source:** {source}"
                                 if attachment_key:
                                     source_line += f" (`{attachment_key}`)"
@@ -215,20 +215,20 @@ def get_item_fulltext(
                                 )
         except Exception as local_extract_error:
             local_extract_error_msg = str(local_extract_error)
-            ctx.info(f"Local extraction fallback not available: {str(local_extract_error)}")
+            context_info(ctx, f"Local extraction fallback not available: {str(local_extract_error)}")
 
         # Try to get attachment details
         attachment = selected_attachment or _client.get_attachment_details(zot, item)
         if not attachment:
             return f"{metadata}\n\n---\n\nNo suitable attachment found for this item."
 
-        ctx.info(f"Found attachment: {attachment.key} ({attachment.content_type})")
+        context_info(ctx, f"Found attachment: {attachment.key} ({attachment.content_type})")
 
         # Try fetching full text from Zotero's full text index first
         try:
             full_text_data = zot.fulltext_item(attachment.key)
             if full_text_data and "content" in full_text_data and full_text_data["content"]:
-                ctx.info("Successfully retrieved full text from Zotero's index")
+                context_info(ctx, "Successfully retrieved full text from Zotero's index")
                 return _helpers._prepend_size_warning(
                     f"{metadata}\n\n---\n\n## Full Text\n\n"
                     f"**Selected attachment:** `{attachment.key}` (Zotero indexed text)\n\n"
@@ -236,11 +236,11 @@ def get_item_fulltext(
                     "Consider using zotero_semantic_search to find specific content instead of reading full papers.",
                 )
         except Exception as fulltext_error:
-            ctx.info(f"Couldn't retrieve indexed full text: {str(fulltext_error)}")
+            context_info(ctx, f"Couldn't retrieve indexed full text: {str(fulltext_error)}")
 
         # If we couldn't get indexed full text, try to download and convert the file
         try:
-            ctx.info(f"Attempting to download and convert attachment {attachment.key}")
+            context_info(ctx, f"Attempting to download and convert attachment {attachment.key}")
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 download = _client.download_attachment_file(
@@ -252,7 +252,7 @@ def get_item_fulltext(
                 )
 
                 if download.path and download.path.exists():
-                    ctx.info(f"Downloaded file via {download.source} to {download.path}, converting to markdown")
+                    context_info(ctx, f"Downloaded file via {download.source} to {download.path}, converting to markdown")
                     converted_text = _client.convert_to_markdown(download.path)
                     return _helpers._prepend_size_warning(
                         f"{metadata}\n\n---\n\n## Full Text\n\n"
@@ -269,7 +269,7 @@ def get_item_fulltext(
                     "ZOTERO_WEBDAV_URL / ZOTERO_WEBDAV_USERNAME / ZOTERO_WEBDAV_PASSWORD."
                 )
         except Exception as download_error:
-            ctx.error(f"Error downloading/converting file: {str(download_error)}")
+            context_error(ctx, f"Error downloading/converting file: {str(download_error)}")
             if local_extract_error_msg:
                 return (
                     f"{metadata}\n\n---\n\nError accessing attachment: {str(download_error)}\n\n"
@@ -278,7 +278,7 @@ def get_item_fulltext(
             return f"{metadata}\n\n---\n\nError accessing attachment: {str(download_error)}"
 
     except Exception as e:
-        ctx.error(f"Error fetching item full text: {str(e)}")
+        context_error(ctx, f"Error fetching item full text: {str(e)}")
         return f"Error fetching item full text: {str(e)}"
 
 
@@ -330,7 +330,7 @@ def get_attachment_path(item_key: str, *, ctx: Context) -> str:
             lines.append("")
         return "\n".join(lines).rstrip()
     except Exception as e:
-        ctx.error(f"Error resolving attachment path: {e}")
+        context_error(ctx, f"Error resolving attachment path: {e}")
         return f"Error resolving attachment path: {e}"
 
 
@@ -376,7 +376,7 @@ def get_collections(limit: int | str | None = None, include_trashed: bool = Fals
         Markdown-formatted list of collections
     """
     try:
-        ctx.info("Fetching collections")
+        context_info(ctx, "Fetching collections")
         zot = _client.get_zotero_client()
 
         limit = _helpers._normalize_limit(limit, default=100, max_val=5000)
@@ -454,7 +454,7 @@ def get_collections(limit: int | str | None = None, include_trashed: bool = Fals
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error fetching collections: {str(e)}")
+        context_error(ctx, f"Error fetching collections: {str(e)}")
         error_msg = f"Error fetching collections: {str(e)}"
         return f"# Zotero Collections\n\n{error_msg}"
 
@@ -524,7 +524,7 @@ def get_collection_items(
         Markdown-formatted list of items in the collection
     """
     try:
-        ctx.info(f"Fetching items for collection {collection_key}")
+        context_info(ctx, f"Fetching items for collection {collection_key}")
         zot = _client.get_zotero_client()
 
         # First get the collection details. Fail fast on lookup error: the
@@ -536,7 +536,7 @@ def get_collection_items(
             collection = zot.collection(collection_key)
             collection_name = collection["data"].get("name", "Unnamed Collection")
         except Exception as e:
-            ctx.error(f"Collection lookup failed for {collection_key}: {e}")
+            context_error(ctx, f"Collection lookup failed for {collection_key}: {e}")
             return (
                 f"Collection not found or not yet accessible: `{collection_key}`. "
                 f"If you just created this collection, wait a moment and try again."
@@ -629,7 +629,7 @@ def get_collection_items(
         return result
 
     except Exception as e:
-        ctx.error(f"Error fetching collection items: {str(e)}")
+        context_error(ctx, f"Error fetching collection items: {str(e)}")
         return f"Error fetching collection items: {str(e)}"
 
 
@@ -666,7 +666,7 @@ def get_item_children(item_key: str, *, ctx: Context) -> str:
         Markdown-formatted list of child items
     """
     try:
-        ctx.info(f"Fetching children for item {item_key}")
+        context_info(ctx, f"Fetching children for item {item_key}")
         zot = _client.get_zotero_client()
 
         # First get the parent item details
@@ -756,7 +756,7 @@ def get_item_children(item_key: str, *, ctx: Context) -> str:
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error fetching item children: {str(e)}")
+        context_error(ctx, f"Error fetching item children: {str(e)}")
         return f"Error fetching item children: {str(e)}"
 
 
@@ -805,7 +805,7 @@ def get_items_children(item_keys: list[str] | str, *, ctx: Context) -> str:
                     k = item.get("key", "")
                     parent_titles[k] = item.get("data", {}).get("title", "Untitled")
             except Exception as e:
-                ctx.warning(f"Batch parent lookup failed: {e}")
+                context_warning(ctx, f"Batch parent lookup failed: {e}")
                 for k in batch:
                     parent_titles.setdefault(k, f"(key: {k})")
 
@@ -857,7 +857,7 @@ def get_items_children(item_keys: list[str] | str, *, ctx: Context) -> str:
     except ValueError as e:
         return f"Input error: {e}"
     except Exception as e:
-        ctx.error(f"Error fetching items children: {str(e)}")
+        context_error(ctx, f"Error fetching items children: {str(e)}")
         return f"Error fetching items children: {str(e)}"
 
 
@@ -892,7 +892,7 @@ def get_tags(limit: int | str | None = None, *, ctx: Context) -> str:
         Markdown-formatted list of tags
     """
     try:
-        ctx.info("Fetching tags")
+        context_info(ctx, "Fetching tags")
         zot = _client.get_zotero_client()
 
         limit = _helpers._normalize_limit(limit, default=500, max_val=5000)
@@ -932,7 +932,7 @@ def get_tags(limit: int | str | None = None, *, ctx: Context) -> str:
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error fetching tags: {str(e)}")
+        context_error(ctx, f"Error fetching tags: {str(e)}")
         return f"Error fetching tags: {str(e)}"
 
 
@@ -970,7 +970,7 @@ def list_libraries(*, ctx: Context) -> str:
         Markdown-formatted list of libraries with item counts.
     """
     try:
-        ctx.info("Listing accessible libraries")
+        context_info(ctx, "Listing accessible libraries")
         local = os.getenv("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]
         override = _client.get_active_library()
 
@@ -1044,7 +1044,7 @@ def list_libraries(*, ctx: Context) -> str:
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error listing libraries: {str(e)}")
+        context_error(ctx, f"Error listing libraries: {str(e)}")
         return f"Error listing libraries: {str(e)}"
 
 
@@ -1095,7 +1095,7 @@ def switch_library(
     try:
         if library_type == "default":
             _client.clear_active_library()
-            ctx.info("Reset to default library configuration")
+            context_info(ctx, "Reset to default library configuration")
             return (
                 "Switched back to default library configuration "
                 f"(ZOTERO_LIBRARY_ID={os.getenv('ZOTERO_LIBRARY_ID', '0')}, "
@@ -1107,7 +1107,7 @@ def switch_library(
             return error
 
         _client.set_active_library(library_id, library_type)
-        ctx.info(f"Switched to library {library_id} (type={library_type})")
+        context_info(ctx, f"Switched to library {library_id} (type={library_type})")
 
         # Verify the switch works by making a test call
         try:
@@ -1126,7 +1126,7 @@ def switch_library(
             )
 
     except Exception as e:
-        ctx.error(f"Error switching library: {str(e)}")
+        context_error(ctx, f"Error switching library: {str(e)}")
         return f"Error switching library: {str(e)}"
 
 
@@ -1198,7 +1198,7 @@ def list_feeds(*, ctx: Context) -> str:
         if not local:
             return "RSS feeds are only accessible in local mode (ZOTERO_LOCAL=true)."
 
-        ctx.info("Listing RSS feeds")
+        context_info(ctx, "Listing RSS feeds")
         from zotero_mcp.local_db import LocalZoteroReader
 
         reader = LocalZoteroReader()
@@ -1224,7 +1224,7 @@ def list_feeds(*, ctx: Context) -> str:
             reader.close()
 
     except Exception as e:
-        ctx.error(f"Error listing feeds: {str(e)}")
+        context_error(ctx, f"Error listing feeds: {str(e)}")
         return f"Error listing feeds: {str(e)}"
 
 
@@ -1269,7 +1269,7 @@ def get_feed_items(
         if not local:
             return "RSS feed items are only accessible in local mode (ZOTERO_LOCAL=true)."
 
-        ctx.info(f"Fetching items from feed (libraryID={library_id})")
+        context_info(ctx, f"Fetching items from feed (libraryID={library_id})")
         from zotero_mcp.local_db import LocalZoteroReader
 
         reader = LocalZoteroReader()
@@ -1313,7 +1313,7 @@ def get_feed_items(
             reader.close()
 
     except Exception as e:
-        ctx.error(f"Error fetching feed items: {str(e)}")
+        context_error(ctx, f"Error fetching feed items: {str(e)}")
         return f"Error fetching feed items: {str(e)}"
 
 
@@ -1352,7 +1352,7 @@ def get_recent(limit: int | str = 10, collection_key: str | None = None, *, ctx:
         Markdown-formatted list of recent items
     """
     try:
-        ctx.info(f"Fetching {limit} recent items")
+        context_info(ctx, f"Fetching {limit} recent items")
         zot = _client.get_zotero_client()
 
         limit = _helpers._normalize_limit(limit, default=10)
@@ -1395,7 +1395,7 @@ def get_recent(limit: int | str = 10, collection_key: str | None = None, *, ctx:
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error fetching recent items: {str(e)}")
+        context_error(ctx, f"Error fetching recent items: {str(e)}")
         return f"Error fetching recent items: {str(e)}"
 
 
@@ -1415,7 +1415,7 @@ def get_item_related(item_key: str, *, ctx: Context) -> str:
         Markdown-formatted list of related items
     """
     try:
-        ctx.info(f"Fetching related items for {item_key}")
+        context_info(ctx, f"Fetching related items for {item_key}")
         zot = _client.get_zotero_client()
 
         # Fetch the item
@@ -1500,5 +1500,5 @@ def get_item_related(item_key: str, *, ctx: Context) -> str:
         return "\n".join(output)
 
     except Exception as e:
-        ctx.error(f"Error fetching related items: {str(e)}")
+        context_error(ctx, f"Error fetching related items: {str(e)}")
         return f"Error fetching related items: {str(e)}"

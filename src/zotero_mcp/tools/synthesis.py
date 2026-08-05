@@ -11,7 +11,7 @@ from typing import Literal
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
-from zotero_mcp._context import Context
+from zotero_mcp._context import Context, context_error, context_info, context_warning
 from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.tools import _helpers
 
@@ -101,7 +101,7 @@ def synthesize_annotations(
         Markdown digest grouped by paper.
     """
     try:
-        ctx.info("Gathering annotations and notes for synthesis")
+        context_info(ctx, "Gathering annotations and notes for synthesis")
         zot = _client.get_zotero_client()
 
         limit = _helpers._normalize_limit(limit, default=200, max_val=5000)
@@ -118,7 +118,7 @@ def synthesize_annotations(
                 )
                 allowed_keys = {it.get("key") for it in coll_items if it.get("key")}
             except Exception as e:
-                ctx.warning(f"Could not load collection items: {e}")
+                context_warning(ctx, f"Could not load collection items: {e}")
                 allowed_keys = set()
 
         anno_params = {"itemType": "annotation"}
@@ -130,12 +130,12 @@ def synthesize_annotations(
         try:
             annotations = _helpers._paginate(zot.items, max_items=limit, **anno_params)
         except Exception as e:
-            ctx.warning(f"Annotation fetch failed: {e}")
+            context_warning(ctx, f"Annotation fetch failed: {e}")
             annotations = []
         try:
             notes = _helpers._paginate(zot.items, max_items=limit, **note_params)
         except Exception as e:
-            ctx.warning(f"Note fetch failed: {e}")
+            context_warning(ctx, f"Note fetch failed: {e}")
             notes = []
 
         combined = [("annotation", item) for item in annotations]
@@ -259,7 +259,7 @@ def synthesize_annotations(
         )
 
     except Exception as e:
-        ctx.error(f"Error synthesizing annotations: {str(e)}")
+        context_error(ctx, f"Error synthesizing annotations: {str(e)}")
         return f"Error synthesizing annotations: {str(e)}"
 
 
@@ -329,7 +329,7 @@ def export_bibliography(
         if item_keys is not None:
             keys = _helpers._normalize_str_list_input(item_keys, "item_keys")
 
-        ctx.info(f"Exporting bibliography (format={export_format}, style={style})")
+        context_info(ctx, f"Exporting bibliography (format={export_format}, style={style})")
         zot = _client.get_zotero_client()
 
         content = "bibtex" if export_format == "bibtex" else export_format
@@ -351,7 +351,7 @@ def export_bibliography(
                     fetch_kwargs["style"] = style
                 rendered = zot.items(**fetch_kwargs)
         except Exception as api_error:
-            ctx.error(f"Bibliography rendering failed: {api_error}")
+            context_error(ctx, f"Bibliography rendering failed: {api_error}")
             return (
                 f"Error rendering bibliography: {api_error}\n\n"
                 "Bibliography/citation rendering relies on Zotero's web API "
@@ -387,5 +387,5 @@ def export_bibliography(
         return "\n".join(lines)
 
     except Exception as e:
-        ctx.error(f"Error exporting bibliography: {str(e)}")
+        context_error(ctx, f"Error exporting bibliography: {str(e)}")
         return f"Error exporting bibliography: {str(e)}"
