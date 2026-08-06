@@ -7,6 +7,7 @@ from fastmcp.tools.tool import ToolResult
 
 from zotero_mcp.server import mcp
 from zotero_mcp.tool_contract import (
+    CONTENT_BEARING_TOOLS,
     RESULT_SCHEMA,
     ToolContractMiddleware,
     _legacy_result_data,
@@ -132,6 +133,13 @@ def test_document_content_cannot_change_tool_outcome():
         assert outcome["ok"] is True
         assert outcome["status"] == "success"
         assert outcome["errors"] == []
+
+    for tool_name in CONTENT_BEARING_TOOLS:
+        outcome = classify_result(
+            "# Retrieved content\n\nError: this sentence is quoted source material.",
+            tool_name=tool_name,
+        )
+        assert outcome["status"] == "success", tool_name
 
 
 def test_explicit_control_lines_after_a_heading_are_still_recognized():
