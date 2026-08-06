@@ -13,6 +13,7 @@ from zotero_mcp.tool_contract import (
     _legacy_result_data,
     classify_result,
 )
+from zotero_mcp.tool_profiles import FEED_TOOLS
 
 
 def _normalized_tools():
@@ -111,6 +112,7 @@ def test_result_classification_recognizes_empty_resolver_results():
         "DOI not found on CrossRef: 10.1000/missing",
         "ISBN not found on Open Library or Google Books: 1234567890",
         "Relation not found: 'ABCD1234' is not related to 'WXYZ5678'.",
+        "OpenAlex has no record for DOI '10.1000/missing', or the lookup failed.",
     ]
 
     for message in empty:
@@ -126,6 +128,7 @@ def test_document_content_cannot_change_tool_outcome():
         "# Failure Analysis of Detector Readout\n\nUseful scientific content.",
         "# Full Text\n\nCalibration is required for accurate spectroscopy.",
         "# Search Result\n\nPartial failure: a term used in the quoted paper.",
+        "No significant difference was observed between cohorts.",
     ]
 
     for document in successful_documents:
@@ -140,6 +143,28 @@ def test_document_content_cannot_change_tool_outcome():
             tool_name=tool_name,
         )
         assert outcome["status"] == "success", tool_name
+
+    assert FEED_TOOLS <= CONTENT_BEARING_TOOLS
+
+
+def test_write_titles_cannot_change_tool_outcome():
+    successful_writes = [
+        "Successfully added: **Failure Analysis of Detector Readout**",
+        "Successfully added: **Partial failure: a statistical perspective**",
+        "Successfully updated: **Missing values in longitudinal studies**",
+    ]
+
+    for result in successful_writes:
+        outcome = classify_result(result, tool_name="zotero_add_by_doi")
+        assert outcome["status"] == "success"
+        assert outcome["errors"] == []
+
+    partial = classify_result(
+        "Successfully added: **Ordinary title**\n"
+        "PDF: unavailable; Partial failure: required PDF attachment was not satisfied",
+        tool_name="zotero_add_by_doi",
+    )
+    assert partial["status"] == "partial"
 
 
 def test_explicit_control_lines_after_a_heading_are_still_recognized():
@@ -253,6 +278,15 @@ def test_call_middleware_uses_json_text_as_native_data():
 
     data = asyncio.run(run()).structured_content["data"]
     assert data == {"items": [{"key": "ABCD1234"}]}
+
+
+def test_content_bearing_json_remains_document_text_not_structured_data():
+    data = _legacy_result_data(
+        '{"error":"quoted source material","body":"paper text"}',
+        content_bearing=True,
+    )
+
+    assert data == {}
 
 
 def test_legacy_data_captures_plain_write_identifiers_as_arrays():

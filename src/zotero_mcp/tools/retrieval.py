@@ -392,8 +392,7 @@ def get_collections(limit: int | str | None = None, include_trashed: bool = Fals
         output = ["# Zotero Collections", ""]
 
         if not collections:
-            output.append("No collections found in your Zotero library.")
-            return "\n".join(output)
+            return "No collections found in your Zotero library."
 
         # Create a mapping of collection IDs to their data
         collection_map = {c["key"]: c for c in collections}
@@ -451,8 +450,7 @@ def get_collections(limit: int | str | None = None, include_trashed: bool = Fals
 
     except Exception as e:
         context_error(ctx, f"Error fetching collections: {str(e)}")
-        error_msg = f"Error fetching collections: {str(e)}"
-        return f"# Zotero Collections\n\n{error_msg}"
+        return f"Error fetching collections: {str(e)}"
 
 
 # Item types that are normally children of a parent metadata item.

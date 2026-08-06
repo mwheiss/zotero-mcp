@@ -1347,7 +1347,12 @@ def update_search_database(
                 f"{stats.get('reused_embeddings', 0)}"
             )
             output.append(f"**Skipped:** {stats.get('skipped_items', 0)}")
-            output.append(f"**Errors:** {stats.get('errors', 0)}")
+            error_count = stats.get("errors", 0)
+            output.append(f"**Errors:** {error_count}")
+            if error_count:
+                output.append(
+                    f"**Partial failure:** {error_count} item(s) could not be updated."
+                )
             output.append(f"**Duration:** {stats.get('duration', 'Unknown')}")
 
             if stats.get('start_time'):

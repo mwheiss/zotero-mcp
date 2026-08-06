@@ -10,9 +10,10 @@ from typing import Any
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.tool import ToolResult
 
-from zotero_mcp.tool_profiles import CONNECTOR_TOOLS
+from zotero_mcp.tool_profiles import CONNECTOR_TOOLS, FEED_TOOLS
 
 CONTENT_BEARING_TOOLS = {
+    *FEED_TOOLS,
     "scite_check_retractions",
     "scite_enrich_item",
     "scite_enrich_search",
@@ -135,7 +136,12 @@ def _is_error_marker(line: str) -> bool:
             marker,
             re.I,
         )
-        or re.search(r":\s*fail(?:ed|ure)?\b", marker, re.I)
+        or re.match(
+            r"^(?:attachments?|collections?|items?|relations?|tags?):\s*"
+            r"fail(?:ed|ure)?\b",
+            marker,
+            re.I,
+        )
     )
 
 
@@ -168,8 +174,12 @@ def _is_empty_marker(line: str) -> bool:
     marker = _marker_text(line)
     return bool(
         re.match(
-            r"^(?:no\b|none of\b|doi\b.*\bnot found\b|isbn\b.*\bnot found\b|"
-            r"relation\b.*\bnot found\b)",
+            r"^(?:no\s+(?:matching\s+)?(?:annotations?|attachments?|"
+            r"bibliography entries|changes|child items|collections?|duplicates?|"
+            r"feed|full[- ]?text|items?|notes?|pdf attachment|related items|"
+            r"results?|rss feeds?|scite data|suitable attachment|tags?)\b|"
+            r"none of\b|doi\b.*\bnot found\b|isbn\b.*\bnot found\b|"
+            r"relation\b.*\bnot found\b|openalex has no record\b)",
             marker,
             re.I,
         )
@@ -183,16 +193,25 @@ def _is_markdown_heading(line: str) -> bool:
 def _is_explicit_control_marker(line: str) -> bool:
     """Return whether a non-leading line deliberately reports tool state."""
     marker = _marker_text(line)
-    return bool(
+    return _is_partial_marker(line) or bool(
         re.match(
             r"^(?:\[(?:error|fail(?:ed|ure)?|warn(?:ing)?)\]|"
             r"(?:(?:input|semantic search)\s+)?error\s*:|"
-            r"partial failure\s*:|warnings?\s*:|warn\s*:|"
+            r"warnings?\s*:|warn\s*:|"
             r"file download failed\.?$|no suitable attachment found\b|"
             r".*:\s*fail(?:ed|ure)?\b)",
             marker,
             re.I,
         )
+    )
+
+
+def _is_partial_marker(line: str) -> bool:
+    """Recognize generated partial-result markers without scanning user text."""
+    marker = _marker_text(line)
+    return bool(
+        re.match(r"^partial failure\s*:", marker, re.I)
+        or re.match(r"^pdf\s*:.*;\s*partial failure\s*:", marker, re.I)
     )
 
 
@@ -249,7 +268,7 @@ def classify_result(
         if not _is_blocked_marker(line)
         and (
             _is_error_marker(line)
-            or re.search(r"\bpartial failure\b", line, re.I)
+            or _is_partial_marker(line)
         )
     ]
     warnings = [
@@ -259,7 +278,7 @@ def classify_result(
     ]
     empty = [line.strip() for line in control_lines[:1] if _is_empty_marker(line)]
     has_partial_failure = any(
-        re.search(r"\bpartial failure\b", line, re.I)
+        _is_partial_marker(line)
         for line in control_lines
     )
     leading_text = _marker_text(control_lines[0]).lower() if control_lines else ""
@@ -324,7 +343,7 @@ def _append_value(target: dict[str, list[str]], key: str, value: str) -> None:
 def _legacy_result_data(text: str, *, content_bearing: bool = False) -> Any:
     """Derive a conservative machine view without changing legacy tool text."""
     stripped = text.strip()
-    if stripped.startswith(("{", "[")):
+    if not content_bearing and stripped.startswith(("{", "[")):
         try:
             return json.loads(stripped)
         except json.JSONDecodeError:
