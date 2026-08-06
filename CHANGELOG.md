@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-08-06
+
+### Changed
+- Structured legacy result fields and identifier categories are consistently arrays, including common item, note, attachment, collection, citation, and DOI keys returned by write tools.
+
+### Fixed
+- Scientific document text can no longer be misclassified as an empty, blocked, or failed tool result merely because it contains words such as "missing", "failure", or "calibration".
+- Direct localhost calls to Zotero's connector and Better BibTeX endpoints now participate in the same cross-process API lock as regular Zotero client operations.
+- Connector search and fetch results now expose the same library-aware Zotero citation URL.
+
 ## [0.7.2] - 2026-08-06
 
 ### Added
