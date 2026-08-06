@@ -34,15 +34,24 @@ def _normalized_tools():
     return asyncio.run(run())
 
 
-def test_zotero_tools_advertise_described_parameters_and_result_schema():
+def test_all_tools_advertise_specific_parameters_and_result_schema(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "all")
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "1")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", "true")
     tools = _normalized_tools()
-    zotero_tools = [tool for tool in tools if tool.name.startswith("zotero_")]
+    contract_tools = [tool for tool in tools if tool.name not in CONNECTOR_TOOLS]
 
-    assert zotero_tools
-    for tool in zotero_tools:
+    assert contract_tools
+    for tool in contract_tools:
         assert tool.output_schema == RESULT_SCHEMA
-        for schema in tool.parameters.get("properties", {}).values():
-            assert schema.get("description")
+        for name, schema in tool.parameters.get("properties", {}).items():
+            description = schema.get("description", "")
+            assert description, f"{tool.name}.{name} has no description"
+            assert not description.startswith("Value for "), (
+                f"{tool.name}.{name} has a placeholder description"
+            )
 
 
 def test_connector_tools_keep_the_connector_output_contract(monkeypatch):
