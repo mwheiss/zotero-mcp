@@ -523,6 +523,86 @@ def test_batch_manifest_keeps_reused_chunks_in_expected_layout(monkeypatch):
     assert client.metadata_updates == []
 
 
+def test_batch_submission_counts_parent_items_not_passage_records(monkeypatch):
+    class Client(FakeChromaClient):
+        embedding_model = "openai"
+        embedding_config = {"model_name": "text-embedding-3-small"}
+
+        def get_item_embedding_hashes(self, item_key):
+            return {f"{item_key}#0": "old"} if item_key == "EXISTING" else {}
+
+        def get_item_record_hashes(self, _item_key):
+            return {}
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=Client())
+    prepared = semantic_search._PreparedIndexBatch(
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"parent_item_key": "EXISTING"},
+            {"parent_item_key": "EXISTING"},
+            {"parent_item_key": "NEWITEM"},
+        ],
+        ids=["EXISTING#0", "EXISTING#1", "NEWITEM#0"],
+        expected_ids=["EXISTING#0", "EXISTING#1", "NEWITEM#0"],
+        metadata_only_ids=[],
+        metadata_only_metadatas=[],
+        item_keys=["EXISTING", "NEWITEM"],
+        stats={
+            "processed": 2,
+            "added": 0,
+            "updated": 0,
+            "skipped": 0,
+            "errors": 0,
+            "reused_embeddings": 0,
+        },
+    )
+    monkeypatch.setattr(
+        search,
+        "_prepare_index_records",
+        lambda items, force_rebuild: (
+            [
+                {"id": doc_id, "document": document, "metadata": metadata}
+                for doc_id, document, metadata in zip(
+                    prepared.ids,
+                    prepared.documents,
+                    prepared.metadatas,
+                    strict=True,
+                )
+            ],
+            prepared.stats,
+            prepared,
+        ),
+    )
+    monkeypatch.setattr(
+        semantic_search.openai_batch,
+        "submit_embedding_batches",
+        lambda **_kwargs: {
+            "run_id": "run-1",
+            "manifest_path": "/tmp/manifest.json",
+            "batches": [{"batch_id": "batch-1"}],
+        },
+    )
+    stats = {
+        "processed_items": 0,
+        "skipped_items": 0,
+        "errors": 0,
+        "reused_embeddings": 0,
+    }
+
+    search._submit_openai_batch_index(
+        [{}, {}],
+        force_full_rebuild=False,
+        target_sync_version=10,
+        stats=stats,
+    )
+
+    assert stats["submitted_items"] == 2
+    assert stats["submitted_records"] == 3
+    assert stats["estimated_updated_items"] == 1
+    assert stats["estimated_added_items"] == 1
+
+
 def test_chroma_client_upsert_embeddings_passes_precomputed_vectors():
     class FakeCollection:
         def __init__(self):

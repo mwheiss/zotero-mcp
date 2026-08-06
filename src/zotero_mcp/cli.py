@@ -214,7 +214,8 @@ def _print_update_stats(stats: dict) -> None:
     print(f"- Total items: {stats.get('total_items', 0)}")
     print(f"- Processed: {stats.get('processed_items', 0)}")
     if stats.get("batch_submitted"):
-        print(f"- Submitted: {stats.get('submitted_items', 0)}")
+        print(f"- Items submitted: {stats.get('submitted_items', 0)}")
+        print(f"- Embedding records submitted: {stats.get('submitted_records', 0)}")
         print(f"- Estimated new items: {stats.get('estimated_added_items', 0)}")
         print(f"- Estimated existing items: {stats.get('estimated_updated_items', 0)}")
     else:

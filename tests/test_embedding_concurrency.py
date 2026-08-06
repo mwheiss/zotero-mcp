@@ -123,6 +123,18 @@ class _InterruptingChroma(_ConcurrentChroma):
             signal.raise_signal(signal.SIGINT)
 
 
+class _FailOnceChroma(_ConcurrentChroma):
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    def upsert_documents(self, documents, metadatas, ids):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError("transient write failure")
+        super().upsert_documents(documents, metadatas, ids)
+
+
 def _search(monkeypatch, chroma, items):
     monkeypatch.setenv("ZOTERO_MCP_FORCE_UPDATE", "1")
     monkeypatch.setattr(
@@ -182,6 +194,19 @@ def test_default_update_path_writes_each_entry_immediately(
     assert "| ETA " in progress
     assert "2/2 finished" in progress
     assert "| Last: Item 1" in progress
+
+
+def test_sequential_retry_restores_added_item_totals(monkeypatch):
+    chroma = _FailOnceChroma()
+    search = _search(monkeypatch, chroma, _items(1))
+
+    stats = search.update_database(force_full_rebuild=True)
+
+    assert stats["errors"] == 0
+    assert stats["recovered_items"] == 1
+    assert stats["added_items"] == 1
+    assert stats["updated_items"] == 0
+    assert chroma.upserted_batches == [["ITEM0000"]]
 
 
 def test_first_sigint_finishes_current_entry_and_stops_before_next(

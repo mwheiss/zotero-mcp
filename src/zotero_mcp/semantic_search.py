@@ -2303,8 +2303,11 @@ class ZoteroSemanticSearch:
             )
             return stats
 
-        ids = [record["id"] for record in records]
-        existing_ids = self.chroma_client.get_existing_ids(ids) if ids and not force_full_rebuild else set()
+        submitted_parent_keys = {
+            (record.get("metadata") or {}).get("parent_item_key")
+            or record["id"].split("#", 1)[0]
+            for record in records
+        }
         if target_sync_version is None:
             raise RuntimeError(
                 "OpenAI Batch submission requires a verified Zotero library "
@@ -2336,9 +2339,17 @@ class ZoteroSemanticSearch:
         stats["batch_run_id"] = manifest["run_id"]
         stats["batch_manifest"] = manifest["manifest_path"]
         stats["batch_ids"] = [batch["batch_id"] for batch in manifest.get("batches", [])]
-        stats["submitted_items"] = len(records)
-        stats["estimated_updated_items"] = len(existing_ids)
-        stats["estimated_added_items"] = len(ids) - len(existing_ids)
+        existing_parent_keys = {
+            parent
+            for parent in submitted_parent_keys
+            if baseline_embedding_hashes_by_item.get(parent)
+        }
+        stats["submitted_items"] = len(submitted_parent_keys)
+        stats["submitted_records"] = len(records)
+        stats["estimated_updated_items"] = len(existing_parent_keys)
+        stats["estimated_added_items"] = len(
+            submitted_parent_keys - existing_parent_keys
+        )
         return stats
 
     def _run_orphan_segment_cleanup(self, stats: dict[str, Any]) -> None:
@@ -3041,11 +3052,15 @@ class ZoteroSemanticSearch:
                     for prepared in failed_concurrent_batches:
                         try:
                             embeddings = self.chroma_client.embed_documents(prepared.documents)
+                            added_before = prepared.stats["added"]
+                            updated_before = prepared.stats["updated"]
                             self._commit_prepared_batch(
                                 prepared,
                                 force_rebuild=force_full_rebuild,
                                 embeddings=embeddings,
                             )
+                            stats["added_items"] += prepared.stats["added"] - added_before
+                            stats["updated_items"] += prepared.stats["updated"] - updated_before
                             stats["errors"] -= prepared.stats["processed"]
                             recovered = prepared.stats["processed"]
                             stats["recovered_items"] += recovered
@@ -3082,10 +3097,14 @@ class ZoteroSemanticSearch:
                 retry_fail = 0
                 for prepared in _failed_docs:
                     try:
+                        added_before = prepared.stats["added"]
+                        updated_before = prepared.stats["updated"]
                         self._commit_prepared_batch(
                             prepared,
                             force_rebuild=force_full_rebuild,
                         )
+                        stats["added_items"] += prepared.stats["added"] - added_before
+                        stats["updated_items"] += prepared.stats["updated"] - updated_before
                         recovered = prepared.stats["processed"]
                         retry_ok += recovered
                         stats["errors"] -= recovered
