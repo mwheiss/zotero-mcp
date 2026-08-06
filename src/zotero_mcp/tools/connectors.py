@@ -38,6 +38,12 @@ def _item_urls(item_key: str) -> tuple[str, str]:
         )
     return select_url, web_url
 
+
+def _citation_url(item_key: str) -> str:
+    """Return the same preferred citation URL for connector search and fetch."""
+    select_url, web_url = _item_urls(item_key)
+    return web_url or select_url
+
 @mcp.tool(
     name="search",
     description=(
@@ -49,7 +55,8 @@ def _item_urls(item_key: str) -> tuple[str, str]:
         "Performs semantic search over the active Zotero library and "
         "returns a JSON string {\"results\":[{\"id\",\"title\",\"url\"}, "
         "...]} matching the ChatGPT connector citation UI. URLs are "
-        "active-library-aware zotero://select deep-links. "
+        "web-library links when available, otherwise active-library-aware "
+        "zotero://select deep-links. "
         "query: topic string; natural language works (embedding match). "
         "No limit parameter — fixed at 10 per the connector UI's "
         "expected result-set size. "
@@ -88,7 +95,7 @@ def chatgpt_connector_search(
                 title = data.get("title", "")
             if not title:
                 title = f"Zotero Item {item_key}" if item_key else "Zotero Item"
-            url = _item_urls(item_key)[0] if item_key else ""
+            url = _citation_url(item_key) if item_key else ""
             result_list.append({
                 "id": item_key or uuid.uuid4().hex[:8],
                 "title": title,
