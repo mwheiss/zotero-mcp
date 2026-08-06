@@ -117,6 +117,41 @@ def test_result_classification_recognizes_empty_resolver_results():
         assert outcome["status"] == "empty"
 
 
+def test_document_content_cannot_change_tool_outcome():
+    successful_documents = [
+        "# Full Text\n\nNo significant difference was observed between cohorts.",
+        "# Full Text\n\nMissing values were imputed using the median.",
+        "# Failure Analysis of Detector Readout\n\nUseful scientific content.",
+        "# Full Text\n\nCalibration is required for accurate spectroscopy.",
+        "# Search Result\n\nPartial failure: a term used in the quoted paper.",
+    ]
+
+    for document in successful_documents:
+        outcome = classify_result(document, tool_name="zotero_get_item_fulltext")
+        assert outcome["ok"] is True
+        assert outcome["status"] == "success"
+        assert outcome["errors"] == []
+
+
+def test_explicit_control_lines_after_a_heading_are_still_recognized():
+    error = classify_result("# Database\n\n**Error:** embedding failed")
+    assert error["status"] == "error"
+
+    partial = classify_result(
+        "Successfully created metadata.\nPartial failure: PDF unavailable."
+    )
+    assert partial["status"] == "partial"
+
+    empty = classify_result("# Item metadata\n\nNo suitable attachment found for this item.")
+    assert empty["status"] == "empty"
+
+    download = classify_result(
+        "# Paper title\n\nFile download failed.\n\nAttempted sources: none",
+        tool_name="zotero_get_item_fulltext",
+    )
+    assert download["status"] == "error"
+
+
 def test_call_middleware_preserves_text_and_adds_structured_result():
     async def run():
         middleware = ToolContractMiddleware()

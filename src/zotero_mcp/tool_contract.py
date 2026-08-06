@@ -12,6 +12,27 @@ from fastmcp.tools.tool import ToolResult
 
 from zotero_mcp.tool_profiles import CONNECTOR_TOOLS
 
+CONTENT_BEARING_TOOLS = {
+    "zotero_advanced_search",
+    "zotero_export_bibliography",
+    "zotero_get_annotations",
+    "zotero_get_collection_items",
+    "zotero_get_item_children",
+    "zotero_get_item_fulltext",
+    "zotero_get_item_metadata",
+    "zotero_get_item_related",
+    "zotero_get_items_children",
+    "zotero_get_notes",
+    "zotero_get_recent",
+    "zotero_get_semantic_context",
+    "zotero_read_pdf_pages",
+    "zotero_search_by_tag",
+    "zotero_search_items",
+    "zotero_search_notes",
+    "zotero_semantic_search",
+    "zotero_synthesize_annotations",
+}
+
 RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -94,6 +115,7 @@ def _is_error_marker(line: str) -> bool:
             r"missing\b|"
             r"(?:collection|feed|group)\b.*\bnot found\b|"
             r"arxiv api error\b|"
+            r"file download failed\b|"
             r".*\bcurrently unreachable\b|"
             r"semantic chunk\b.*\bchanged after\b)",
             marker,
@@ -140,17 +162,76 @@ def _is_empty_marker(line: str) -> bool:
     )
 
 
+def _is_markdown_heading(line: str) -> bool:
+    return bool(re.match(r"^\s{0,3}#{1,6}\s+", line))
+
+
+def _is_explicit_control_marker(line: str) -> bool:
+    """Return whether a non-leading line deliberately reports tool state."""
+    marker = _marker_text(line)
+    return bool(
+        re.match(
+            r"^(?:\[(?:error|fail(?:ed|ure)?|warn(?:ing)?)\]|"
+            r"(?:(?:input|semantic search)\s+)?error\s*:|"
+            r"partial failure\s*:|warnings?\s*:|warn\s*:|"
+            r"file download failed\.?$|no suitable attachment found\b|"
+            r".*:\s*fail(?:ed|ure)?\b)",
+            marker,
+            re.I,
+        )
+    )
+
+
+def _control_lines(text: str, *, content_bearing: bool = False) -> list[str]:
+    """Return only lines that may describe the operation rather than content."""
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    control: list[str] = []
+    first = lines[0]
+    # A heading is normally a paper/result title. The destructive safeguard is
+    # the one control outcome intentionally rendered as a heading.
+    if not _is_markdown_heading(first) or "not started" in _marker_text(first).lower():
+        control.append(first)
+    if content_bearing:
+        # Later lines may be arbitrary papers, notes, abstracts, or quoted
+        # passages. Only attachment fallback messages have a guaranteed
+        # control meaning inside those otherwise content-bearing responses.
+        safe_followups = re.compile(
+            r"^(?:file download failed\.?$|no suitable attachment found\b|"
+            r"error accessing attachment\s*:)",
+            re.I,
+        )
+        control.extend(
+            line
+            for line in lines[1:]
+            if safe_followups.match(_marker_text(line))
+        )
+    else:
+        control.extend(
+            line
+            for line in lines[1:]
+            if _is_explicit_control_marker(line)
+        )
+    return control
+
+
 def classify_result(
     text: str,
     is_error: bool = False,
     data: Any = None,
+    tool_name: str | None = None,
 ) -> dict[str, Any]:
     stripped = text.strip()
-    lowered = stripped.lower()
-    blocked = [line.strip() for line in stripped.splitlines() if _is_blocked_marker(line)]
+    control_lines = _control_lines(
+        stripped,
+        content_bearing=tool_name in CONTENT_BEARING_TOOLS,
+    )
+    blocked = [line.strip() for line in control_lines if _is_blocked_marker(line)]
     errors = [
         line.strip()
-        for line in stripped.splitlines()
+        for line in control_lines
         if not _is_blocked_marker(line)
         and (
             _is_error_marker(line)
@@ -159,15 +240,19 @@ def classify_result(
     ]
     warnings = [
         line.strip()
-        for line in stripped.splitlines()
+        for line in control_lines
         if _is_warning_marker(line)
     ]
-    empty = [line.strip() for line in stripped.splitlines() if _is_empty_marker(line)]
-    has_partial_failure = "partial failure" in lowered
+    empty = [line.strip() for line in control_lines[:1] if _is_empty_marker(line)]
+    has_partial_failure = any(
+        re.search(r"\bpartial failure\b", line, re.I)
+        for line in control_lines
+    )
+    leading_text = _marker_text(control_lines[0]).lower() if control_lines else ""
     has_positive_result = bool(
         re.search(
             r"\b(?:successfully|created|updated|deleted|reused|restored|attached)\b",
-            lowered,
+            leading_text,
         )
     )
     if has_partial_failure or (errors and has_positive_result):
@@ -333,6 +418,7 @@ class ToolContractMiddleware(Middleware):
             text,
             result.is_error,
             data=_result_data(result, text),
+            tool_name=context.message.name,
         )
         return ToolResult(
             content=result.content,
