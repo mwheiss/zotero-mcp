@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-08-06
+
+### Fixed
+- Retrieval results now protect RSS content and JSON-formatted documents from legacy status/field parsing, while echoed scientific titles cannot accidentally change write outcomes.
+- Empty and failed collection listings, unresolved OpenAlex records, and semantic updates with per-item errors now expose truthful empty, error, and partial statuses.
+- Connector search omits malformed semantic rows instead of inventing unfetchable IDs, and connector fetch rejects malformed Zotero keys before API access or URL construction.
+- Invalid non-finite or overflowing `ZOTERO_MCP_LOCK_TIMEOUT` values fall back to the bounded default instead of raising from the runtime lock primitive.
+
 ## [0.7.3] - 2026-08-06
 
 ### Changed
