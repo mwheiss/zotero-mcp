@@ -711,8 +711,8 @@ class ZoteroSemanticSearch:
         # _get_items_from_local_db); used to verify watermark promotion.
         self._last_scan_snapshot_keys: set[str] | None = None
         # Top-level keys that belong in the configured semantic corpus. Unlike
-        # the snapshot set, this excludes deleted, child, filtered, and
-        # deduplicated items and can be reconciled against ChromaDB.
+        # the snapshot set, this excludes deleted, child, and collection-
+        # filtered items and can be reconciled against ChromaDB.
         self._last_scan_indexable_keys: set[str] | None = None
         # Active attachment keys grouped by parent from the canonical API item
         # listing. Local immutable SQLite reads can retain attachments that
@@ -1262,59 +1262,6 @@ class ZoteroSemanticSearch:
                 candidate_count = len(local_items)
                 sys.stderr.write(f"Found {candidate_count} candidate items.\n")
 
-                # Optional deduplication: if preprint and journalArticle share a DOI/title, keep journalArticle
-                # Build index by (normalized DOI or normalized title)
-                def norm(s: str | None) -> str | None:
-                    if not s:
-                        return None
-                    return "".join(s.lower().split())
-
-                key_to_best = {}
-                for it in local_items:
-                    doi_key = ("doi", norm(getattr(it, "doi", None))) if getattr(it, "doi", None) else None
-                    title_key = ("title", norm(getattr(it, "title", None))) if getattr(it, "title", None) else None
-
-                    def consider(k):
-                        if not k:
-                            return
-                        cur = key_to_best.get(k)
-                        # Prefer journalArticle over preprint; otherwise keep first
-                        if cur is None:
-                            key_to_best[k] = it
-                        else:
-                            prefer_types = {"journalArticle": 2, "preprint": 1}
-                            cur_score = prefer_types.get(getattr(cur, "item_type", ""), 0)
-                            new_score = prefer_types.get(getattr(it, "item_type", ""), 0)
-                            if new_score > cur_score:
-                                key_to_best[k] = it
-
-                    consider(doi_key)
-                    consider(title_key)
-
-                # If a preprint loses against a journal article for same DOI/title, drop it
-                filtered_items = []
-                for it in local_items:
-                    # If there is a journalArticle alternative for same DOI or title, and this is preprint, drop
-                    if getattr(it, "item_type", None) == "preprint":
-                        k_doi = ("doi", norm(getattr(it, "doi", None))) if getattr(it, "doi", None) else None
-                        k_title = ("title", norm(getattr(it, "title", None))) if getattr(it, "title", None) else None
-                        drop = False
-                        for k in (k_doi, k_title):
-                            if not k:
-                                continue
-                            best = key_to_best.get(k)
-                            if (
-                                best is not None
-                                and best is not it
-                                and getattr(best, "item_type", None) == "journalArticle"
-                            ):
-                                drop = True
-                                break
-                        if drop:
-                            continue
-                    filtered_items.append(it)
-
-                local_items = filtered_items
                 self._last_scan_indexable_keys = {it.key for it in local_items}
                 if pre_extraction_callback is not None:
                     preview_items = [
@@ -1330,19 +1277,10 @@ class ZoteroSemanticSearch:
                         set(self._last_scan_indexable_keys),
                         set(api_metadata_by_key),
                     )
-                total_to_extract = len(local_items)
-                if total_to_extract != candidate_count:
-                    try:
-                        sys.stderr.write(
-                            f"After filtering/dedup: {total_to_extract} items to process. Extracting content...\n"
-                        )
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        sys.stderr.write("Extracting content...\n")
-                    except Exception:
-                        pass
+                try:
+                    sys.stderr.write("Extracting content...\n")
+                except Exception:
+                    pass
 
                 # Phase 2: selectively extract fulltext only when requested
                 if extract_fulltext:

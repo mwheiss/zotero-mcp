@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from zotero_mcp import cli, db_health, semantic_search
+from zotero_mcp import cli, db_health, local_db, semantic_search
 
 _REAL_ACQUIRE_SHARED_UPDATE_LOCK = db_health._acquire_shared_update_lock
 
@@ -272,29 +272,32 @@ def test_health_audit_reports_genuinely_unowned_segments(tmp_path):
     assert _finding(report, "foreign_keys").level == "error"
 
 
-def test_zotero_key_deduplication_matches_update_type_priority():
-    unknown = SimpleNamespace(
-        key="UNKNOWN",
-        doi="10.1/shared",
-        title="Shared",
-        item_type="report",
-    )
-    preprint = SimpleNamespace(
-        key="PREPRINT",
-        doi="10.1/shared",
-        title="Shared",
-        item_type="preprint",
-    )
-    journal = SimpleNamespace(
-        key="JOURNAL",
-        doi="10.1/shared",
-        title="Shared",
-        item_type="journalArticle",
-    )
+def test_zotero_coverage_keeps_preprints_and_journal_versions(monkeypatch):
+    items = [
+        SimpleNamespace(key="PREPRINT", item_type="preprint"),
+        SimpleNamespace(key="JOURNAL", item_type="journalArticle"),
+    ]
 
-    result = db_health._deduplicate_index_items([unknown, preprint, journal])
+    class Reader:
+        db_path = "/tmp/zotero.sqlite"
 
-    assert [item.key for item in result] == ["UNKNOWN", "JOURNAL"]
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def get_items_with_text(self, **_kwargs):
+            return items
+
+    monkeypatch.setattr(local_db, "LocalZoteroReader", Reader)
+
+    keys, _path = db_health._read_zotero_keys(None, None)
+
+    assert keys == {"PREPRINT", "JOURNAL"}
 
 
 def test_health_audit_refuses_snapshot_during_update(monkeypatch, tmp_path):

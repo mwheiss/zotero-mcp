@@ -118,48 +118,6 @@ def _load_persisted_ids(metadata_path: Path) -> set[str]:
     return set(id_to_label)
 
 
-def _deduplicate_index_items(items: list[Any]) -> list[Any]:
-    """Mirror the update path's preprint/journal duplicate preference."""
-
-    def normalized(value: str | None) -> str | None:
-        return "".join(value.lower().split()) if value else None
-
-    best: dict[tuple[str, str], Any] = {}
-    type_priority = {"journalArticle": 2, "preprint": 1}
-    for item in items:
-        keys = []
-        if doi := normalized(getattr(item, "doi", None)):
-            keys.append(("doi", doi))
-        if title := normalized(getattr(item, "title", None)):
-            keys.append(("title", title))
-        for key in keys:
-            current = best.get(key)
-            if current is None or type_priority.get(
-                getattr(item, "item_type", None), 0
-            ) > type_priority.get(getattr(current, "item_type", None), 0):
-                best[key] = item
-
-    result = []
-    for item in items:
-        if getattr(item, "item_type", None) != "preprint":
-            result.append(item)
-            continue
-        keys = []
-        if doi := normalized(getattr(item, "doi", None)):
-            keys.append(("doi", doi))
-        if title := normalized(getattr(item, "title", None)):
-            keys.append(("title", title))
-        if any(
-            (winner := best.get(key)) is not None
-            and winner is not item
-            and getattr(winner, "item_type", None) == "journalArticle"
-            for key in keys
-        ):
-            continue
-        result.append(item)
-    return result
-
-
 def _read_zotero_keys(
     db_path: str | None,
     collection_keys: list[str] | None,
@@ -186,7 +144,7 @@ def _read_zotero_keys(
             read_kwargs["library_id"] = sqlite_library_id
         items = reader.get_items_with_text(**read_kwargs)
         resolved_path = Path(reader.db_path)
-    return {item.key for item in _deduplicate_index_items(items)}, resolved_path
+    return {item.key for item in items}, resolved_path
 
 
 def audit_semantic_database(
