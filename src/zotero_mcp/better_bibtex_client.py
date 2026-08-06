@@ -10,6 +10,8 @@ from typing import Any
 
 import requests
 
+from zotero_mcp.client import call_with_zotero_api_lock
+
 # Matches the opening ``@type{`` line of a BibTeX entry where the citekey is
 # either absent or followed immediately by the comma + newline that a
 # missing-citekey entry produces. Used to inject the citekey when BBT's
@@ -77,11 +79,12 @@ class ZoteroBetterBibTexAPI:
         }
 
         try:
-            response = requests.post(
+            response = call_with_zotero_api_lock(
+                requests.post,
                 self.base_url,
                 headers=self.headers,
                 data=json.dumps(payload),
-                timeout=30
+                timeout=30,
             )
             response.raise_for_status()
             data = response.json()
@@ -101,10 +104,11 @@ class ZoteroBetterBibTexAPI:
     def is_zotero_running(self) -> bool:
         """Check if Zotero is running and accessible."""
         try:
-            response = requests.get(
+            response = call_with_zotero_api_lock(
+                requests.get,
                 f"http://127.0.0.1:{self.port}/better-bibtex/cayw?probe=true",
                 headers=self.headers,
-                timeout=5
+                timeout=5,
             )
             return response.text == "ready"
         except Exception:

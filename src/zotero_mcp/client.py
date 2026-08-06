@@ -186,6 +186,11 @@ def with_zotero_api_lock(func):
     return wrapper
 
 
+def call_with_zotero_api_lock(func, *args, **kwargs):
+    """Serialize one direct Zotero HTTP call through the shared API lock."""
+    return _call_with_zotero_api_lock(func, *args, **kwargs)
+
+
 # Direct-call fallback used by the standalone CLI and unit tests, where no MCP
 # session exists. Real MCP calls use the bounded session map below.
 _active_library_override: dict[str, str] = {}

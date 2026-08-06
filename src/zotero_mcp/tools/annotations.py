@@ -1014,7 +1014,8 @@ def create_note(
                     ],
                     "uri": "about:blank",
                 }
-                resp = requests.post(
+                resp = _client.call_with_zotero_api_lock(
+                    requests.post,
                     connector_url,
                     headers={"Content-Type": "application/json"},
                     json=payload,

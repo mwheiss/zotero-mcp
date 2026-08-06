@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
+from zotero_mcp import better_bibtex_client
 from zotero_mcp.better_bibtex_client import (
     ZoteroBetterBibTexAPI,
     _inject_citekey,
@@ -72,6 +73,34 @@ class _FakeResponse:
 
     def json(self):
         return self._payload
+
+
+def test_json_rpc_and_probe_use_shared_zotero_api_lock(monkeypatch):
+    locked_calls = []
+
+    def locked(func, *args, **kwargs):
+        locked_calls.append(func)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(better_bibtex_client, "call_with_zotero_api_lock", locked)
+    monkeypatch.setattr(
+        better_bibtex_client.requests,
+        "post",
+        lambda *args, **kwargs: _FakeResponse({"result": {}}),
+    )
+    monkeypatch.setattr(
+        better_bibtex_client.requests,
+        "get",
+        lambda *args, **kwargs: type("Response", (), {"text": "ready"})(),
+    )
+
+    client = ZoteroBetterBibTexAPI()
+    client._make_request("item.citationkey", {"item_keys": ["ABCD1234"]})
+    assert client.is_zotero_running() is True
+    assert locked_calls == [
+        better_bibtex_client.requests.post,
+        better_bibtex_client.requests.get,
+    ]
 
 
 def _capture_post(captured_payloads, results_iter):

@@ -1,4 +1,5 @@
 from zotero_mcp import server
+from zotero_mcp.tools import annotations
 
 
 class DummyContext:
@@ -41,3 +42,31 @@ def test_create_note_includes_title_heading(monkeypatch):
     note_html = fake_zot.created[0]["note"]
     assert note_html.startswith("<h1>&lt;Unsafe Title&gt;</h1>")
     assert "<p>Line one</p>" in note_html
+
+
+def test_local_connector_note_write_uses_shared_api_lock(monkeypatch):
+    fake_zot = FakeZotero()
+    locked_calls = []
+
+    class Response:
+        status_code = 201
+
+    def locked(func, *args, **kwargs):
+        locked_calls.append((func, args, kwargs))
+        return Response()
+
+    monkeypatch.setattr(annotations._utils, "is_local_mode", lambda: True)
+    monkeypatch.setattr(annotations._client, "get_zotero_client", lambda: fake_zot)
+    monkeypatch.setattr(annotations._client, "get_web_zotero_client", lambda: None)
+    monkeypatch.setattr(annotations._client, "call_with_zotero_api_lock", locked)
+
+    result = annotations.create_note(
+        item_key="ITEM0001",
+        note_title="Title",
+        note_text="Body",
+        ctx=DummyContext(),
+    )
+
+    assert "standalone note" in result
+    assert len(locked_calls) == 1
+    assert locked_calls[0][0] is annotations.requests.post
