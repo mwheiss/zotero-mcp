@@ -13,7 +13,13 @@ from zotero_mcp.tool_contract import (
     _legacy_result_data,
     classify_result,
 )
-from zotero_mcp.tool_profiles import FEED_TOOLS
+from zotero_mcp.tool_profiles import (
+    ADMIN_TOOLS,
+    CONNECTOR_TOOLS,
+    FEED_TOOLS,
+    LOCAL_PATH_TOOLS,
+    WRITE_TOOLS,
+)
 
 
 def _normalized_tools():
@@ -45,6 +51,24 @@ def test_connector_tools_keep_the_connector_output_contract(monkeypatch):
 
     assert tools["search"].output_schema != RESULT_SCHEMA
     assert tools["fetch"].output_schema != RESULT_SCHEMA
+
+
+def test_every_non_content_tool_has_an_explicit_operational_role(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "all")
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "1")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", "true")
+    tool_names = {tool.name for tool in _normalized_tools()}
+    permitted_non_content = (
+        CONNECTOR_TOOLS
+        | WRITE_TOOLS
+        | ADMIN_TOOLS
+        | LOCAL_PATH_TOOLS
+        | {"zotero_switch_library"}
+    )
+
+    assert tool_names - CONTENT_BEARING_TOOLS <= permitted_non_content
 
 
 def test_result_classification_distinguishes_empty_blocked_and_partial():
