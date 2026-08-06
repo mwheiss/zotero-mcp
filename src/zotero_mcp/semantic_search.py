@@ -3683,6 +3683,25 @@ class ZoteroSemanticSearch:
 
     def import_openai_batch(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
         """Import completed OpenAI Batch API embeddings into ChromaDB."""
+        lock_path = Path.home() / ".config" / "zotero-mcp" / "update.lock"
+        lock_cm = _acquire_update_lock(lock_path)
+        acquired = lock_cm.__enter__()
+        if not acquired:
+            lock_cm.__exit__(None, None, None)
+            raise RuntimeError(
+                "Another semantic-search update is already running "
+                f"(lock held at {lock_path})"
+            )
+        try:
+            return self._import_openai_batch_locked(batch_ids)
+        finally:
+            lock_cm.__exit__(None, None, None)
+
+    def _import_openai_batch_locked(
+        self,
+        batch_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Import a batch while the semantic update lock is held."""
         selected_ids = set(batch_ids or [])
         manifest = openai_batch.find_manifest(
             config_path=self.config_path,
@@ -3731,13 +3750,6 @@ class ZoteroSemanticSearch:
             "orphan_segment_cleanup_errors": 0,
             "errors": [],
         }
-
-        lock_path = Path.home() / ".config" / "zotero-mcp" / "update.lock"
-        lock_cm = _acquire_update_lock(lock_path)
-        acquired = lock_cm.__enter__()
-        if not acquired:
-            lock_cm.__exit__(None, None, None)
-            raise RuntimeError(f"Another semantic-search update is already running (lock held at {lock_path})")
 
         staged_batch_rebuild_active = False
         try:
@@ -3895,7 +3907,6 @@ class ZoteroSemanticSearch:
                         "Could not discard staged OpenAI batch rebuild: %s",
                         e,
                     )
-            lock_cm.__exit__(None, None, None)
 
     def search(self, query: str, limit: int = 10, filters: dict[str, Any] | None = None) -> dict[str, Any]:
         """

@@ -13,7 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ._atomic_io import atomic_write_json, atomic_write_lines
+from ._atomic_io import atomic_write_json, atomic_write_lines, atomic_write_text
+from ._file_lock import advisory_file_lock
 
 OPENAI_BATCH_ENDPOINT = "/v1/embeddings"
 OPENAI_BATCH_COMPLETION_WINDOW = "24h"
@@ -151,9 +152,23 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def save_manifest(manifest: dict[str, Any]) -> None:
+def _manifest_lock_path(manifest: dict[str, Any]) -> Path:
+    return Path(manifest["manifest_path"]).with_name("manifest.lock")
+
+
+def _save_manifest_unlocked(manifest: dict[str, Any]) -> None:
     manifest_path = Path(manifest["manifest_path"])
     atomic_write_json(manifest_path, manifest, indent=2)
+
+
+def save_manifest(manifest: dict[str, Any]) -> None:
+    """Persist a manifest without racing status refreshes or imports."""
+    with advisory_file_lock(
+        _manifest_lock_path(manifest),
+        exclusive=True,
+        blocking=True,
+    ):
+        _save_manifest_unlocked(manifest)
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -280,18 +295,49 @@ def refresh_manifest_status(
     batch_ids: set[str] | None = None,
     client: Any | None = None,
 ) -> dict[str, Any]:
-    """Retrieve current OpenAI status for selected batches and persist it."""
+    """Retrieve batch status while preserving concurrent import bookkeeping."""
     client = client or create_openai_client(embedding_config)
+    updates: dict[str, dict[str, Any]] = {}
     for batch in manifest.get("batches", []):
         if batch_ids and batch.get("batch_id") not in batch_ids:
             continue
         batch_obj = client.batches.retrieve(batch["batch_id"])
-        batch["status"] = _object_attr(batch_obj, "status", batch.get("status"))
-        batch["output_file_id"] = _object_attr(batch_obj, "output_file_id", batch.get("output_file_id"))
-        batch["error_file_id"] = _object_attr(batch_obj, "error_file_id", batch.get("error_file_id"))
-        batch["request_counts"] = _jsonable(_object_attr(batch_obj, "request_counts", batch.get("request_counts")))
-    save_manifest(manifest)
-    return manifest
+        updates[batch["batch_id"]] = {
+            "status": _object_attr(batch_obj, "status", batch.get("status")),
+            "output_file_id": _object_attr(
+                batch_obj,
+                "output_file_id",
+                batch.get("output_file_id"),
+            ),
+            "error_file_id": _object_attr(
+                batch_obj,
+                "error_file_id",
+                batch.get("error_file_id"),
+            ),
+            "request_counts": _jsonable(
+                _object_attr(
+                    batch_obj,
+                    "request_counts",
+                    batch.get("request_counts"),
+                )
+            ),
+        }
+
+    # Status requests can take long enough for an importer to finish. Reload
+    # under the manifest lock and merge only remote status fields so a stale
+    # status object cannot erase imported_at/imported_count or error details.
+    with advisory_file_lock(
+        _manifest_lock_path(manifest),
+        exclusive=True,
+        blocking=True,
+    ):
+        manifest_path = Path(manifest["manifest_path"])
+        latest = load_manifest(manifest_path) if manifest_path.exists() else manifest
+        for batch in latest.get("batches", []):
+            if update := updates.get(batch.get("batch_id")):
+                batch.update(update)
+        _save_manifest_unlocked(latest)
+    return latest
 
 
 def content_to_text(content: Any) -> str:
@@ -310,8 +356,7 @@ def content_to_text(content: Any) -> str:
 def download_file_text(client: Any, file_id: str, output_path: Path) -> str:
     content = client.files.content(file_id)
     text = content_to_text(content)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(text)
+    atomic_write_text(output_path, text)
     _private_chmod(output_path)
     return text
 

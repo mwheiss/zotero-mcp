@@ -121,6 +121,97 @@ def test_submit_embedding_batches_writes_manifest_and_jsonl(tmp_path):
     ) == [{"id": "UNCHANGED", "metadata": {"title": "Current title"}}]
 
 
+def test_status_refresh_preserves_newer_import_bookkeeping(tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    latest = {
+        "run_id": "run-1",
+        "manifest_path": str(manifest_path),
+        "batches": [{
+            "batch_id": "batch-1",
+            "status": "in_progress",
+            "imported_at": "2026-08-06T12:00:00",
+            "imported_count": 7,
+        }],
+    }
+    openai_batch.save_manifest(latest)
+    stale = {
+        "run_id": "run-1",
+        "manifest_path": str(manifest_path),
+        "batches": [{
+            "batch_id": "batch-1",
+            "status": "in_progress",
+            "imported_at": None,
+            "imported_count": 0,
+        }],
+    }
+    client = SimpleNamespace(
+        batches=SimpleNamespace(
+            retrieve=lambda _batch_id: SimpleNamespace(
+                status="completed",
+                output_file_id="output-1",
+                error_file_id=None,
+                request_counts={"completed": 7},
+            )
+        )
+    )
+
+    refreshed = openai_batch.refresh_manifest_status(
+        stale,
+        embedding_config=None,
+        client=client,
+    )
+
+    batch = refreshed["batches"][0]
+    assert batch["status"] == "completed"
+    assert batch["output_file_id"] == "output-1"
+    assert batch["imported_at"] == "2026-08-06T12:00:00"
+    assert batch["imported_count"] == 7
+
+
+def test_download_file_text_uses_atomic_persistence(tmp_path, monkeypatch):
+    output_path = tmp_path / "output.jsonl"
+    writes = []
+    monkeypatch.setattr(
+        openai_batch,
+        "atomic_write_text",
+        lambda path, content: writes.append((path, content)),
+    )
+    client = SimpleNamespace(
+        files=SimpleNamespace(content=lambda _file_id: b"complete output")
+    )
+
+    text = openai_batch.download_file_text(client, "file-1", output_path)
+
+    assert text == "complete output"
+    assert writes == [(output_path, "complete output")]
+
+
+def test_import_locks_before_reading_manifest(monkeypatch):
+    events = []
+
+    class Lock:
+        def __enter__(self):
+            events.append("lock-enter")
+            return True
+
+        def __exit__(self, *_args):
+            events.append("lock-exit")
+
+    def find_manifest(**_kwargs):
+        events.append("manifest-read")
+        raise RuntimeError("stop after manifest read")
+
+    monkeypatch.setattr(semantic_search, "_acquire_update_lock", lambda _path: Lock())
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(semantic_search.openai_batch, "find_manifest", find_manifest)
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
+
+    with pytest.raises(RuntimeError, match="stop after manifest read"):
+        search.import_openai_batch()
+
+    assert events == ["lock-enter", "manifest-read", "lock-exit"]
+
+
 def test_setup_openai_new_config_defaults_to_batch(monkeypatch):
     answers = iter([
         "2",  # OpenAI
