@@ -93,3 +93,41 @@ def test_search_uses_the_preferred_group_citation_url(monkeypatch):
 
     expected = "https://www.zotero.org/groups/5910265/items/ABCD1234"
     assert search_payload["results"][0]["url"] == expected
+
+
+def test_search_omits_results_without_fetchable_item_keys(monkeypatch):
+    from zotero_mcp import semantic_search
+
+    class FakeSearch:
+        def search(self, **_kwargs):
+            return {
+                "results": [
+                    {"item_key": "", "zotero_item": {"data": {"title": "Missing"}}},
+                    {"item_key": "TOO-LONG-KEY", "zotero_item": {"data": {"title": "Bad"}}},
+                    {"item_key": "ABCD1234", "zotero_item": {"data": {"title": "Good"}}},
+                ]
+            }
+
+    monkeypatch.setattr(
+        semantic_search,
+        "create_semantic_search",
+        lambda *_args, **_kwargs: FakeSearch(),
+    )
+
+    payload = json.loads(connectors.chatgpt_connector_search("test", ctx=DummyContext()))
+
+    assert [result["id"] for result in payload["results"]] == ["ABCD1234"]
+
+
+def test_fetch_rejects_malformed_item_key_before_zotero_access(monkeypatch):
+    monkeypatch.setattr(
+        connectors._client,
+        "get_zotero_client",
+        lambda: (_ for _ in ()).throw(AssertionError("Zotero must not be called")),
+    )
+
+    payload = json.loads(connectors.connector_fetch("../INVALID", ctx=DummyContext()))
+
+    assert payload["url"] == ""
+    assert payload["text"] == ""
+    assert payload["metadata"] == {"error": "invalid Zotero item key"}

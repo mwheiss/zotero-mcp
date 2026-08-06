@@ -1,7 +1,7 @@
 """ChatGPT connector tool functions (search & fetch)."""
 
 import json
-import uuid
+import re
 from pathlib import Path
 
 from zotero_mcp import client as _client
@@ -13,6 +13,8 @@ from zotero_mcp.tools.retrieval import get_item_fulltext
 # These are required for ChatGPT custom MCP servers via web "connectors"
 # specific tools required are "search" and "fetch"
 # See: https://platform.openai.com/docs/mcp
+
+_ITEM_KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
 
 
 def _item_urls(item_key: str) -> tuple[str, str]:
@@ -88,16 +90,21 @@ def chatgpt_connector_search(
         result_list: list[dict[str, str]] = []
         results = search.search(query=query, limit=default_limit, filters=None) or {}
         for r in results.get("results", []):
-            item_key = r.get("item_key") or ""
+            raw_item_key = r.get("item_key")
+            item_key = raw_item_key.strip() if isinstance(raw_item_key, str) else ""
+            # Connector search IDs are later passed verbatim to fetch. Returning
+            # a synthetic or malformed ID creates an unfetchable citation.
+            if not _ITEM_KEY_RE.fullmatch(item_key):
+                continue
             title = ""
             if r.get("zotero_item"):
                 data = (r.get("zotero_item") or {}).get("data", {})
                 title = data.get("title", "")
             if not title:
                 title = f"Zotero Item {item_key}" if item_key else "Zotero Item"
-            url = _citation_url(item_key) if item_key else ""
+            url = _citation_url(item_key)
             result_list.append({
-                "id": item_key or uuid.uuid4().hex[:8],
+                "id": item_key,
                 "title": title,
                 "url": url,
             })
@@ -152,6 +159,14 @@ def connector_fetch(
                 "text": "",
                 "url": "",
                 "metadata": {"error": "missing item key"}
+            }, separators=(",", ":"))
+        if not _ITEM_KEY_RE.fullmatch(item_key):
+            return json.dumps({
+                "id": id,
+                "title": "",
+                "text": "",
+                "url": "",
+                "metadata": {"error": "invalid Zotero item key"}
             }, separators=(",", ":"))
 
         # Fetch item metadata for title and context
