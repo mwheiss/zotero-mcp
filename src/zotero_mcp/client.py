@@ -3,6 +3,7 @@ Zotero client wrapper for MCP server.
 """
 
 import functools
+import math
 import os
 import re
 import threading
@@ -85,9 +86,12 @@ def _lock_timeout() -> float:
     if not raw:
         return _DEFAULT_LOCK_TIMEOUT
     try:
-        return float(raw)
+        timeout = float(raw)
     except ValueError:
         return _DEFAULT_LOCK_TIMEOUT
+    if not math.isfinite(timeout) or timeout > threading.TIMEOUT_MAX:
+        return _DEFAULT_LOCK_TIMEOUT
+    return timeout
 
 
 def _api_lock_path() -> Path:

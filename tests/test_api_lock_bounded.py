@@ -17,10 +17,25 @@ from conftest import DummyContext
 from zotero_mcp import client as _client
 from zotero_mcp.client import (
     ZoteroApiBusyError,
+    _lock_timeout,
     _SerializedCallProxy,
     _zotero_api_lock,
     with_zotero_api_lock,
 )
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e100", "invalid"])
+def test_invalid_lock_timeout_uses_bounded_default(monkeypatch, value):
+    monkeypatch.setenv("ZOTERO_MCP_LOCK_TIMEOUT", value)
+
+    assert _lock_timeout() == _client._DEFAULT_LOCK_TIMEOUT
+
+
+@pytest.mark.parametrize("value, expected", [("0", 0.0), ("-1", -1.0), ("3.5", 3.5)])
+def test_valid_lock_timeout_is_preserved(monkeypatch, value, expected):
+    monkeypatch.setenv("ZOTERO_MCP_LOCK_TIMEOUT", value)
+
+    assert _lock_timeout() == expected
 
 
 def _hold_process_lock(lock_path, ready, release):
