@@ -9,6 +9,7 @@ from zotero_mcp.server import mcp
 from zotero_mcp.tool_contract import (
     RESULT_SCHEMA,
     ToolContractMiddleware,
+    _legacy_result_data,
     classify_result,
 )
 
@@ -227,8 +228,8 @@ def test_call_middleware_derives_fields_and_identifiers_from_legacy_markdown():
     assert data["identifiers"] == {
         "item_keys": ["ABCD1234", "WXYZ5678"],
         "chunk_ids": ["ABCD1234:0007", "WXYZ5678:0002"],
-        "chunk_hashes": "abc123",
-        "dois": "10.1000/example",
+        "chunk_hashes": ["abc123"],
+        "dois": ["10.1000/example"],
     }
 
 
@@ -244,3 +245,33 @@ def test_call_middleware_uses_json_text_as_native_data():
 
     data = asyncio.run(run()).structured_content["data"]
     assert data == {"items": [{"key": "ABCD1234"}]}
+
+
+def test_legacy_data_captures_plain_write_identifiers_as_arrays():
+    data = _legacy_result_data(
+        "Successfully created an item.\n"
+        "Item key: `ABCD1234`\n"
+        "Note key: WXYZ5678\n"
+        "DOI: 10.1000/example"
+    )
+
+    assert data["identifiers"] == {
+        "item_keys": ["ABCD1234"],
+        "note_keys": ["WXYZ5678"],
+        "dois": ["10.1000/example"],
+    }
+
+
+def test_content_data_ignores_arbitrary_paper_fields():
+    data = _legacy_result_data(
+        "# Paper\n"
+        "**Item Key:** `ABCD1234`\n"
+        "**Methods:** Missing values were imputed.\n"
+        "**Result:** No effect.",
+        content_bearing=True,
+    )
+
+    assert data == {
+        "fields": {"item_key": ["ABCD1234"]},
+        "identifiers": {"item_keys": ["ABCD1234"]},
+    }

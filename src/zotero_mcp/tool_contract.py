@@ -46,7 +46,8 @@ RESULT_SCHEMA = {
         "data": {
             "description": (
                 "Machine-readable result data. Native structures are preserved; "
-                "legacy markdown tools expose parsed fields and identifiers."
+                "legacy markdown tools expose parsed fields and identifiers, "
+                "with every parsed category represented as an array."
             ),
         },
         "warnings": {
@@ -275,13 +276,16 @@ def classify_result(
     }
 
 
-def _result_data(result: ToolResult, text: str) -> Any:
+def _result_data(result: ToolResult, text: str, *, tool_name: str | None = None) -> Any:
     """Preserve native data or derive useful structure from legacy markdown."""
     structured = result.structured_content
     if not (isinstance(structured, dict) and structured == {"result": text}):
         if structured is not None:
             return copy.deepcopy(structured)
-    return _legacy_result_data(text)
+    return _legacy_result_data(
+        text,
+        content_bearing=tool_name in CONTENT_BEARING_TOOLS,
+    )
 
 
 def _field_name(label: str) -> str:
@@ -298,18 +302,13 @@ def _field_value(value: str) -> str:
     return cleaned.strip()
 
 
-def _append_value(target: dict[str, Any], key: str, value: str) -> None:
-    existing = target.get(key)
-    if existing is None:
-        target[key] = value
-    elif isinstance(existing, list):
-        if value not in existing:
-            existing.append(value)
-    elif existing != value:
-        target[key] = [existing, value]
+def _append_value(target: dict[str, list[str]], key: str, value: str) -> None:
+    values = target.setdefault(key, [])
+    if value not in values:
+        values.append(value)
 
 
-def _legacy_result_data(text: str) -> Any:
+def _legacy_result_data(text: str, *, content_bearing: bool = False) -> Any:
     """Derive a conservative machine view without changing legacy tool text."""
     stripped = text.strip()
     if stripped.startswith(("{", "[")):
@@ -318,16 +317,19 @@ def _legacy_result_data(text: str) -> Any:
         except json.JSONDecodeError:
             pass
 
-    fields: dict[str, Any] = {}
-    identifiers: dict[str, Any] = {}
+    fields: dict[str, list[str]] = {}
+    identifiers: dict[str, list[str]] = {}
     field_pattern = re.compile(
         r"^\s*(?:[-*]\s+)?\*\*([^*:\n]+):\*\*\s*(.*?)\s*$"
     )
     identifier_fields = {
         "item_key": "item_keys",
+        "requested_item_key": "item_keys",
+        "note_key": "note_keys",
         "attachment_key": "attachment_keys",
         "collection_key": "collection_keys",
         "chunk_id": "chunk_ids",
+        "requested_chunk": "chunk_ids",
         "chunk_hash": "chunk_hashes",
         "doi": "dois",
         "citation_key": "citation_keys",
@@ -341,6 +343,26 @@ def _legacy_result_data(text: str) -> Any:
         "supporting_passages",
         "text",
     }
+    safe_content_fields = {
+        "attachment_key",
+        "authors",
+        "chunk_hash",
+        "chunk_id",
+        "citation_key",
+        "collection_key",
+        "date",
+        "doi",
+        "indexed_source",
+        "item_key",
+        "location",
+        "note_key",
+        "relevance",
+        "requested_chunk",
+        "requested_item_key",
+        "selected_attachment",
+        "selected_source",
+        "type",
+    }
 
     for line in stripped.splitlines():
         match = field_pattern.match(line)
@@ -348,19 +370,43 @@ def _legacy_result_data(text: str) -> Any:
             continue
         key = _field_name(match.group(1))
         value = _field_value(match.group(2))
-        if not value or key in prose_fields:
+        if (
+            not value
+            or key in prose_fields
+            or (content_bearing and key not in safe_content_fields)
+        ):
             continue
         _append_value(fields, key, value)
         identifier_key = identifier_fields.get(key)
         if identifier_key:
             _append_value(identifiers, identifier_key, value)
 
-    # Capture identifiers embedded in links or compact prose even when a tool
-    # does not render them as labelled fields.
-    for key in re.findall(r"zotero://select/(?:library|groups/\d+)/items/([A-Z0-9]{8})", stripped):
-        _append_value(identifiers, "item_keys", key)
-    for doi in re.findall(r"https?://doi\.org/([^\s)>]+)", stripped, re.I):
-        _append_value(identifiers, "dois", doi.rstrip(".,;"))
+    if not content_bearing:
+        plain_identifier_pattern = re.compile(
+            r"^\s*(?:[-*]\s+)?(Item|Note|Attachment|Collection|Citation)\s+key:\s*`?([^`\s]+)`?\s*$",
+            re.I,
+        )
+        plain_doi_pattern = re.compile(r"^\s*(?:[-*]\s+)?DOI:\s*(\S+)\s*$", re.I)
+        for line in stripped.splitlines():
+            match = plain_identifier_pattern.match(line)
+            if match:
+                key = _field_name(f"{match.group(1)} key")
+                value = _field_value(match.group(2))
+                _append_value(fields, key, value)
+                _append_value(identifiers, identifier_fields[key], value)
+                continue
+            doi_match = plain_doi_pattern.match(line)
+            if doi_match:
+                value = _field_value(doi_match.group(1))
+                _append_value(fields, "doi", value)
+                _append_value(identifiers, "dois", value)
+
+        # Capture identifiers embedded in links or compact prose even when a
+        # non-content tool does not render them as labelled fields.
+        for key in re.findall(r"zotero://select/(?:library|groups/\d+)/items/([A-Z0-9]{8})", stripped):
+            _append_value(identifiers, "item_keys", key)
+        for doi in re.findall(r"https?://doi\.org/([^\s)>]+)", stripped, re.I):
+            _append_value(identifiers, "dois", doi.rstrip(".,;"))
 
     data: dict[str, Any] = {}
     if fields:
@@ -417,7 +463,7 @@ class ToolContractMiddleware(Middleware):
         structured = classify_result(
             text,
             result.is_error,
-            data=_result_data(result, text),
+            data=_result_data(result, text, tool_name=context.message.name),
             tool_name=context.message.name,
         )
         return ToolResult(
