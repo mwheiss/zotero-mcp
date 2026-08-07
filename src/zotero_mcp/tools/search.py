@@ -562,7 +562,10 @@ def search_by_citation_key(
         "join_mode: 'all' (AND, default) or 'any' (OR). "
         "sort_by: dateAdded, dateModified, title, creator, etc. "
         "sort_direction: 'asc' (default) or 'desc'. "
-        "limit: max results (default 50, max 500). "
+        "Results include DOI, language, dateAdded, and dateModified in addition "
+        "to the standard item summary; unavailable values remain empty. "
+        "limit: max results (default 50, max 2000). Large result sets can "
+        "produce correspondingly large MCP responses. "
         "Example: zotero_advanced_search(conditions=[{'field': 'itemType', "
         "'operation': 'is', 'value': 'preprint'}, {'field': 'dateAdded', "
         "'operation': 'isAfter', 'value': '2026-03-22'}], "
@@ -611,7 +614,7 @@ def advanced_search(
         if join_mode not in {"all", "any"}:
             return "Error: join_mode must be either 'all' or 'any'"
 
-        limit = _helpers._normalize_limit(limit, default=50, max_val=500)
+        limit = _helpers._normalize_limit(limit, default=50, max_val=2000)
 
         context_info(ctx, f"Performing advanced search with {len(conditions)} conditions")
         zot = _client.get_zotero_client()
@@ -810,9 +813,24 @@ def advanced_search(
         output.append("## Results")
 
         for i, item in enumerate(results, 1):
-            output.extend(_utils.format_item_result(item, index=i))
+            data = item.get("data", {})
+            output.extend(
+                _utils.format_item_result(
+                    item,
+                    index=i,
+                    extra_fields={
+                        "DOI": str(data.get("DOI") or ""),
+                        "Language": str(data.get("language") or ""),
+                        "Date Added": str(data.get("dateAdded") or ""),
+                        "Date Modified": str(data.get("dateModified") or ""),
+                    },
+                )
+            )
 
-        return "\n".join(output)
+        return _helpers._prepend_size_warning(
+            "\n".join(output),
+            "Narrow the conditions or lower limit to reduce response size.",
+        )
 
     except Exception as e:
         context_error(ctx, f"Error in advanced search: {str(e)}")

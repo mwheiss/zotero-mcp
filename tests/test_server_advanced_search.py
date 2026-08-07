@@ -79,3 +79,66 @@ def test_advanced_search_rejects_unknown_operation(monkeypatch):
     )
 
     assert "Unsupported operation" in result
+
+
+def test_advanced_search_exposes_bulk_inventory_fields(monkeypatch):
+    fake_items = [
+        {
+            "key": "AAA11111",
+            "data": {
+                "itemType": "journalArticle",
+                "title": "Complete Metadata",
+                "date": "2024-03-01",
+                "DOI": "10.1000/complete",
+                "language": "en",
+                "dateAdded": "2026-07-01T10:00:00Z",
+                "dateModified": "2026-08-06T11:30:00Z",
+                "creators": [],
+                "tags": [],
+            },
+        }
+    ]
+    monkeypatch.setattr(
+        "zotero_mcp.client.get_zotero_client",
+        lambda: FakeZotero(fake_items),
+    )
+
+    result = server.advanced_search(
+        conditions=[{"field": "itemType", "operation": "is", "value": "journalArticle"}],
+        ctx=DummyContext(),
+    )
+
+    assert "**DOI:** 10.1000/complete" in result
+    assert "**Language:** en" in result
+    assert "**Date Added:** 2026-07-01T10:00:00Z" in result
+    assert "**Date Modified:** 2026-08-06T11:30:00Z" in result
+
+
+def test_advanced_search_caps_bulk_results_at_2000(monkeypatch):
+    fake_items = [
+        {
+            "key": f"K{i:07d}",
+            "data": {
+                "itemType": "journalArticle",
+                "title": f"Paper {i}",
+                "date": "2026",
+                "creators": [],
+                "tags": [],
+            },
+        }
+        for i in range(2100)
+    ]
+    monkeypatch.setattr(
+        "zotero_mcp.client.get_zotero_client",
+        lambda: FakeZotero(fake_items),
+    )
+
+    result = server.advanced_search(
+        conditions=[{"field": "itemType", "operation": "is", "value": "journalArticle"}],
+        limit=2500,
+        ctx=DummyContext(),
+    )
+
+    assert "Found 2000 items matching the search criteria" in result
+    assert "Paper 1999" in result
+    assert "Paper 2000" not in result
