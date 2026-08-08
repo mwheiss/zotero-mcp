@@ -929,21 +929,22 @@ def get_tags(limit: int | str | None = None, *, ctx: Context) -> str:
     name="zotero_list_libraries",
     description=(
         "List every Zotero library this MCP can address: the user's "
-        "personal library (libraryID=1 conventionally), all group "
-        "libraries the user is a member of (with groupID), and (in "
-        "local mode) RSS feed libraries. Each entry shows the "
-        "library/group ID, display name, and item count. "
-        "Use this to discover a library ID before calling "
-        "zotero_switch_library — the two form a read-then-switch "
-        "workflow. If the user only wants to see Zotero collections "
+        "personal library, all group libraries the user is a member "
+        "of, and (in local mode) RSS feed libraries. Each entry shows "
+        "the exact library_id and library_type accepted by "
+        "zotero_switch_library, plus its display name and item count. "
+        "The local personal library uses Zotero's API identity user:0; "
+        "internal SQLite library IDs are not exposed. Only switch when "
+        "the requested library differs from the Active library shown at "
+        "the top. If the user only wants to see Zotero collections "
         "inside the CURRENT library, use zotero_get_collections "
         "instead. "
         "No parameters. "
         "In local mode: reads the local Zotero SQLite DB (fast, includes "
         "RSS feeds). In web mode: queries /groups via the Zotero web "
         "API (no feeds). "
-        "Read-only; no side effects. The current session override is "
-        "flagged at the top when one is active. "
+        "Read-only; no side effects. The effective active library is "
+        "always shown at the top. "
         "Example: zotero_list_libraries()."
     ),
 )
@@ -960,14 +961,13 @@ def list_libraries(*, ctx: Context) -> str:
     try:
         context_info(ctx, "Listing accessible libraries")
         local = os.getenv("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]
-        override = _client.get_active_library()
+        active = _client.get_current_library()
 
         output = ["# Zotero Libraries", ""]
 
         # Show active library context
-        if override:
-            output.append(f"> **Active library:** ID={override['library_id']}, type={override['library_type']}")
-            output.append("")
+        output.append(f"> **Active library:** {active['library_type']}:{active['library_id']}")
+        output.append("")
 
         if local:
             from zotero_mcp.local_db import LocalZoteroReader
@@ -981,7 +981,10 @@ def list_libraries(*, ctx: Context) -> str:
                 if user_libs:
                     output.append("## User Library")
                     for lib in user_libs:
-                        output.append(f"- **My Library** — {lib['itemCount']} items (libraryID={lib['libraryID']})")
+                        output.append(
+                            f"- **My Library** — {lib['itemCount']} items "
+                            "(`library_id=0`, `library_type=user`)"
+                        )
                     output.append("")
 
                 # Group libraries
@@ -991,7 +994,8 @@ def list_libraries(*, ctx: Context) -> str:
                     for lib in group_libs:
                         desc = f" — {lib['groupDescription']}" if lib.get("groupDescription") else ""
                         output.append(
-                            f"- **{lib['groupName']}** — {lib['itemCount']} items (groupID={lib['groupID']}){desc}"
+                            f"- **{lib['groupName']}** — {lib['itemCount']} items "
+                            f"(`library_id={lib['groupID']}`, `library_type=group`){desc}"
                         )
                     output.append("")
 
@@ -1001,7 +1005,8 @@ def list_libraries(*, ctx: Context) -> str:
                     output.append("## RSS Feeds")
                     for lib in feed_libs:
                         output.append(
-                            f"- **{lib['feedName']}** — {lib['itemCount']} items (libraryID={lib['libraryID']})"
+                            f"- **{lib['feedName']}** — {lib['itemCount']} items "
+                            f"(`library_id={lib['libraryID']}`, `library_type=feed`)"
                         )
                     output.append("")
             finally:
@@ -1010,7 +1015,8 @@ def list_libraries(*, ctx: Context) -> str:
             # Web mode: query groups via pyzotero
             zot = _client.get_zotero_client()
             output.append("## User Library")
-            output.append(f"- **My Library** (libraryID={os.getenv('ZOTERO_LIBRARY_ID', '?')})")
+            user_id = os.getenv("ZOTERO_LIBRARY_ID", "?")
+            output.append(f"- **My Library** (`library_id={user_id}`, `library_type=user`)")
             output.append("")
 
             try:
@@ -1019,7 +1025,10 @@ def list_libraries(*, ctx: Context) -> str:
                     output.append("## Group Libraries")
                     for group in groups:
                         gdata = group.get("data", {})
-                        output.append(f"- **{gdata.get('name', 'Unknown')}** (groupID={group.get('id', '?')})")
+                        output.append(
+                            f"- **{gdata.get('name', 'Unknown')}** "
+                            f"(`library_id={group.get('id', '?')}`, `library_type=group`)"
+                        )
                     output.append("")
             except Exception:
                 output.append("*Could not retrieve group libraries.*\n")
@@ -1027,7 +1036,7 @@ def list_libraries(*, ctx: Context) -> str:
             output.append("*Note: RSS feeds are only accessible in local mode.*")
 
         output.append("")
-        output.append("Use `zotero_switch_library` to switch to a different library.")
+        output.append("Use `zotero_switch_library` only to select a different library.")
 
         return "\n".join(output)
 
@@ -1043,11 +1052,12 @@ def list_libraries(*, ctx: Context) -> str:
         "tools use that library, and semantic tools use its isolated index. "
         "Other connected MCP sessions are unaffected. The selection persists "
         "until this session switches again or resets to default. "
-        "Discover valid library IDs/types via zotero_list_libraries "
-        "first; don't guess. "
-        "library_id: library ID string as returned by "
-        "zotero_list_libraries (numeric for user/group, numeric for "
-        "feeds). "
+        "Discover valid library_id/library_type pairs via "
+        "zotero_list_libraries first; don't guess and don't switch when "
+        "the desired library is already active. library_id: exact ID "
+        "string returned by zotero_list_libraries. In local mode the "
+        "personal library is always '0'; SQLite-internal IDs such as '1' "
+        "are not valid MCP library identities. "
         "library_type: 'user' — the personal library; 'group' (default) "
         "— a group library; 'feed' — a local RSS feed library; "
         "'default' — RESET to whatever the ZOTERO_LIBRARY_ID / "
@@ -1129,6 +1139,12 @@ def validate_library_switch(library_id: str, library_type: str) -> str | None:
     # In local mode, verify the library actually exists in the database
     local = os.getenv("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]
     if local:
+        if library_type == "user" and library_id != "0":
+            return (
+                "Invalid local user library ID. Zotero's local API addresses "
+                "the personal library as library_id='0'; SQLite-internal "
+                "library IDs are not valid here."
+            )
         try:
             from zotero_mcp.local_db import LocalZoteroReader
 
