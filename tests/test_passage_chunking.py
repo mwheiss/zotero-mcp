@@ -55,6 +55,29 @@ def test_split_offsets_are_monotonic_and_cover_text():
         prev_start = start
 
 
+def test_split_balances_chunks_instead_of_leaving_a_small_tail():
+    body = "x" * 6575
+
+    out = split_into_passages(body, chunk_size=6000, overlap=750)
+
+    assert len(out) == 2
+    lengths = [end - start for _text, start, end in out]
+    assert max(lengths) - min(lengths) <= 1
+    assert out[1][1] == out[0][2] - 750
+    assert out[-1][2] == len(body)
+
+
+def test_balanced_split_snaps_to_nearby_paragraph_boundary():
+    body = "a" * 3400 + "\n\n" + "b" * 3173
+
+    out = split_into_passages(body, chunk_size=6000, overlap=750)
+
+    assert len(out) == 2
+    assert out[0][2] == 3402
+    assert out[1][1] == 2652
+    assert out[-1][2] == len(body)
+
+
 def test_split_respects_max_chunks():
     body = "word " * 5000
     out = split_into_passages(body, chunk_size=100, overlap=10, max_chunks=7)
@@ -218,7 +241,7 @@ def test_chunking_emits_multiple_passage_ids(monkeypatch):
     assert meta0["chunk_index"] == 0
     assert meta0["n_chunks"] == len(s.chroma_client.upserted_ids)
     assert "char_start" in meta0 and "char_end" in meta0
-    assert meta0["index_layout_signature"] == "chunks-v1:120:20:10"
+    assert meta0["index_layout_signature"] == "chunks-v2-balanced:120:20:10"
 
 
 def test_fallback_fulltext_gets_separate_metadata_and_body_passages(monkeypatch):
@@ -456,6 +479,10 @@ def test_chunking_config_loaded_from_file(monkeypatch, tmp_path):
 def test_changed_chunk_layout_requires_incremental_migration(monkeypatch):
     s = _chunking_search(monkeypatch)
     assert s._index_layout_changed({}) is True
+    assert (
+        s._index_layout_changed({"index_layout_signature": "chunks-v2-balanced:120:20:10"})
+        is False
+    )
     assert (
         s._index_layout_changed({"index_layout_signature": "chunks-v1:120:20:10"})
         is False

@@ -475,14 +475,16 @@ def split_into_passages(
     overlap: int = 200,
     max_chunks: int = DEFAULT_MAX_CHUNKS_PER_ITEM,
 ) -> list[tuple[str, int, int]]:
-    """Split *text* into overlapping passages on natural boundaries.
+    """Split *text* into balanced, overlapping natural passages.
 
     Pure function (no I/O, no model load) so it is unit-testable in isolation.
     Returns a list of ``(passage_text, char_start, char_end)`` tuples with
-    character offsets into the original string. Each window targets
-    ``chunk_size`` characters but is snapped back to the nearest paragraph or
-    sentence boundary in its second half so passages read as coherent quotes.
-    Consecutive windows overlap by ``overlap`` characters so a relevant span
+    character offsets into the original string. The required passage count is
+    calculated first from ``chunk_size`` and ``overlap``; internal boundaries
+    are then distributed evenly and nudged within a narrow tolerance toward a
+    paragraph, sentence, line, or word boundary. This avoids a greedy first
+    passage leaving a disproportionately small final passage. Consecutive
+    windows overlap by ``overlap`` source characters so a relevant span
     straddling a boundary is still captured whole in one of them. At most
     ``max_chunks`` passages are produced (a guard against pathologically long
     documents inflating the index).
@@ -490,29 +492,69 @@ def split_into_passages(
     text = (text or "").strip()
     if not text:
         return []
+    chunk_size = max(1, int(chunk_size))
+    overlap = max(0, int(overlap))
+    max_chunks = max(1, int(max_chunks))
     if overlap >= chunk_size:
         overlap = chunk_size // 4
 
-    passages: list[tuple[str, int, int]] = []
-    start = 0
     n = len(text)
-    while start < n and len(passages) < max_chunks:
-        end = min(n, start + chunk_size)
-        if end < n:
-            window = text[start:end]
-            for sep in ("\n\n", ". ", ".\n", "\n", " "):
-                idx = window.rfind(sep)
-                if idx != -1 and idx >= int(chunk_size * 0.5):
-                    end = start + idx + len(sep)
-                    break
+    if n <= chunk_size:
+        return [(text, 0, n)]
+
+    stride = chunk_size - overlap
+    required_chunks = max(1, math.ceil((n - overlap) / stride))
+    chunk_count = min(required_chunks, max_chunks)
+    # Preserve the historical cap contract: if the configured cap cannot
+    # cover the document at the requested size, index only that bounded prefix
+    # rather than creating passages larger than the embedding budget.
+    covered_end = min(n, chunk_count * chunk_size - (chunk_count - 1) * overlap)
+    ideal_length = (covered_end + (chunk_count - 1) * overlap) / chunk_count
+    snap_tolerance = max(1, int(ideal_length * 0.10))
+
+    def natural_boundary(ideal: int, lower: int, upper: int) -> int:
+        """Return a coherent boundary near *ideal*, preferring paragraphs."""
+        lower = max(1, lower)
+        upper = min(covered_end - 1, upper)
+        if lower > upper:
+            return max(1, min(ideal, covered_end - 1))
+        for separator in ("\n\n", ". ", ".\n", "\n", " "):
+            candidates: list[int] = []
+            cursor = text.find(separator, lower, upper + 1)
+            while cursor != -1:
+                boundary = cursor + len(separator)
+                if boundary <= upper:
+                    candidates.append(boundary)
+                cursor = text.find(separator, cursor + 1, upper + 1)
+            if candidates:
+                return min(candidates, key=lambda boundary: (abs(boundary - ideal), boundary))
+        return max(lower, min(ideal, upper))
+
+    ends: list[int] = []
+    previous_end = 0
+    for index in range(1, chunk_count):
+        ideal_end = round(index * (covered_end - overlap) / chunk_count + overlap)
+        start = max(0, previous_end - overlap)
+        remaining_chunks = chunk_count - index
+        lower = max(
+            start + 1,
+            ideal_end - snap_tolerance,
+            covered_end - remaining_chunks * stride,
+        )
+        upper = min(start + chunk_size, ideal_end + snap_tolerance)
+        end = natural_boundary(ideal_end, lower, upper)
+        ends.append(end)
+        previous_end = end
+    ends.append(covered_end)
+
+    passages: list[tuple[str, int, int]] = []
+    previous_end = 0
+    for end in ends:
+        start = max(0, previous_end - overlap) if passages else 0
         chunk = text[start:end].strip()
         if chunk:
-            passages.append((chunk, start, min(end, n)))
-        if end >= n:
-            break
-        new_start = end - overlap
-        # Guarantee forward progress even when overlap is large.
-        start = new_start if new_start > start else end
+            passages.append((chunk, start, end))
+        previous_end = end
     return passages
 
 
@@ -767,7 +809,7 @@ class ZoteroSemanticSearch:
         """Identify the chunk layout that produced the stored vectors."""
         if not self._chunking_enabled:
             return "item-v1"
-        return "chunks-v1:{size}:{overlap}:{maximum}".format(
+        return "chunks-v2-balanced:{size}:{overlap}:{maximum}".format(
             size=int(self._chunking_config.get("chunk_size", 1500)),
             overlap=int(self._chunking_config.get("overlap", 200)),
             maximum=int(self._chunking_config.get("max_chunks_per_item", DEFAULT_MAX_CHUNKS_PER_ITEM)),
@@ -776,10 +818,21 @@ class ZoteroSemanticSearch:
     def _index_layout_changed(self, metadata: dict[str, Any]) -> bool:
         """Return whether an existing item needs migration to this layout."""
         stored = metadata.get("index_layout_signature")
+        current = self._index_layout_signature
+        if self._chunking_enabled and isinstance(stored, str):
+            # Balanced chunking changes boundaries, not the retrieval schema.
+            # Treat the prior algorithm as read-compatible when all configured
+            # dimensions match, so deploying this improvement cannot silently
+            # trigger a full-library re-embedding. Any item selected for a
+            # normal content refresh is rewritten with the current signature;
+            # an explicitly confirmed force rebuild migrates the rest.
+            legacy_compatible = current.replace("chunks-v2-balanced:", "chunks-v1:", 1)
+            if stored == legacy_compatible:
+                return False
         # Old item-level indexes did not carry a signature. Preserve their
         # historical skip behavior, while an enabled chunk layout migrates old
         # records once. A stamped chunked index also migrates when disabled.
-        return (self._chunking_enabled or stored is not None) and (stored != self._index_layout_signature)
+        return (self._chunking_enabled or stored is not None) and (stored != current)
 
     def _load_reranker_config(self) -> dict[str, Any]:
         """Load reranker configuration from file or use defaults."""
