@@ -1584,14 +1584,60 @@ class ZoteroSemanticSearch:
                                 )
                                 chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
                                 local_has_fulltext = bool(att_keys)
-                                chroma_date = existing_metadata.get("date_modified", "")
-                                item_date = canonical_data.get("dateModified") or getattr(it, "date_modified", "") or ""
-                                metadata_changed = chroma_date != item_date
+                                current_metadata_item = (
+                                    self._merge_local_fulltext_with_api_metadata(
+                                        it,
+                                        api_metadata_by_key.get(it.key),
+                                        extract_fulltext=False,
+                                    )
+                                )
+                                current_metadata_hash = _embedding_content_hash(
+                                    self._create_document_text(
+                                        current_metadata_item
+                                    ).strip()
+                                )
+                                stored_metadata_hash = existing_metadata.get(
+                                    "embedding_metadata_sha256"
+                                )
+                                legacy_metadata_changed = (
+                                    existing_metadata.get("date_modified", "")
+                                    != (
+                                        canonical_data.get("dateModified")
+                                        or getattr(it, "date_modified", "")
+                                        or ""
+                                    )
+                                )
+                                metadata_payload_changed = (
+                                    existing_metadata.get("fulltext_source")
+                                    not in _SELF_CONTAINED_FULLTEXT_SOURCES
+                                    and (
+                                        stored_metadata_hash
+                                        != current_metadata_hash
+                                        if stored_metadata_hash is not None
+                                        else legacy_metadata_changed
+                                    )
+                                )
                                 stored_signature = existing_metadata.get("attachment_signature")
                                 signature_changed = (
                                     stored_signature is not None and stored_signature != attachment_signature
                                 )
                                 layout_changed = self._index_layout_changed(existing_metadata)
+                                stored_chunk_count = existing_metadata.get("n_chunks")
+                                chunk_group_incomplete = False
+                                get_chunk_ids = getattr(
+                                    chroma_client,
+                                    "get_item_chunk_ids",
+                                    None,
+                                )
+                                if (
+                                    callable(get_chunk_ids)
+                                    and isinstance(stored_chunk_count, int)
+                                    and stored_chunk_count > 0
+                                ):
+                                    chunk_group_incomplete = (
+                                        len(get_chunk_ids(it.key))
+                                        != stored_chunk_count
+                                    )
 
                                 # Skip if extraction previously failed AND neither the item
                                 # nor its attachment set has changed since (handles both a
@@ -1615,9 +1661,10 @@ class ZoteroSemanticSearch:
                                         )
                                     if (
                                         not retry_failed_fulltext
-                                        and not metadata_changed
+                                        and not metadata_payload_changed
                                         and attachment_unchanged
                                         and not layout_changed
+                                        and not chunk_group_incomplete
                                     ):
                                         # Nothing changed since the failure — don't retry
                                         should_extract = False
@@ -1636,16 +1683,23 @@ class ZoteroSemanticSearch:
                                     # Successful legacy records have no signature.
                                     # Reindex them once to establish a baseline.
                                     if (
-                                        metadata_changed
+                                        metadata_payload_changed
                                         or signature_changed
                                         or stored_signature is None
                                         or layout_changed
+                                        or chunk_group_incomplete
                                     ):
                                         updated_existing += 1
                                     else:
                                         should_extract = False
                                         skipped_existing += 1
-                                elif metadata_changed or signature_changed or local_has_fulltext or layout_changed:
+                                elif (
+                                    metadata_payload_changed
+                                    or signature_changed
+                                    or local_has_fulltext
+                                    or layout_changed
+                                    or chunk_group_incomplete
+                                ):
                                     # Metadata changed, attachment content changed, or
                                     # a metadata-only item gained extractable content.
                                     updated_existing += 1

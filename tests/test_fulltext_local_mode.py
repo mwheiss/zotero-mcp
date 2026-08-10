@@ -179,15 +179,24 @@ def test_local_embedding_queue_prefers_best_selected_fulltext_stably():
 
 
 @pytest.mark.parametrize(
-    ("completed_signature", "expected_extractions"),
+    (
+        "completed_signature",
+        "completed_metadata_hash",
+        "completed_source",
+        "expected_extractions",
+    ),
     [
-        ("same-DONE", ["PENDING"]),
-        ("changed-DONE", ["DONE", "PENDING"]),
+        ("same-DONE", "current", "pdf", ["PENDING"]),
+        ("changed-DONE", "current", "pdf", ["DONE", "PENDING"]),
+        ("same-DONE", "stale", "pdf", ["DONE", "PENDING"]),
+        ("same-DONE", "stale", "betterissa-indexing", ["PENDING"]),
     ],
 )
 def test_local_rebuild_resume_extracts_pending_and_changed_items_only(
     monkeypatch,
     completed_signature,
+    completed_metadata_hash,
+    completed_source,
     expected_extractions,
 ):
     marker = "rebuild-pending:test"
@@ -244,12 +253,21 @@ def test_local_rebuild_resume_extracts_pending_and_changed_items_only(
             self.search = search
 
         def get_document_metadata(self, key):
+            metadata_hash = semantic_search._embedding_content_hash(
+                f"Title {key}\n\nAbstract"
+            )
             return {
                 "has_fulltext": "failed" if key == "PENDING" else True,
                 "date_modified": "2026-08-10T00:00:00Z",
                 "attachment_signature": f"same-{key}",
                 "index_layout_signature": self.search._index_layout_signature,
                 "embedding_content_sha256": marker if key == "PENDING" else "current",
+                "embedding_metadata_sha256": (
+                    "stale"
+                    if key == "DONE" and completed_metadata_hash == "stale"
+                    else metadata_hash
+                ),
+                "fulltext_source": completed_source if key == "DONE" else "",
             }
 
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
@@ -293,3 +311,103 @@ def test_local_rebuild_resume_extracts_pending_and_changed_items_only(
 
     assert reader.extract_calls == expected_extractions
     assert [item["key"] for item in items] == expected_extractions
+
+
+def test_local_rebuild_resume_repairs_incomplete_chunk_group(monkeypatch):
+    marker = "rebuild-pending:test"
+    local_item = SimpleNamespace(
+        item_id=1,
+        key="DONE",
+        title="Title DONE",
+        creators="Author, A",
+        fulltext=None,
+        fulltext_source=None,
+        fulltext_selection_priority=None,
+        date_modified="2026-08-10T00:00:00Z",
+    )
+
+    class Reader:
+        last_extraction_details = None
+
+        def __init__(self):
+            self.extract_calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def resolve_library_id(self, *_args):
+            return 0
+
+        def get_all_item_keys(self, _library_id):
+            return {"DONE"}
+
+        def get_items_with_text(self, **_kwargs):
+            return [local_item]
+
+        def get_fulltext_meta_for_item(self, *_args):
+            return [["ATT1", "storage:1.txt", "text/plain"]]
+
+        def get_attachment_signature(self, *_args):
+            return "same-DONE"
+
+        def extract_fulltext_for_item(self, *_args):
+            self.extract_calls.append("DONE")
+            self.last_extraction_details = {"selection_priority": 0}
+            return "Body DONE", "betterissa-indexing"
+
+    class ResumeChroma(FakeChromaClient):
+        def __init__(self, search):
+            super().__init__()
+            self.search = search
+
+        def get_document_metadata(self, _key):
+            return {
+                "has_fulltext": True,
+                "attachment_signature": "same-DONE",
+                "index_layout_signature": self.search._index_layout_signature,
+                "embedding_content_sha256": "current",
+                "embedding_metadata_sha256": semantic_search._embedding_content_hash(
+                    "Title DONE\n\nAbstract"
+                ),
+                "fulltext_source": "betterissa-indexing",
+                "n_chunks": 2,
+            }
+
+        def get_item_chunk_ids(self, _key):
+            return {"DONE#0"}
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
+    chroma = ResumeChroma(search)
+    reader = Reader()
+    monkeypatch.setattr(semantic_search, "LocalZoteroReader", lambda **_kwargs: reader)
+    monkeypatch.setattr(
+        search,
+        "_get_items_from_api",
+        lambda: [
+            {
+                "key": "DONE",
+                "data": {
+                    "key": "DONE",
+                    "itemType": "journalArticle",
+                    "title": "Title DONE",
+                    "abstractNote": "Abstract",
+                    "dateModified": "2026-08-10T00:00:00Z",
+                    "creators": [],
+                },
+            }
+        ],
+    )
+
+    items = search._get_items_from_local_db(
+        extract_fulltext=True,
+        chroma_client=chroma,
+        rebuild_marker=marker,
+    )
+
+    assert reader.extract_calls == ["DONE"]
+    assert [item["key"] for item in items] == ["DONE"]
