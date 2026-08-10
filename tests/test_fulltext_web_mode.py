@@ -1053,6 +1053,18 @@ def test_normal_update_resumes_rebuild_and_repairs_missing_item(
         chroma,
         config_path=config_path,
     )
+    resumed_source_args = {}
+    original_get_items = resumed_search._get_items_from_source
+
+    def capture_resumed_source(**kwargs):
+        resumed_source_args.update(kwargs)
+        return original_get_items(**kwargs)
+
+    monkeypatch.setattr(
+        resumed_search,
+        "_get_items_from_source",
+        capture_resumed_source,
+    )
 
     resumed = resumed_search.update_database()
 
@@ -1062,6 +1074,11 @@ def test_normal_update_resumes_rebuild_and_repairs_missing_item(
     assert chroma._ids == {"A", "B"}
     assert len(chroma.embedded_titles) == 1
     assert "Title B" in chroma.embedded_titles[0]
+    assert resumed_source_args["chroma_client"] is chroma
+    assert resumed_source_args["force_rebuild"] is False
+    assert resumed_source_args["rebuild_marker"].startswith(
+        "rebuild-pending:"
+    )
     state = json.loads(open(config_path).read())["semantic_search"][
         "library_states"
     ][resumed_search.library_identity]

@@ -1300,6 +1300,7 @@ class ZoteroSemanticSearch:
         chroma_client: ChromaClient | None = None,
         force_rebuild: bool = False,
         retry_failed_fulltext: bool = False,
+        rebuild_marker: str | None = None,
         pre_extraction_callback: Callable[[list[dict[str, Any]], set[str], set[str]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """
@@ -1314,6 +1315,8 @@ class ZoteroSemanticSearch:
             local_scan: Use the filtered local corpus without extracting text
             chroma_client: ChromaDB client to check for existing documents (None to skip checks)
             force_rebuild: Whether to force extraction even if item exists
+            rebuild_marker: Saved marker whose items must be resumed even
+                when their Zotero source metadata is unchanged
 
         Returns:
             List of items in API-compatible format
@@ -1332,6 +1335,7 @@ class ZoteroSemanticSearch:
                 chroma_client=chroma_client,
                 force_rebuild=force_rebuild,
                 retry_failed_fulltext=retry_failed_fulltext,
+                rebuild_marker=rebuild_marker,
                 pre_extraction_callback=pre_extraction_callback,
             )
         return self._get_items_from_api(limit)
@@ -1343,6 +1347,7 @@ class ZoteroSemanticSearch:
         chroma_client: ChromaClient | None = None,
         force_rebuild: bool = False,
         retry_failed_fulltext: bool = False,
+        rebuild_marker: str | None = None,
         pre_extraction_callback: Callable[[list[dict[str, Any]], set[str], set[str]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """
@@ -1353,6 +1358,8 @@ class ZoteroSemanticSearch:
             extract_fulltext: Whether to extract fulltext content
             chroma_client: ChromaDB client to check for existing documents (None to skip checks)
             force_rebuild: Whether to force extraction even if item exists
+            rebuild_marker: Saved marker whose items must be resumed even
+                when their Zotero source metadata is unchanged
 
         Returns:
             List of items in API-compatible format
@@ -1570,6 +1577,11 @@ class ZoteroSemanticSearch:
                             # chunk 0 so chunked items are still recognized.
                             existing_metadata = chroma_client.get_document_metadata(it.key)
                             if existing_metadata:
+                                pending_rebuild = (
+                                    isinstance(rebuild_marker, str)
+                                    and existing_metadata.get("embedding_content_sha256")
+                                    == rebuild_marker
+                                )
                                 chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
                                 local_has_fulltext = bool(att_keys)
                                 chroma_date = existing_metadata.get("date_modified", "")
@@ -1585,7 +1597,12 @@ class ZoteroSemanticSearch:
                                 # nor its attachment set has changed since (handles both a
                                 # replaced bad PDF and a PDF newly attached to an item that
                                 # was indexed metadata-only)
-                                if chroma_has_fulltext == "failed":
+                                if pending_rebuild:
+                                    # This item did not finish the prior run.
+                                    # Force it through extraction even when its
+                                    # source metadata itself is unchanged.
+                                    updated_existing += 1
+                                elif chroma_has_fulltext == "failed":
                                     if retry_failed_fulltext:
                                         updated_existing += 1
                                         attachment_unchanged = False
@@ -2810,9 +2827,18 @@ class ZoteroSemanticSearch:
                     limit=limit,
                     fulltext=fulltext,
                     local_scan=bool(configured_collection_keys),
-                    chroma_client=self.chroma_client if not complete_rebuild else None,
-                    force_rebuild=complete_rebuild,
+                    chroma_client=(
+                        self.chroma_client
+                        if not complete_rebuild or resuming_rebuild
+                        else None
+                    ),
+                    force_rebuild=complete_rebuild and not resuming_rebuild,
                     retry_failed_fulltext=retry_failed_fulltext,
+                    rebuild_marker=(
+                        rebuild_state["marker"]
+                        if resuming_rebuild and rebuild_state is not None
+                        else None
+                    ),
                     pre_extraction_callback=(run_local_prephase if use_local_source else None),
                 )
                 # The local-extraction scan may lag behind the API version

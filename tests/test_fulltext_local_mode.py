@@ -176,3 +176,120 @@ def test_local_embedding_queue_prefers_best_selected_fulltext_stably():
         "OCR",
         "PDF",
     ]
+
+
+@pytest.mark.parametrize(
+    ("completed_signature", "expected_extractions"),
+    [
+        ("same-DONE", ["PENDING"]),
+        ("changed-DONE", ["DONE", "PENDING"]),
+    ],
+)
+def test_local_rebuild_resume_extracts_pending_and_changed_items_only(
+    monkeypatch,
+    completed_signature,
+    expected_extractions,
+):
+    marker = "rebuild-pending:test"
+
+    def local_item(item_id, key):
+        return SimpleNamespace(
+            item_id=item_id,
+            key=key,
+            title=f"Title {key}",
+            creators="Author, A",
+            fulltext=None,
+            fulltext_source=None,
+            fulltext_selection_priority=None,
+            date_modified="2026-08-10T00:00:00Z",
+        )
+
+    class Reader:
+        def __init__(self):
+            self.extract_calls = []
+            self.last_extraction_details = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def resolve_library_id(self, *_args):
+            return 0
+
+        def get_all_item_keys(self, _library_id):
+            return {"DONE", "PENDING"}
+
+        def get_items_with_text(self, **_kwargs):
+            return [local_item(1, "DONE"), local_item(2, "PENDING")]
+
+        def get_fulltext_meta_for_item(self, item_id, *_args):
+            return [[f"ATT{item_id}", f"storage:{item_id}.txt", "text/plain"]]
+
+        def get_attachment_signature(self, item_id, *_args):
+            if item_id == 1:
+                return completed_signature
+            return "same-PENDING"
+
+        def extract_fulltext_for_item(self, item_id, *_args):
+            key = "DONE" if item_id == 1 else "PENDING"
+            self.extract_calls.append(key)
+            self.last_extraction_details = {"selection_priority": 0}
+            return f"Body {key}", "betterissa-indexing"
+
+    class ResumeChroma(FakeChromaClient):
+        def __init__(self, search):
+            super().__init__()
+            self.search = search
+
+        def get_document_metadata(self, key):
+            return {
+                "has_fulltext": "failed" if key == "PENDING" else True,
+                "date_modified": "2026-08-10T00:00:00Z",
+                "attachment_signature": f"same-{key}",
+                "index_layout_signature": self.search._index_layout_signature,
+                "embedding_content_sha256": marker if key == "PENDING" else "current",
+            }
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
+    search = semantic_search.ZoteroSemanticSearch(
+        chroma_client=FakeChromaClient()
+    )
+    chroma = ResumeChroma(search)
+    reader = Reader()
+    monkeypatch.setattr(
+        semantic_search,
+        "LocalZoteroReader",
+        lambda **_kwargs: reader,
+    )
+    api_items = [
+        {
+            "key": key,
+            "data": {
+                "key": key,
+                "itemType": "journalArticle",
+                "title": f"Title {key}",
+                "abstractNote": "Abstract",
+                "dateModified": "2026-08-10T00:00:00Z",
+                "creators": [],
+            },
+        }
+        for key in ("DONE", "PENDING")
+    ]
+
+    def api_scan():
+        search._last_api_attachment_keys_by_parent = None
+        return api_items
+
+    monkeypatch.setattr(search, "_get_items_from_api", api_scan)
+
+    items = search._get_items_from_local_db(
+        extract_fulltext=True,
+        chroma_client=chroma,
+        rebuild_marker=marker,
+    )
+
+    assert reader.extract_calls == expected_extractions
+    assert [item["key"] for item in items] == expected_extractions
