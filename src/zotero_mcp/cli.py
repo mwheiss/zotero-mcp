@@ -655,13 +655,6 @@ def main():
         if args.force_rebuild and not _confirm_force_rebuild():
             print("Force rebuild cancelled.")
             sys.exit(0)
-        if args.retry_failed_fulltext and not args.fulltext:
-            print(
-                "Error: --retry-failed-fulltext requires --fulltext.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-
         # Setup Zotero environment variables
         setup_zotero_environment()
 
@@ -695,6 +688,12 @@ def main():
                 args.fulltext,
                 args.force_rebuild,
             )
+            if args.retry_failed_fulltext and not effective_fulltext:
+                print(
+                    "Error: --retry-failed-fulltext requires full-text mode.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
             print("Starting database update...")
             if resuming_rebuild:
                 print("Resuming the saved semantic rebuild contract...")

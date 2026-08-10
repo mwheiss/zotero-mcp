@@ -124,6 +124,41 @@ def test_cli_resume_reports_and_passes_saved_fulltext_mode(
     assert captured["fulltext"] is True
 
 
+def test_cli_resume_allows_retry_failed_fulltext_from_saved_mode(
+    monkeypatch,
+):
+    captured = {}
+
+    class ResumingSearch:
+        chroma_client = SimpleNamespace(embedding_model="openai")
+
+        def get_database_status(self):
+            return {"rebuild_in_progress": {"fulltext": True}}
+
+        def update_database(self, **kwargs):
+            captured.update(kwargs)
+            return {"errors": 0}
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["zotero-mcp", "update-db", "--retry-failed-fulltext"],
+    )
+    monkeypatch.setattr(cli, "setup_zotero_environment", lambda: None)
+    monkeypatch.setattr(cli, "_print_update_stats", lambda _stats: None)
+    monkeypatch.setattr(
+        semantic_search,
+        "create_semantic_search",
+        lambda *_args, **_kwargs: ResumingSearch(),
+    )
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+
+    cli.main()
+
+    assert captured["fulltext"] is True
+    assert captured["retry_failed_fulltext"] is True
+
+
 def test_zotero_mcp_cli_cancellation_happens_before_setup(
     monkeypatch, capsys
 ):
