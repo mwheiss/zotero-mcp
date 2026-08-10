@@ -865,6 +865,72 @@ def test_force_clear_preserves_destructive_rebuild_escape_hatch(
     assert chroma.staged_rebuild_calls == 0
 
 
+@pytest.mark.parametrize("force_clear", [False, True])
+@pytest.mark.parametrize("embedding_concurrency", [1, 2])
+def test_force_rebuild_completes_when_current_item_has_no_semantic_payload(
+    monkeypatch, tmp_path, force_clear, embedding_concurrency
+):
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 100})
+    empty_item = _paper("EMPTY", title="")
+    empty_item["data"]["abstractNote"] = ""
+    zot = FakeZoteroClient()
+    zot.load_scenario([empty_item], library_version=120)
+    chroma = FakeChromaClient(
+        preloaded_ids=["EMPTY"],
+        preloaded_metadata={"EMPTY": {"embedding_content_sha256": "old"}},
+    )
+    chroma.embedding_model = "openai"
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    stats = search.update_database(
+        force_full_rebuild=True,
+        force_clear=force_clear,
+        embedding_concurrency=embedding_concurrency,
+    )
+
+    assert stats["errors"] == 0
+    assert stats["skipped_items"] == 1
+    assert stats["pending_rebuild_items"] == 0
+    assert chroma._ids == set()
+    state = json.loads(open(config_path).read())["semantic_search"][
+        "library_states"
+    ][search.library_identity]
+    assert "rebuild_in_progress" not in state
+
+
+def test_empty_payload_deletion_failure_is_retried_and_completes(
+    monkeypatch, tmp_path
+):
+    class FailOnceChroma(FakeChromaClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.fail_delete = True
+
+        def delete_item_records(self, item_key):
+            if self.fail_delete:
+                self.fail_delete = False
+                raise RuntimeError("temporary delete failure")
+            super().delete_item_records(item_key)
+
+    config_path = _write_config(tmp_path)
+    empty_item = _paper("EMPTY", title="")
+    empty_item["data"]["abstractNote"] = ""
+    zot = FakeZoteroClient()
+    zot.load_scenario([empty_item], library_version=1)
+    chroma = FailOnceChroma(
+        preloaded_ids=["EMPTY"],
+        preloaded_metadata={"EMPTY": {"embedding_content_sha256": "old"}},
+    )
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+    monkeypatch.setattr(semantic_search.time, "sleep", lambda _seconds: None)
+
+    stats = search.update_database(force_full_rebuild=True)
+
+    assert stats["errors"] == 0
+    assert stats["recovered_items"] == 1
+    assert chroma._ids == set()
+
+
 def test_force_clear_requires_force_rebuild(monkeypatch, tmp_path):
     search = _build_search(
         monkeypatch,

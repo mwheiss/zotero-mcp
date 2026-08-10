@@ -268,6 +268,64 @@ def test_update_db_batch_flag_resolution_reads_config(tmp_path, monkeypatch):
     assert non_openai._resolve_openai_batch_enabled(True) is False
 
 
+def test_empty_force_rebuild_batch_commits_an_empty_staged_collection(
+    monkeypatch,
+):
+    class EmptyRebuildClient(FakeChromaClient):
+        def __init__(self):
+            super().__init__()
+            self.events = []
+            self.reconciled = []
+
+        def begin_staged_rebuild(self):
+            self.events.append("begin")
+
+        def commit_staged_rebuild(self):
+            self.events.append("commit")
+
+        def abort_staged_rebuild(self):
+            self.events.append("abort")
+
+        def reconcile_item_records(self, parent, expected_ids):
+            self.reconciled.append((parent, set(expected_ids)))
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(
+        semantic_search.openai_batch,
+        "submit_embedding_batches",
+        lambda **_kwargs: pytest.fail("an empty rebuild must not submit a batch"),
+    )
+    client = EmptyRebuildClient()
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=client)
+    monkeypatch.setattr(search, "_save_update_config", lambda **_kwargs: None)
+
+    stats = search._submit_openai_batch_index(
+        [
+            {
+                "key": "EMPTY",
+                "data": {
+                    "title": "",
+                    "abstractNote": "",
+                    "itemType": "journalArticle",
+                    "creators": [],
+                },
+            }
+        ],
+        force_full_rebuild=True,
+        target_sync_version=1,
+        stats={
+            "processed_items": 0,
+            "skipped_items": 0,
+            "errors": 0,
+        },
+    )
+
+    assert stats["batch_submitted"] is False
+    assert stats["skipped_items"] == 1
+    assert client.events == ["begin", "commit"]
+    assert client.reconciled == [("EMPTY", set())]
+
+
 def test_failed_batch_submit_does_not_report_added_or_updated(monkeypatch):
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
     search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())

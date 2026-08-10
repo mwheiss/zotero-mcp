@@ -22,7 +22,7 @@ import unicodedata
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -98,6 +98,12 @@ class _PreparedIndexBatch:
     metadata_only_metadatas: list[dict[str, Any]]
     item_keys: list[str]
     stats: dict[str, int]
+    empty_item_keys: list[str] = field(default_factory=list)
+
+
+def _prepared_work_item_count(prepared: _PreparedIndexBatch) -> int:
+    """Return items whose successful commit changes or removes index state."""
+    return prepared.stats["processed"] + len(prepared.empty_item_keys)
 
 
 class _MedianETA:
@@ -2373,6 +2379,8 @@ class ZoteroSemanticSearch:
         for doc_id in prepared.expected_ids:
             parent = doc_id.split("#", 1)[0]
             expected_ids_by_item.setdefault(parent, []).append(doc_id)
+        for parent in prepared.empty_item_keys:
+            expected_ids_by_item.setdefault(parent, [])
         expected_ids_by_item = {parent: sorted(ids) for parent, ids in expected_ids_by_item.items()}
         get_item_hashes = getattr(self.chroma_client, "get_item_embedding_hashes", None)
         baseline_embedding_hashes_by_item = (
@@ -2391,6 +2399,13 @@ class ZoteroSemanticSearch:
                     prepared.metadata_only_ids,
                     prepared.metadata_only_metadatas,
                 )
+            if force_full_rebuild:
+                self.chroma_client.begin_staged_rebuild()
+                try:
+                    self.chroma_client.commit_staged_rebuild()
+                except Exception:
+                    self.chroma_client.abort_staged_rebuild()
+                    raise
             stats["batch_submitted"] = False
             stats["metadata_only"] = bool(prepared.metadata_only_ids)
             if hasattr(self.chroma_client, "reconcile_item_records"):
@@ -3155,7 +3170,7 @@ class ZoteroSemanticSearch:
                                     "Concurrent embedding entry failed (%s), saving it for a sequential retry",
                                     error,
                                 )
-                                prepared.stats["errors"] += prepared.stats["processed"]
+                                prepared.stats["errors"] += _prepared_work_item_count(prepared)
                                 failed_concurrent_batches.append(prepared)
 
                             item_duration += time.monotonic() - commit_started
@@ -3178,7 +3193,10 @@ class ZoteroSemanticSearch:
                 if failed_concurrent_batches:
                     import time as _retry_time
 
-                    failed_items = sum(batch.stats["processed"] for batch in failed_concurrent_batches)
+                    failed_items = sum(
+                        _prepared_work_item_count(batch)
+                        for batch in failed_concurrent_batches
+                    )
                     try:
                         sys.stderr.write(f"\n  Retrying {failed_items} failed items sequentially...\n")
                     except Exception:
@@ -3200,12 +3218,12 @@ class ZoteroSemanticSearch:
                             )
                             stats["added_items"] += prepared.stats["added"] - added_before
                             stats["updated_items"] += prepared.stats["updated"] - updated_before
-                            stats["errors"] -= prepared.stats["processed"]
-                            recovered = prepared.stats["processed"]
+                            recovered = _prepared_work_item_count(prepared)
+                            stats["errors"] -= recovered
                             stats["recovered_items"] += recovered
                             retry_ok += recovered
                         except Exception as e:
-                            retry_fail += prepared.stats["processed"]
+                            retry_fail += _prepared_work_item_count(prepared)
                             logger.error(
                                 "Sequential retry failed for batch starting %s: %s",
                                 prepared.ids[0] if prepared.ids else "unknown",
@@ -3223,7 +3241,9 @@ class ZoteroSemanticSearch:
             if _failed_docs:
                 try:
                     _clear_progress_line(sys.stderr)
-                    retry_items = sum(batch.stats["processed"] for batch in _failed_docs)
+                    retry_items = sum(
+                        _prepared_work_item_count(batch) for batch in _failed_docs
+                    )
                     sys.stderr.write(f"\n  Retrying {retry_items} failed items...\n")
                 except Exception:
                     pass
@@ -3250,12 +3270,12 @@ class ZoteroSemanticSearch:
                         )
                         stats["added_items"] += prepared.stats["added"] - added_before
                         stats["updated_items"] += prepared.stats["updated"] - updated_before
-                        recovered = prepared.stats["processed"]
+                        recovered = _prepared_work_item_count(prepared)
                         retry_ok += recovered
                         stats["errors"] -= recovered
                         stats["recovered_items"] += recovered
                     except Exception as e2:
-                        retry_fail += prepared.stats["processed"]
+                        retry_fail += _prepared_work_item_count(prepared)
                         first_id = prepared.ids[0] if prepared.ids else "unknown"
                         logger.error(f"Retry failed for {first_id}: {e2}")
 
@@ -3394,6 +3414,7 @@ class ZoteroSemanticSearch:
         # One entry per *item* successfully prepared (not per chunk) so add/
         # update accounting stays item-granular regardless of chunking.
         item_keys_order: list[str] = []
+        empty_item_keys: list[str] = []
 
         for item in items:
             try:
@@ -3451,6 +3472,7 @@ class ZoteroSemanticSearch:
                             )
                         )
                     if not passages:
+                        empty_item_keys.append(item_key)
                         stats["skipped"] += 1
                         continue
                     n_chunks = len(passages)
@@ -3482,6 +3504,7 @@ class ZoteroSemanticSearch:
                     else:
                         doc_text = metadata_text
                     if not doc_text:
+                        empty_item_keys.append(item_key)
                         stats["skipped"] += 1
                         continue
                     # Truncate to fit the configured embedding model's token limit
@@ -3507,6 +3530,7 @@ class ZoteroSemanticSearch:
             metadata_only_metadatas=[],
             item_keys=item_keys_order,
             stats=stats,
+            empty_item_keys=empty_item_keys,
         )
 
     def _partition_reusable_embeddings(
@@ -3613,27 +3637,36 @@ class ZoteroSemanticSearch:
         metadata_only_ids = prepared.metadata_only_ids
         metadata_only_metadatas = prepared.metadata_only_metadatas
         item_keys_order = prepared.item_keys
+        empty_item_keys = prepared.empty_item_keys
         stats = prepared.stats
 
-        if not documents and not metadata_only_ids:
+        if not documents and not metadata_only_ids and not empty_item_keys:
             return stats
         if embeddings is not None and len(embeddings) != len(documents):
             raise ValueError(f"Embedding provider returned {len(embeddings)} vectors for {len(documents)} documents")
 
-        # Probe both layouts so migrations are classified as updates. Existing
-        # records remain searchable until the replacement upsert succeeds.
+        # Probe both layouts so migrations are classified as updates. Rebuild
+        # records remain searchable while embeddings are computed, then each
+        # item is replaced through the explicit delete-first contract below.
         existing_item_keys: set[str] = set()
         if not force_rebuild:
-            unique_keys = list(dict.fromkeys(item_keys_order))
+            unique_keys = list(
+                dict.fromkeys([*item_keys_order, *empty_item_keys])
+            )
             probe_ids = unique_keys + [f"{key}#0" for key in unique_keys]
             existing_records = self.chroma_client.get_existing_ids(probe_ids)
             existing_item_keys = {record_id.split("#", 1)[0] for record_id in existing_records}
 
-        expected_ids_by_item: dict[str, set[str]] = {key: set() for key in item_keys_order}
+        expected_ids_by_item: dict[str, set[str]] = {
+            key: set() for key in [*item_keys_order, *empty_item_keys]
+        }
         for doc_id in expected_ids:
             expected_ids_by_item.setdefault(doc_id.split("#", 1)[0], set()).add(doc_id)
 
         try:
+            if replace_item_records:
+                for key in empty_item_keys:
+                    self.chroma_client.delete_item_records(key)
             if documents:
                 if replace_item_records:
                     if embeddings is None:
@@ -3676,7 +3709,7 @@ class ZoteroSemanticSearch:
             logger.warning(f"Batch upsert failed ({e}), saving for retry")
             if _failed_docs is not None:
                 _failed_docs.append(prepared)
-                stats["errors"] += stats["processed"]
+                stats["errors"] += _prepared_work_item_count(prepared)
             else:
                 raise
 
