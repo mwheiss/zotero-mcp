@@ -166,6 +166,13 @@ def audit_semantic_database(
         return report
 
     semantic_config = config.get("semantic_search", {})
+    active_rebuild_markers = {
+        rebuild["marker"]
+        for state in semantic_config.get("library_states", {}).values()
+        if isinstance(state, dict)
+        and isinstance((rebuild := state.get("rebuild_in_progress")), dict)
+        and isinstance(rebuild.get("marker"), str)
+    }
     collection_name = semantic_config.get("collection_name", "zotero_library")
     if library is not None:
         from .client import library_identity
@@ -475,17 +482,39 @@ def audit_semantic_database(
         )
         hash_count = 0
         hash_mismatches = 0
+        active_rebuild_hashes = 0
+        orphaned_rebuild_hashes = 0
         for document, expected_hash in hash_rows:
             hash_count += 1
+            if str(expected_hash or "").startswith("rebuild-pending:"):
+                if expected_hash in active_rebuild_markers:
+                    active_rebuild_hashes += 1
+                else:
+                    orphaned_rebuild_hashes += 1
+                continue
             actual_hash = hashlib.sha256(document.encode("utf-8")).hexdigest()
             hash_mismatches += actual_hash != expected_hash
         report.metrics["content_hashes"] = hash_count
+        report.metrics["pending_rebuild_passages"] = active_rebuild_hashes
         report.metrics["legacy_passages_without_hash"] = len(current_ids) - hash_count
-        if hash_mismatches:
+        if orphaned_rebuild_hashes:
+            report.add(
+                "error",
+                "content_hashes",
+                f"Found {orphaned_rebuild_hashes} rebuild marker(s) without a matching active rebuild contract.",
+            )
+        elif hash_mismatches:
             report.add(
                 "error",
                 "content_hashes",
                 f"Found {hash_mismatches} stored content-hash mismatch(es).",
+            )
+        elif active_rebuild_hashes:
+            report.add(
+                "warning",
+                "content_hashes",
+                f"All {hash_count - active_rebuild_hashes} completed content hashes match; "
+                f"{active_rebuild_hashes} passage(s) are intentionally marked for the active rebuild.",
             )
         elif hash_count < len(current_ids):
             report.add(
@@ -674,6 +703,7 @@ def format_health_report(report: DatabaseHealthReport) -> str:
             "passages": "Indexed passages",
             "embedding_dimension": "Embedding dimension",
             "content_hashes": "Verified content hashes",
+            "pending_rebuild_passages": "Passages pending rebuild",
             "legacy_passages_without_hash": "Legacy passages without hashes",
             "items_with_fulltext_errors": "Items with full-text errors",
             "hnsw_replayed_operations": "Queued HNSW operations",

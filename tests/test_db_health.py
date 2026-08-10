@@ -25,19 +25,25 @@ def _isolate_health_tests_from_live_update_lock(monkeypatch):
     )
 
 
-def _create_fixture(tmp_path, *, bad_hash=False, queue_vector=True):
+def _create_fixture(
+    tmp_path,
+    *,
+    bad_hash=False,
+    queue_vector=True,
+    rebuild_marker=None,
+    save_rebuild_state=True,
+):
     persist_directory = tmp_path / "chroma_db"
     persist_directory.mkdir()
     config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "semantic_search": {
-                    "collection_name": "zotero_library",
-                }
+    semantic_config = {"collection_name": "zotero_library"}
+    if rebuild_marker and save_rebuild_state:
+        semantic_config["library_states"] = {
+            "user:0": {
+                "rebuild_in_progress": {"marker": rebuild_marker}
             }
-        )
-    )
+        }
+    config_path.write_text(json.dumps({"semantic_search": semantic_config}))
     database_path = persist_directory / "chroma.sqlite3"
     connection = sqlite3.connect(database_path)
     connection.executescript(
@@ -105,6 +111,8 @@ def _create_fixture(tmp_path, *, bad_hash=False, queue_vector=True):
             (row_id, metadata_segment, record_id, b"1"),
         )
         content_hash = hashlib.sha256(document.encode()).hexdigest()
+        if rebuild_marker and record_id == "NEW#0":
+            content_hash = rebuild_marker
         if bad_hash and record_id == "NEW#0":
             content_hash = "not-the-document-hash"
         connection.executemany(
@@ -197,6 +205,48 @@ def test_health_audit_detects_hash_mismatch(tmp_path):
 
     assert report.healthy is False
     assert _finding(report, "content_hashes").level == "error"
+
+
+def test_health_audit_accepts_hashes_invalidated_by_active_rebuild(tmp_path):
+    marker = "rebuild-pending:test-run"
+    config_path, persist_directory = _create_fixture(
+        tmp_path,
+        rebuild_marker=marker,
+    )
+
+    report = db_health.audit_semantic_database(
+        config_path,
+        persist_directory=persist_directory,
+        compare_zotero=False,
+        full_integrity=False,
+    )
+
+    assert report.healthy is True
+    assert report.metrics["pending_rebuild_passages"] == 1
+    assert _finding(report, "content_hashes").level == "warning"
+    assert "active rebuild" in _finding(report, "content_hashes").detail
+
+
+def test_health_audit_rejects_orphaned_rebuild_hash_marker(tmp_path):
+    marker = "rebuild-pending:orphaned"
+    config_path, persist_directory = _create_fixture(
+        tmp_path,
+        rebuild_marker=marker,
+        save_rebuild_state=False,
+    )
+
+    report = db_health.audit_semantic_database(
+        config_path,
+        persist_directory=persist_directory,
+        compare_zotero=False,
+        full_integrity=False,
+    )
+
+    assert report.healthy is False
+    assert _finding(report, "content_hashes").level == "error"
+    assert "without a matching active rebuild" in _finding(
+        report, "content_hashes"
+    ).detail
 
 
 def test_health_audit_detects_missing_replay_vector(tmp_path):
