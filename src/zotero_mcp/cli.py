@@ -30,6 +30,19 @@ def _confirm_force_rebuild() -> bool:
     return response.strip().lower() in {"y", "yes"}
 
 
+def _resolve_update_fulltext_mode(search, requested: bool, force_rebuild: bool) -> tuple[bool, bool]:
+    """Return the effective CLI mode and whether it comes from a saved rebuild."""
+    if force_rebuild:
+        return requested, False
+    try:
+        rebuild = search.get_database_status().get("rebuild_in_progress")
+    except Exception:
+        rebuild = None
+    if isinstance(rebuild, dict) and isinstance(rebuild.get("fulltext"), bool):
+        return rebuild["fulltext"], True
+    return requested, False
+
+
 def obfuscate_sensitive_value(value, keep_chars=4):
     """Obfuscate sensitive values by showing only the first few characters."""
     if not value or not isinstance(value, str):
@@ -677,8 +690,15 @@ def main():
                 print("Error: --openai-batch requires ZOTERO_EMBEDDING_MODEL=openai", file=sys.stderr)
                 sys.exit(1)
 
+            effective_fulltext, resuming_rebuild = _resolve_update_fulltext_mode(
+                search,
+                args.fulltext,
+                args.force_rebuild,
+            )
             print("Starting database update...")
-            if args.fulltext:
+            if resuming_rebuild:
+                print("Resuming the saved semantic rebuild contract...")
+            if effective_fulltext:
                 from zotero_mcp.utils import is_local_mode
                 if not is_local_mode():
                     print(
@@ -695,7 +715,7 @@ def main():
                 force_full_rebuild=args.force_rebuild,
                 force_clear=args.force_clear,
                 limit=args.limit,
-                fulltext=args.fulltext,
+                fulltext=effective_fulltext,
                 use_openai_batch=args.openai_batch,
                 embedding_concurrency=args.embedding_concurrency,
                 retry_failed_fulltext=args.retry_failed_fulltext,

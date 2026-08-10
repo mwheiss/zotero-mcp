@@ -434,7 +434,10 @@ def cmd_db(args):
 
     from pathlib import Path
     setup_zotero_environment()
-    from zotero_mcp.cli import _save_zotero_db_path_to_config
+    from zotero_mcp.cli import (
+        _resolve_update_fulltext_mode,
+        _save_zotero_db_path_to_config,
+    )
     from zotero_mcp.semantic_search import create_semantic_search
 
     config_path_arg = getattr(args, "config_path", None)
@@ -455,7 +458,11 @@ def cmd_db(args):
         if getattr(args, "openai_batch", None) is True and search.chroma_client.embedding_model != "openai":
             print("Error: --openai-batch requires ZOTERO_EMBEDDING_MODEL=openai", file=sys.stderr)
             sys.exit(1)
-        fulltext = getattr(args, "fulltext", False)
+        fulltext, _resuming_rebuild = _resolve_update_fulltext_mode(
+            search,
+            getattr(args, "fulltext", False),
+            args.force_rebuild,
+        )
         if fulltext:
             from zotero_mcp.utils import is_local_mode
             if not is_local_mode():

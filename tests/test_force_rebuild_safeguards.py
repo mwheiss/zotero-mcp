@@ -54,6 +54,76 @@ def test_cli_force_rebuild_confirmation_denies_eof(monkeypatch):
     assert cli._confirm_force_rebuild() is False
 
 
+@pytest.mark.parametrize("saved_fulltext", [False, True])
+def test_cli_uses_saved_fulltext_mode_when_resuming(saved_fulltext):
+    search = SimpleNamespace(
+        get_database_status=lambda: {
+            "rebuild_in_progress": {"fulltext": saved_fulltext}
+        }
+    )
+
+    effective, resuming = cli._resolve_update_fulltext_mode(
+        search,
+        requested=not saved_fulltext,
+        force_rebuild=False,
+    )
+
+    assert effective is saved_fulltext
+    assert resuming is True
+
+
+def test_cli_new_force_rebuild_uses_explicit_fulltext_mode():
+    search = SimpleNamespace(
+        get_database_status=lambda: {
+            "rebuild_in_progress": {"fulltext": True}
+        }
+    )
+
+    effective, resuming = cli._resolve_update_fulltext_mode(
+        search,
+        requested=False,
+        force_rebuild=True,
+    )
+
+    assert effective is False
+    assert resuming is False
+
+
+def test_cli_resume_reports_and_passes_saved_fulltext_mode(
+    monkeypatch,
+    capsys,
+):
+    captured = {}
+
+    class ResumingSearch:
+        chroma_client = SimpleNamespace(embedding_model="openai")
+
+        def get_database_status(self):
+            return {"rebuild_in_progress": {"fulltext": True}}
+
+        def update_database(self, **kwargs):
+            captured.update(kwargs)
+            return {"errors": 0}
+
+    monkeypatch.setattr(sys, "argv", ["zotero-mcp", "update-db"])
+    monkeypatch.setattr(cli, "setup_zotero_environment", lambda: None)
+    monkeypatch.setattr(cli, "_print_update_stats", lambda _stats: None)
+    monkeypatch.setattr(
+        semantic_search,
+        "create_semantic_search",
+        lambda *_args, **_kwargs: ResumingSearch(),
+    )
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+
+    cli.main()
+
+    output = capsys.readouterr().out
+    assert "Resuming the saved semantic rebuild contract" in output
+    assert "Extracting full-text content" in output
+    assert "full text disabled" not in output
+    assert captured["fulltext"] is True
+
+
 def test_zotero_mcp_cli_cancellation_happens_before_setup(
     monkeypatch, capsys
 ):
