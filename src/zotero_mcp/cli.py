@@ -19,7 +19,7 @@ from pathlib import Path
 def _confirm_force_rebuild() -> bool:
     """Require an explicit interactive confirmation for a full rebuild."""
     print(
-        "WARNING: --force-rebuild discards and re-embeds the entire semantic "
+        "WARNING: --force-rebuild re-embeds the entire semantic "
         "search index.\nThis can take hours and may incur substantial API costs.",
         file=sys.stderr,
     )
@@ -226,6 +226,10 @@ def _print_update_stats(stats: dict) -> None:
     _print_orphan_cleanup_stats(stats)
     print(f"- Skipped: {stats.get('skipped_items', 0)}")
     print(f"- Errors: {stats.get('errors', 0)}")
+    if stats.get("rebuild_in_progress"):
+        if stats.get("pending_rebuild_items"):
+            print(f"- Items still pending rebuild: {stats['pending_rebuild_items']}")
+        print("- Resume with: zotero-mcp update-db")
     print(f"- Duration: {stats.get('duration', 'Unknown')}")
     if stats.get("batch_submitted"):
         print(f"- Batch run: {stats.get('batch_run_id')}")
@@ -377,13 +381,13 @@ def main():
     # Update database command
     update_db_parser = subparsers.add_parser("update-db", help="Update semantic search database")
     update_db_parser.add_argument("--force-rebuild", action="store_true",
-                                 help="Build and activate a complete replacement index")
+                                 help="Re-embed every item with resumable item-by-item replacement")
     update_db_parser.add_argument(
         "--force-clear",
         action="store_true",
         help=(
-            "Clear the live index before a forced rebuild instead of staging "
-            "the replacement (requires --force-rebuild and realtime embeddings)"
+            "Clear the live index before a forced rebuild "
+            "(requires --force-rebuild and realtime embeddings)"
         ),
     )
     update_db_parser.add_argument("--limit", type=int,
@@ -625,7 +629,7 @@ def main():
     elif args.command == "update-db":
         if args.force_rebuild and args.limit is not None:
             print(
-                "Error: --limit cannot be combined with --force-rebuild.",
+                "Error: --limit cannot be combined with a rebuild.",
                 file=sys.stderr,
             )
             sys.exit(2)
@@ -705,8 +709,8 @@ def main():
 
         except KeyboardInterrupt:
             print(
-                "\nDatabase update stopped cleanly. Completed incremental "
-                "entries were kept; an unfinished staged rebuild was discarded.",
+                "\nDatabase update stopped cleanly. Completed entries were kept; "
+                "run 'zotero-mcp update-db' to continue.",
                 file=sys.stderr,
             )
             sys.exit(130)
@@ -798,6 +802,12 @@ def main():
             print(f"- Last update: {update_config.get('last_update', 'Never')}")
             print(f"- Should update: {status.get('should_update', False)}")
             print(f"- OpenAI Batch API: {'active' if batch_config.get('active') else 'inactive'}")
+            rebuild = status.get("rebuild_in_progress")
+            if rebuild:
+                mode = "full text" if rebuild.get("fulltext") else "metadata only"
+                print(f"- Rebuild in progress: yes ({mode}; ordinary update resumes)")
+            else:
+                print("- Rebuild in progress: no")
 
             if collection_info.get('error'):
                 print(f"\nError: {collection_info['error']}")

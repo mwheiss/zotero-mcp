@@ -142,8 +142,8 @@ PARAMETER_DESCRIPTIONS = {
     "filters": "Exact-match semantic metadata filters as an object or JSON object string.",
     "if_exists": "Existing-item policy: reuse, merge, duplicate, or legacy aliases skip/file.",
     "attach_mode": "Attachment policy; see the tool description for supported modes.",
-    "force_rebuild": "Request a complete replacement semantic index; requires explicit confirmation.",
-    "force_clear": "Clear the live index before a confirmed force rebuild instead of staged replacement.",
+    "force_rebuild": "Re-embed the complete semantic index with resumable item replacement; requires explicit confirmation.",
+    "force_clear": "Clear the live index before a confirmed force rebuild.",
     "confirmation": "Exact user-provided confirmation required by a destructive safeguard.",
 }
 

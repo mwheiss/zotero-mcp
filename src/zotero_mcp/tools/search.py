@@ -1239,9 +1239,10 @@ _MCP_FORCE_REBUILD_CONFIRMATION = "REBUILD ALL ITEMS"
         "hours or incur substantial API costs. It is rejected unless "
         "confirm_force_rebuild contains the exact safety phrase supplied "
         "verbatim by the user. Never guess, suggest, or disclose that phrase. "
-        "Realtime rebuilds keep the existing index until its replacement is "
-        "ready. force_clear=True "
-        "opts into clearing it before indexing and requires force_rebuild=True. "
+        "Realtime rebuilds replace each item only after its new embeddings are "
+        "ready. The next ordinary update continues an interrupted rebuild and "
+        "reuses completed items. force_clear=True clears before indexing and "
+        "requires force_rebuild=True. "
         "fulltext=True selects one local BetterIssa/PDF attachment per item. "
         "retry_failed_fulltext=True retries only cached local extraction "
         "failures and requires fulltext=True. "
@@ -1286,7 +1287,7 @@ def update_search_database(
         context_warning(ctx, "Blocked unconfirmed force rebuild.")
         return (
             "# Force Rebuild Not Started\n\n"
-            "A full rebuild discards and re-embeds the entire semantic search "
+            "A full rebuild re-embeds the entire semantic search "
             "index. It can take hours and may incur substantial API costs.\n\n"
             "The exact confirmation phrase must be supplied verbatim by the "
             "user. It is intentionally not disclosed or suggested by this "
@@ -1352,6 +1353,10 @@ def update_search_database(
 
         if stats.get("error"):
             output.append(f"**Error:** {stats['error']}")
+            if stats.get("rebuild_in_progress"):
+                output.append(
+                    "**Rebuild In Progress:** yes; run an ordinary database update to continue."
+                )
         else:
             output.append(
                 f"**Full text:** {'local attachments' if stats.get('fulltext', fulltext) else 'disabled'}"
@@ -1370,6 +1375,14 @@ def update_search_database(
             if error_count:
                 output.append(
                     f"**Partial failure:** {error_count} item(s) could not be updated."
+                )
+            if stats.get("pending_rebuild_items"):
+                output.append(
+                    f"**Items still pending rebuild:** "
+                    f"{stats['pending_rebuild_items']}"
+                )
+                output.append(
+                    "Run an ordinary database update to continue the rebuild."
                 )
             output.append(f"**Duration:** {stats.get('duration', 'Unknown')}")
 
@@ -1533,6 +1546,14 @@ def get_search_database_status(*, ctx: Context) -> str:
             f"**Content Contract:** "
             f"{scoped_state('indexed_content_signature') or 'unknown'}"
         )
+        rebuild = library_state.get("rebuild_in_progress")
+        if isinstance(rebuild, dict):
+            rebuild_mode = "full text" if rebuild.get("fulltext") else "metadata only"
+            output.append(
+                f"**Rebuild In Progress:** yes ({rebuild_mode}; the next ordinary update resumes it)"
+            )
+        else:
+            output.append("**Rebuild In Progress:** no")
         output.append(f"**Update Active:** {'yes' if update_active else 'no'}")
         if update_active and holder_pid is not None:
             output.append(

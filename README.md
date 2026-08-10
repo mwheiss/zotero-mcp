@@ -211,8 +211,8 @@ zotero-mcp update-db --fulltext
 # Use your custom zotero.sqlite path
 zotero-mcp update-db --fulltext --db-path "/Your_custom_path/zotero.sqlite"
 
-# If you have embedding conflicts or changed models, force a rebuild
-zotero-mcp update-db --force-rebuild
+# If the embedding model changed, clear and rebuild with realtime embeddings
+zotero-mcp update-db --force-rebuild --force-clear --no-openai-batch
 
 # Destructive alternative: clear the live index before a realtime rebuild
 zotero-mcp update-db --force-rebuild --force-clear --no-openai-batch
@@ -446,7 +446,7 @@ zotero-mcp openai-batch-status             # Check latest OpenAI embedding batch
 zotero-mcp openai-batch-import             # Import completed OpenAI batch embeddings
 zotero-mcp update-db --fulltext            # Add one preferred local attachment per item
 zotero-mcp update-db --force-rebuild       # Force complete database rebuild
-zotero-mcp update-db --force-rebuild --force-clear --no-openai-batch # Clear first instead of staging
+zotero-mcp update-db --force-rebuild --force-clear --no-openai-batch # Clear first (required for model changes)
 zotero-mcp update-db --fulltext --force-rebuild  # Rebuild with local attachments
 zotero-mcp update-db --fulltext --db-path "your_path/to/zotero.sqlite" # Customize your Zotero database path
 zotero-mcp db-status                       # Show database status and info
@@ -456,12 +456,13 @@ zotero-mcp version                         # Show current version
 ```
 
 Updates prune removed Zotero items first and refresh changed bibliographic
-metadata immediately. Replacement vectors are written only after encoding
-succeeds, and obsolete chunks are removed after that upsert. Realtime
-`--force-rebuild` runs build a complete staging collection and activate it only
-after success, leaving the current index searchable during long rebuilds.
-`--force-clear` explicitly opts out of staging and invalidates the live index
-before encoding; it requires `--force-rebuild` and realtime embeddings.
+metadata immediately. Ordinary incremental updates write replacement vectors
+before removing obsolete chunks. A realtime `--force-rebuild` invalidates the
+stored content hashes, computes each complete item's new vectors, then replaces
+that item's old records. If interrupted, the next ordinary `update-db` reuses
+finished items and continues the rebuild. `--force-clear` clears the collection
+first and is required when the embedding model or vector dimensions changed; it
+requires `--force-rebuild` and realtime embeddings.
 
 ## ⌨️ CLI Mode (`zotero-cli`)
 
@@ -678,7 +679,7 @@ A 45-point live integration test plan is included at `docs/integration-test-plan
 
 ### Semantic Search Issues
 - **"Missing required environment variables" when running update-db**: Run `zotero-mcp setup` to configure your environment, or the CLI will automatically load settings from your MCP client config (e.g., Claude Desktop)
-- **ChromaDB / stale embedding model errors**: If you changed embedding models and see 404 errors (e.g., `text-embedding-004 is not found`), run `zotero-mcp update-db --force-rebuild` to recreate the collection with your current model. If that doesn't work, delete `~/.config/zotero-mcp/chroma_db/` and rebuild.
+- **ChromaDB / stale embedding model errors**: If you changed embedding models and see 404 errors (e.g., `text-embedding-004 is not found`), run `zotero-mcp update-db --force-rebuild --force-clear --no-openai-batch` to recreate the collection with your current model. If that doesn't work, inspect it with `zotero-mcp db-health` before removing any files.
 - **Database update takes long**: Full-text attachment extraction is opt-in with `--fulltext`. Omit it to index title and abstract only, or use `--limit` for testing: `zotero-mcp update-db --limit 100`
 - **Semantic search returns no results**: Ensure the database is initialized with `zotero-mcp update-db` and check status with `zotero-mcp db-status`
 - **Limited search quality**: Use `zotero-mcp update-db --fulltext` to add the preferred local BetterIssa/PDF attachment to each item's title and abstract.

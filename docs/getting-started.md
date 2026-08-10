@@ -226,9 +226,10 @@ Switching installs or install methods (sometimes to deal with failed installs), 
 zotero-mcp update-db --force-rebuild
 ```
 
-Force rebuilding discards and re-embeds the complete semantic index, can take
-hours, and may incur API cost. The CLI requires interactive confirmation and
-the MCP tool requires an explicit confirmation value supplied by the user.
+Force rebuilding re-embeds the complete semantic index item by item, can take
+hours, and may incur API cost. An interrupted rebuild continues on the next
+ordinary update and reuses finished items. The CLI requires interactive
+confirmation and the MCP tool requires an explicit value supplied by the user.
 Prefer `zotero-mcp db-status` and `zotero_get_search_database_health` before a
 rebuild; ordinary `update-db` runs already prune and reconcile incrementally.
 
