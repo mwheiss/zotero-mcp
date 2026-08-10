@@ -81,6 +81,7 @@ def test_zotero_ft_cache_short_circuits_pdf_extraction(tmp_path):
         "attachment_key": "ABCDEFGH",
         "is_pdf": True,
         "used_zotero_cache": True,
+        "selection_priority": 8,
     }
 
 
@@ -138,6 +139,7 @@ def test_storage_scan_recovers_from_renamed_pdf(tmp_path):
         "attachment_key": "RENAMED1",
         "is_pdf": True,
         "used_zotero_cache": False,
+        "selection_priority": 8,
         "page_count": None,
         "page_cap": 10,
     }

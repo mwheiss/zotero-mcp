@@ -141,6 +141,7 @@ class ZoteroItem:
     creators: str | None = None
     fulltext: str | None = None
     fulltext_source: str | None = None
+    fulltext_selection_priority: int | None = None
     notes: str | None = None
     extra: str | None = None
     date_added: str | None = None
@@ -1144,7 +1145,7 @@ class LocalZoteroReader:
         ]
 
         attempted = set()
-        for source, group in groups:
+        for selection_priority, (source, group) in enumerate(groups):
             for candidate in newest_first(group):
                 if candidate.key in attempted:
                     continue
@@ -1173,6 +1174,7 @@ class LocalZoteroReader:
                             "attachment_key": candidate.key,
                             "is_pdf": True,
                             "used_zotero_cache": True,
+                            "selection_priority": selection_priority,
                         }
                         return cached, "zotero-cache"
                     if not resolved or not resolved.exists():
@@ -1192,6 +1194,7 @@ class LocalZoteroReader:
                         "attachment_key": candidate.key,
                         "is_pdf": is_pdf(candidate),
                         "used_zotero_cache": False,
+                        "selection_priority": selection_priority,
                     }
                     return _EXTRACTION_TIMEOUT, "timeout"
                 if text:
@@ -1202,6 +1205,7 @@ class LocalZoteroReader:
                         "attachment_key": candidate.key,
                         "is_pdf": is_pdf(candidate),
                         "used_zotero_cache": False,
+                        "selection_priority": selection_priority,
                         "page_count": (self._get_pdf_page_count(resolved) if is_pdf(candidate) and resolved else None),
                         "page_cap": (self._effective_pdf_max_pages() if is_pdf(candidate) else None),
                     }
@@ -1528,6 +1532,8 @@ class LocalZoteroReader:
         items = []
 
         for row in cursor:
+            res = self._extract_fulltext_for_item(row["itemID"]) if include_fulltext else None
+            extraction_details = self.last_extraction_details if include_fulltext and res else None
             item = ZoteroItem(
                 item_id=row["itemID"],
                 key=row["key"],
@@ -1537,9 +1543,13 @@ class LocalZoteroReader:
                 title=row["title"],
                 abstract=row["abstract"],
                 creators=row["creators"],
-                fulltext=(res := (self._extract_fulltext_for_item(row["itemID"]) if include_fulltext else None))
-                and res[0],
+                fulltext=res[0] if res else None,
                 fulltext_source=res[1] if include_fulltext and res else None,
+                fulltext_selection_priority=(
+                    extraction_details.get("selection_priority")
+                    if extraction_details is not None
+                    else None
+                ),
                 notes=row["notes"],
                 extra=row["extra"],
                 date_added=row["dateAdded"],

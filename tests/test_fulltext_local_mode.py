@@ -156,3 +156,23 @@ def test_local_fulltext_overlays_complete_api_metadata(monkeypatch):
     assert merged["data"]["attachmentKeys"] == "ATT1,ATT2"
     assert merged["data"]["attachmentSignature"] == "signature-v1"
     assert "fulltext" not in api_item["data"]
+
+
+def test_local_embedding_queue_prefers_best_selected_fulltext_stably():
+    items = [
+        SimpleNamespace(key="PDF", fulltext="pdf", fulltext_selection_priority=8),
+        SimpleNamespace(key="METADATA", fulltext=None, fulltext_selection_priority=None),
+        SimpleNamespace(key="INDEXING_1", fulltext="one", fulltext_selection_priority=0),
+        SimpleNamespace(key="OCR", fulltext="ocr", fulltext_selection_priority=2),
+        SimpleNamespace(key="INDEXING_2", fulltext="two", fulltext_selection_priority=0),
+    ]
+
+    ordered = semantic_search._sort_local_items_by_fulltext_priority(items)
+
+    assert [item.key for item in ordered] == [
+        "METADATA",
+        "INDEXING_1",
+        "INDEXING_2",
+        "OCR",
+        "PDF",
+    ]

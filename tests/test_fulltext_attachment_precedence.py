@@ -292,12 +292,12 @@ def test_betterissa_fixed_artifact_fallback_order(tmp_path):
         ),
     }
     expected = [
-        ({"semantic", "ocr", "reading", "pdf"}, "semantic text", "betterissa-semantic"),
-        ({"ocr", "reading", "pdf"}, "advanced OCR text", "betterissa-ocr"),
-        ({"reading", "pdf"}, "reading view text", "betterissa-reading-view"),
-        ({"pdf"}, "Zotero PDF cache", "zotero-cache"),
+        ({"semantic", "ocr", "reading", "pdf"}, "semantic text", "betterissa-semantic", 1),
+        ({"ocr", "reading", "pdf"}, "advanced OCR text", "betterissa-ocr", 2),
+        ({"reading", "pdf"}, "reading view text", "betterissa-reading-view", 3),
+        ({"pdf"}, "Zotero PDF cache", "zotero-cache", 8),
     ]
-    for included, expected_text, expected_source in expected:
+    for included, expected_text, expected_source, expected_priority in expected:
         attachments = []
         paths = {}
         metadata = {}
@@ -319,6 +319,7 @@ def test_betterissa_fixed_artifact_fallback_order(tmp_path):
 
         assert expected_text in text
         assert source == expected_source
+        assert reader.last_extraction_details["selection_priority"] == expected_priority
 
 
 def test_invalid_betterissa_semantic_document_falls_back(tmp_path):
@@ -405,34 +406,38 @@ def test_betterissa_workflow_artifacts_never_reach_generic_fallback(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("included_keys", "expected_text", "expected_source"),
+    ("included_keys", "expected_text", "expected_source", "expected_priority"),
     [
         (
             {"tei", "fulltext", "ocr", "full_text_pdf", "pdf", "other"},
             "Semantic abstract text.",
             "grobid-tei",
+            4,
         ),
         (
             {"fulltext", "ocr", "full_text_pdf", "pdf", "other"},
             "named fulltext",
             "fulltext",
+            5,
         ),
         (
             {"ocr", "full_text_pdf", "pdf", "other"},
             "ocr pdf",
             "ocr-pdf",
+            6,
         ),
         (
             {"full_text_pdf", "pdf", "other"},
             "full text pdf",
             "pdf",
+            7,
         ),
-        ({"pdf", "other"}, "generic pdf", "pdf"),
-        ({"other"}, "generic text", "file"),
+        ({"pdf", "other"}, "generic pdf", "pdf", 8),
+        ({"other"}, "generic text", "file", 9),
     ],
 )
 def test_requested_attachment_precedence(
-    tmp_path, included_keys, expected_text, expected_source
+    tmp_path, included_keys, expected_text, expected_source, expected_priority
 ):
     files = {
         "tei": ("BetterIssa-GROBID-TEI.xml", "application/xml", TEI),
@@ -457,6 +462,7 @@ def test_requested_attachment_precedence(
 
     assert expected_text in text
     assert source == expected_source
+    assert reader.last_extraction_details["selection_priority"] == expected_priority
 
 
 def test_malformed_or_bodyless_tei_falls_back_to_fulltext(tmp_path):

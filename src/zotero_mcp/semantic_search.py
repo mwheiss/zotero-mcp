@@ -74,6 +74,18 @@ _IMMEDIATE_METADATA_FIELDS = {
 }
 
 
+def _sort_local_items_by_fulltext_priority(items: list[Any]) -> list[Any]:
+    """Queue cheap metadata-only items, then full text from best to worst."""
+
+    def priority(item: Any) -> tuple[int, int | float]:
+        if not getattr(item, "fulltext", None):
+            return (0, 0)
+        value = getattr(item, "fulltext_selection_priority", None)
+        return (1, value if isinstance(value, int) else math.inf)
+
+    return sorted(items, key=priority)
+
+
 @dataclass
 class _PreparedIndexBatch:
     """An embedding batch prepared in memory but not yet written to ChromaDB."""
@@ -1660,6 +1672,7 @@ class ZoteroSemanticSearch:
                                         else:
                                             it.fulltext = text
                                         details = getattr(reader, "last_extraction_details", None) or {}
+                                        it.fulltext_selection_priority = details.get("selection_priority")
                                         page_count = details.get("page_count")
                                         page_cap = details.get("page_cap")
                                         if (
@@ -1748,8 +1761,10 @@ class ZoteroSemanticSearch:
                     except Exception:
                         pass
 
-                    # Replace local_items with filtered list
-                    local_items = items_to_process
+                    # Dispatch the best selected artifacts first. This is a
+                    # stable sort, so Zotero's existing order is preserved
+                    # within each attachment-preference tier.
+                    local_items = _sort_local_items_by_fulltext_priority(items_to_process)
                 else:
                     # Skip fulltext extraction for faster processing
                     for it in local_items:
