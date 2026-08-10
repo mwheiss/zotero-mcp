@@ -30,6 +30,7 @@ class FakeChromaClient:
         self.operation_events = []
         self.metadata_by_key = dict(preloaded_metadata or {})
         self.metadata_updates = []
+        self.documents_by_key = {}
         self._pre_staging_ids = None
 
     def truncate_text(self, text, max_tokens=None):
@@ -57,11 +58,61 @@ class FakeChromaClient:
         self.metadata_updates.append((item_key, dict(updates)))
         return 1
 
+    def get_records(self, ids):
+        return {
+            doc_id: {
+                "document": self.documents_by_key.get(doc_id),
+                "metadata": self.metadata_by_key.get(doc_id, {}),
+            }
+            for doc_id in ids
+            if doc_id in self._ids
+        }
+
+    def update_metadatas(self, ids, metadatas):
+        for doc_id, metadata in zip(ids, metadatas, strict=True):
+            self.metadata_by_key[doc_id] = dict(metadata)
+
+    def get_item_chunk_ids(self, item_key):
+        return {doc_id for doc_id in self._ids if doc_id.startswith(f"{item_key}#")}
+
+    def delete_item_records(self, item_key):
+        ids = self.get_item_chunk_ids(item_key)
+        if item_key in self._ids:
+            ids.add(item_key)
+        if ids:
+            self.delete_documents(sorted(ids))
+
+    def invalidate_embedding_hashes(self, marker):
+        for doc_id in self._ids:
+            metadata = dict(self.metadata_by_key.get(doc_id, {}))
+            metadata["embedding_content_sha256"] = marker
+            self.metadata_by_key[doc_id] = metadata
+        return len(self._ids)
+
+    def get_pending_rebuild_item_keys(self, marker):
+        return {
+            doc_id.split("#", 1)[0]
+            for doc_id in self._ids
+            if self.metadata_by_key.get(doc_id, {}).get(
+                "embedding_content_sha256"
+            )
+            == marker
+        }
+
+    def embed_documents(self, documents):
+        return [[float(index), 1.0] for index, _ in enumerate(documents)]
+
     def upsert_documents(self, documents, metadatas, ids):
         self.operation_events.append("upsert")
         self.added.append((list(documents), list(metadatas), list(ids)))
-        for i in ids:
+        for document, metadata, i in zip(documents, metadatas, ids, strict=True):
             self._ids.add(i)
+            self.documents_by_key[i] = document
+            self.metadata_by_key[i] = dict(metadata)
+
+    def upsert_embeddings(self, documents, metadatas, ids, embeddings):
+        assert len(documents) == len(embeddings)
+        self.upsert_documents(documents, metadatas, ids)
 
     def add_documents(self, documents, metadatas, ids):
         self.upsert_documents(documents, metadatas, ids)
@@ -71,6 +122,8 @@ class FakeChromaClient:
         self.deleted.extend(list(ids))
         for i in ids:
             self._ids.discard(i)
+            self.documents_by_key.pop(i, None)
+            self.metadata_by_key.pop(i, None)
 
     def reset_collection(self):
         self.reset_calls += 1
@@ -767,10 +820,10 @@ def test_content_contract_change_warns_without_automatic_rebuild(
     )
 
 
-def test_update_database_force_rebuild_stages_replacement_after_pruning(
+def test_update_database_force_rebuild_replaces_items_after_pruning(
     monkeypatch, tmp_path
 ):
-    """A force rebuild prunes first, then swaps in a staged full scan."""
+    """A force rebuild prunes first, then replaces finished items in place."""
     config_path = _write_config(tmp_path, extra={"last_sync_version": 100})
     zot = FakeZoteroClient()
     zot.load_scenario([_paper("A"), _paper("B")], library_version=120)
@@ -784,13 +837,15 @@ def test_update_database_force_rebuild_stages_replacement_after_pruning(
     search.update_database(force_full_rebuild=True)
 
     assert chroma.reset_calls == 0
-    assert chroma.staged_rebuild_calls == 1
-    assert chroma.staged_commit_calls == 1
-    assert chroma.operation_events[:3] == [
+    assert chroma.staged_rebuild_calls == 0
+    assert chroma.staged_commit_calls == 0
+    assert chroma.operation_events[:4] == [
         "delete",
         "metadata",
-        "begin_staging",
+        "delete",
+        "upsert",
     ]
+    assert chroma._ids == {"A", "B"}
     # No since-based fetch: full scan used items() not item_versions(since=...)
     assert not any(c[0] == "item_versions" and c[1] is not None for c in zot.calls)
 
@@ -859,9 +914,9 @@ def test_force_rebuild_with_limit_never_mutates_collection(monkeypatch, tmp_path
     assert chroma.staged_rebuild_calls == 0
 
 
-def test_failed_staged_rebuild_keeps_previous_records(monkeypatch, tmp_path):
+def test_failed_in_place_rebuild_is_resumable(monkeypatch, tmp_path):
     class FailingChroma(FakeChromaClient):
-        def upsert_documents(self, documents, metadatas, ids):
+        def upsert_embeddings(self, documents, metadatas, ids, embeddings):
             self.operation_events.append("failed_upsert")
             raise RuntimeError("encoder unavailable")
 
@@ -878,9 +933,98 @@ def test_failed_staged_rebuild_keeps_previous_records(monkeypatch, tmp_path):
 
     assert stats["errors"] == 1
     assert chroma.staged_commit_calls == 0
-    assert chroma.staged_abort_calls == 1
+    assert chroma.staged_abort_calls == 0
+    assert chroma._ids == set()
+    state = json.loads(open(config_path).read())["semantic_search"][
+        "library_states"
+    ][search.library_identity]["rebuild_in_progress"]
+    assert state["phase"] == "active"
+
+
+@pytest.mark.parametrize("force_clear", [False, True])
+def test_normal_update_resumes_rebuild_and_repairs_missing_item(
+    monkeypatch, tmp_path, force_clear
+):
+    class FailSecondItemChroma(FakeChromaClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.fail_second = True
+            self.embedded_titles = []
+
+        def embed_documents(self, documents):
+            self.embedded_titles.extend(documents)
+            return super().embed_documents(documents)
+
+        def upsert_embeddings(self, documents, metadatas, ids, embeddings):
+            if self.fail_second and ids == ["B"]:
+                raise RuntimeError("temporary encoder write failure")
+            super().upsert_embeddings(documents, metadatas, ids, embeddings)
+
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 100})
+    zot = FakeZoteroClient()
+    zot.load_scenario(
+        [_paper("A", title="Title A"), _paper("B", title="Title B")],
+        library_version=120,
+    )
+    chroma = FailSecondItemChroma(
+        preloaded_ids=["A", "B"],
+        preloaded_metadata={"A": {}, "B": {}},
+    )
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    first = search.update_database(
+        force_full_rebuild=True,
+        force_clear=force_clear,
+    )
+
+    assert first["errors"] == 1
     assert chroma._ids == {"A"}
-    assert chroma.metadata_by_key["A"]["title"] == "Paper"
+    chroma.fail_second = False
+    chroma.embedded_titles.clear()
+    resumed_search = _build_search(
+        monkeypatch,
+        zot,
+        chroma,
+        config_path=config_path,
+    )
+
+    resumed = resumed_search.update_database()
+
+    assert resumed["errors"] == 0
+    assert resumed["resumed_rebuild"] is True
+    assert resumed["reused_embeddings"] == 1
+    assert chroma._ids == {"A", "B"}
+    assert len(chroma.embedded_titles) == 1
+    assert "Title B" in chroma.embedded_titles[0]
+    state = json.loads(open(config_path).read())["semantic_search"][
+        "library_states"
+    ][resumed_search.library_identity]
+    assert "rebuild_in_progress" not in state
+    assert chroma.metadata_by_key["A"]["title"] == "Title A"
+
+
+def test_embedding_mismatch_requires_force_clear_before_mutation(
+    monkeypatch, tmp_path
+):
+    config_path = _write_config(tmp_path)
+    zot = FakeZoteroClient()
+    zot.load_scenario([_paper("A")], library_version=1)
+    chroma = FakeChromaClient(
+        preloaded_ids=["A"],
+        preloaded_metadata={"A": {"embedding_content_sha256": "current"}},
+    )
+    chroma._pending_embedding_mismatch = True
+    search = _build_search(monkeypatch, zot, chroma, config_path=config_path)
+
+    stats = search.update_database(force_full_rebuild=True)
+
+    assert "--force-clear" in stats["error"]
+    assert chroma._ids == {"A"}
+    assert chroma.metadata_by_key["A"]["embedding_content_sha256"] == "current"
+    library_state = json.loads(open(config_path).read()).get(
+        "semantic_search", {}
+    ).get("library_states", {}).get(search.library_identity, {})
+    assert "rebuild_in_progress" not in library_state
 
 
 def test_failed_incremental_embedding_keeps_old_record_with_new_metadata(

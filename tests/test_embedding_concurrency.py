@@ -94,6 +94,24 @@ class _ConcurrentChroma:
     def get_all_ids(self):
         return set()
 
+    def invalidate_embedding_hashes(self, _marker):
+        return 0
+
+    def get_pending_rebuild_item_keys(self, _marker):
+        return set()
+
+    def get_records(self, _ids):
+        return {}
+
+    def update_metadatas(self, _ids, _metadatas):
+        pass
+
+    def get_item_chunk_ids(self, _item_key):
+        return set()
+
+    def delete_item_records(self, _item_key):
+        pass
+
     def embed_documents(self, documents):
         with self._lock:
             self.active_embeddings += 1
@@ -128,11 +146,11 @@ class _FailOnceChroma(_ConcurrentChroma):
         super().__init__()
         self.attempts = 0
 
-    def upsert_documents(self, documents, metadatas, ids):
+    def upsert_embeddings(self, documents, metadatas, ids, embeddings):
         self.attempts += 1
         if self.attempts == 1:
             raise RuntimeError("transient write failure")
-        super().upsert_documents(documents, metadatas, ids)
+        super().upsert_embeddings(documents, metadatas, ids, embeddings)
 
 
 def _search(monkeypatch, chroma, items):
@@ -186,9 +204,8 @@ def test_default_update_path_writes_each_entry_immediately(
     stats = search.update_database(force_full_rebuild=True)
 
     assert stats["errors"] == 0
-    assert chroma.sequential_upserts == 2
     assert chroma.upserted_batches == [["ITEM0000"], ["ITEM0001"]]
-    assert chroma.max_active_embeddings == 0
+    assert chroma.max_active_embeddings == 1
     assert "embedding_concurrency" not in stats
     progress = capsys.readouterr().err
     assert "| ETA " in progress

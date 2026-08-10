@@ -1029,6 +1029,52 @@ class ChromaClient:
             raise
 
     @_with_index_lifecycle_lock(exclusive=False)
+    def invalidate_embedding_hashes(self, marker: str) -> int:
+        """Mark every current record for a resumable in-place rebuild."""
+        if not marker.startswith("rebuild-pending:"):
+            raise ValueError("Invalid semantic rebuild marker")
+        self._ensure_live_collection()
+        result = self.collection.get(include=["metadatas"])
+        ids = list(result.get("ids", []))
+        stored_metadatas = result.get("metadatas", []) or []
+        metadatas = []
+        for index, _doc_id in enumerate(ids):
+            metadata = (
+                dict(stored_metadatas[index])
+                if index < len(stored_metadatas)
+                and isinstance(stored_metadatas[index], dict)
+                else {}
+            )
+            metadata["embedding_content_sha256"] = marker
+            metadatas.append(metadata)
+        if not ids:
+            return 0
+        try:
+            max_batch = int(self.client.get_max_batch_size())
+        except Exception:
+            max_batch = 5000
+        for offset in range(0, len(ids), max_batch):
+            self.collection.update(
+                ids=ids[offset : offset + max_batch],
+                metadatas=metadatas[offset : offset + max_batch],
+            )
+        logger.info("Invalidated embedding hashes for %s records", len(ids))
+        return len(ids)
+
+    @_with_index_lifecycle_lock(exclusive=False)
+    def get_pending_rebuild_item_keys(self, marker: str) -> set[str]:
+        """Return parent item keys whose records still carry a rebuild marker."""
+        result = self._collection_for_read().get(
+            where={"embedding_content_sha256": marker},
+            include=[],
+        )
+        return {
+            doc_id.split("#", 1)[0]
+            for doc_id in result.get("ids", [])
+            if doc_id
+        }
+
+    @_with_index_lifecycle_lock(exclusive=False)
     def update_item_metadata(
         self,
         item_key: str,

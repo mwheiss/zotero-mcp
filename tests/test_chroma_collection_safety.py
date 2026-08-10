@@ -247,6 +247,8 @@ def test_chroma_operations_declare_lifecycle_lock_mode():
         "upsert_embeddings",
         "get_records",
         "update_metadatas",
+        "invalidate_embedding_hashes",
+        "get_pending_rebuild_item_keys",
         "update_item_metadata",
         "search",
         "delete_documents",
@@ -277,6 +279,25 @@ def test_chroma_operations_declare_lifecycle_lock_mode():
     for method_name in exclusive:
         method = getattr(chroma_client.ChromaClient, method_name)
         assert method._zotero_mcp_lifecycle_exclusive is True
+
+
+def test_embedding_hash_invalidation_preserves_records_and_tracks_items(
+    tmp_path,
+):
+    client, raw_client = _staging_client(tmp_path)
+    marker = "rebuild-pending:test-run"
+
+    invalidated = client.invalidate_embedding_hashes(marker)
+
+    assert invalidated == 1
+    stored = raw_client.get_collection("zotero_library").get(
+        ids=["OLD"],
+        include=["embeddings", "metadatas"],
+    )
+    assert stored["ids"] == ["OLD"]
+    assert list(stored["embeddings"][0]) == [1.0, 0.0]
+    assert stored["metadatas"][0]["embedding_content_sha256"] == marker
+    assert client.get_pending_rebuild_item_keys(marker) == {"OLD"}
 
 
 def test_aborted_staged_rebuild_leaves_live_collection_untouched(tmp_path):

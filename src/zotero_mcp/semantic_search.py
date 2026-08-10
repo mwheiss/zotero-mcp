@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import unicodedata
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -971,6 +972,104 @@ class ZoteroSemanticSearch:
         except Exception as e:
             logger.warning(f"Error loading indexed_content_signature: {e}")
             return None
+
+    def _load_rebuild_state(self) -> dict[str, Any] | None:
+        """Return the durable contract for an interrupted in-place rebuild."""
+        transient = getattr(self, "_transient_rebuild_state", None)
+        if not self.config_path or not os.path.exists(self.config_path):
+            return dict(transient) if isinstance(transient, dict) else None
+        try:
+            state = self._load_library_state().get("rebuild_in_progress")
+            return dict(state) if isinstance(state, dict) else None
+        except Exception as e:
+            logger.warning("Error loading rebuild state: %s", e)
+            return None
+
+    def _save_rebuild_state(self, state: dict[str, Any] | None) -> None:
+        """Persist or clear the library-scoped in-place rebuild contract."""
+        self._transient_rebuild_state = dict(state) if state is not None else None
+        if not self.config_path:
+            return
+        full_config: dict[str, Any] = {}
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path) as config_file:
+                    full_config = json.load(config_file)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Cannot update unreadable configuration {self.config_path}: {e}"
+                ) from e
+        semantic = full_config.setdefault("semantic_search", {})
+        library, identity, _ = self._library_scope()
+        library_state = semantic.setdefault("library_states", {}).setdefault(
+            identity, {}
+        )
+        library_state["library_id"] = library.get("library_id", "")
+        library_state["library_type"] = library.get("library_type", "user")
+        if state is None:
+            library_state.pop("rebuild_in_progress", None)
+        else:
+            library_state["rebuild_in_progress"] = dict(state)
+        atomic_write_json(self.config_path, full_config, indent=2)
+
+    def _make_rebuild_state(
+        self,
+        *,
+        fulltext: bool,
+        force_clear: bool,
+    ) -> dict[str, Any]:
+        """Create the compatibility contract carried across rebuild resumes."""
+        token = uuid.uuid4().hex
+        embedding_identity = getattr(
+            self.chroma_client,
+            "embedding_identity",
+            getattr(self.chroma_client, "embedding_model", "unknown"),
+        )
+        return {
+            "version": 1,
+            "phase": "preparing",
+            "token": token,
+            "marker": f"rebuild-pending:{token}",
+            "fulltext": fulltext,
+            "force_clear": force_clear,
+            "embedding_identity": embedding_identity,
+            "library_identity": self.library_identity,
+            "index_layout_signature": self._index_layout_signature,
+            "content_signature": _CONTENT_CONTRACT_SIGNATURE,
+        }
+
+    def _validate_rebuild_state(self, state: dict[str, Any]) -> None:
+        """Reject resume under a different vector or content contract."""
+        embedding_identity = getattr(
+            self.chroma_client,
+            "embedding_identity",
+            getattr(self.chroma_client, "embedding_model", "unknown"),
+        )
+        expected = {
+            "version": 1,
+            "embedding_identity": embedding_identity,
+            "library_identity": self.library_identity,
+            "index_layout_signature": self._index_layout_signature,
+            "content_signature": _CONTENT_CONTRACT_SIGNATURE,
+        }
+        mismatched = [
+            key for key, value in expected.items() if state.get(key) != value
+        ]
+        marker = state.get("marker")
+        if not isinstance(marker, str) or not marker.startswith("rebuild-pending:"):
+            mismatched.append("marker")
+        if not isinstance(state.get("fulltext"), bool):
+            mismatched.append("fulltext")
+        if not isinstance(state.get("force_clear"), bool):
+            mismatched.append("force_clear")
+        if state.get("phase") not in {"preparing", "active"}:
+            mismatched.append("phase")
+        if mismatched:
+            raise RuntimeError(
+                "Cannot resume the semantic rebuild because its saved contract "
+                f"differs in: {', '.join(sorted(set(mismatched)))}. Start a new "
+                "explicitly confirmed force rebuild instead."
+            )
 
     def _save_update_config(
         self,
@@ -2373,7 +2472,7 @@ class ZoteroSemanticSearch:
         Args:
             force_full_rebuild: Whether to rebuild the entire database
             force_clear: Clear the live collection before a forced realtime
-                rebuild instead of building its replacement in staging.
+                rebuild instead of replacing items as embeddings complete.
             limit: Limit number of items to process (for testing)
             fulltext: Whether to select and extract one local attachment.
                 False indexes API title and abstract only. None uses the
@@ -2408,8 +2507,8 @@ class ZoteroSemanticSearch:
             "start_time": start_time.isoformat(),
             "duration": None,
         }
-        staged_rebuild_active = False
         interrupt_controller: _UpdateInterruptController | None = None
+        rebuild_state: dict[str, Any] | None = None
 
         # Guard against concurrent rebuilds: the MCP server auto-launches
         # update_database on startup while the user may also run
@@ -2444,6 +2543,20 @@ class ZoteroSemanticSearch:
 
         try:
             self._run_orphan_segment_cleanup(stats)
+            saved_rebuild_state = self._load_rebuild_state()
+            resuming_rebuild = (
+                saved_rebuild_state is not None and not force_full_rebuild
+            )
+            complete_rebuild = force_full_rebuild or resuming_rebuild
+            if resuming_rebuild:
+                self._validate_rebuild_state(saved_rebuild_state)
+                fulltext = bool(saved_rebuild_state["fulltext"])
+                rebuild_state = saved_rebuild_state
+                stats["resumed_rebuild"] = True
+                sys.stderr.write(
+                    "Resuming the interrupted force rebuild; completed items "
+                    "will reuse their current vectors.\n"
+                )
             if fulltext is None:
                 fulltext = self._load_fulltext_setting()
             if not isinstance(fulltext, bool):
@@ -2455,10 +2568,10 @@ class ZoteroSemanticSearch:
             indexed_content_signature = self._load_indexed_content_signature()
             collection_has_items = int(self.chroma_client.get_collection_info().get("count", 0)) > 0
             indexed_fulltext_state = (
-                fulltext if force_full_rebuild or not collection_has_items else indexed_fulltext is True or fulltext
+                fulltext if complete_rebuild or not collection_has_items else indexed_fulltext is True or fulltext
             )
             content_mismatch = (
-                not force_full_rebuild
+                not complete_rebuild
                 and collection_has_items
                 and indexed_content_signature != _CONTENT_CONTRACT_SIGNATURE
             )
@@ -2472,6 +2585,8 @@ class ZoteroSemanticSearch:
                     "force rebuild to migrate the complete index.\n"
                 )
             use_openai_batch = self._resolve_openai_batch_enabled(use_openai_batch)
+            if resuming_rebuild:
+                use_openai_batch = False
             configured_collection_keys = None
             try:
                 if self.config_path and os.path.exists(self.config_path):
@@ -2484,9 +2599,9 @@ class ZoteroSemanticSearch:
             use_local_source = bool(extract_fulltext or configured_collection_keys)
             if force_clear and not force_full_rebuild:
                 raise ValueError("force_clear requires force_full_rebuild")
-            if force_full_rebuild and limit is not None:
+            if complete_rebuild and limit is not None:
                 raise ValueError(
-                    "limit cannot be combined with force_full_rebuild because "
+                    "limit cannot be combined with a complete rebuild because "
                     "a partial scan cannot replace the complete index"
                 )
             if force_clear and use_openai_batch:
@@ -2507,20 +2622,46 @@ class ZoteroSemanticSearch:
                     embedding_concurrency,
                 )
 
-            # Explicit escape hatch for users who prefer the old destructive
-            # behavior. Normal realtime rebuilds are staged below, immediately
-            # before indexing, so extraction cannot invalidate the live index.
-            if force_full_rebuild and force_clear:
-                logger.warning("Force clearing semantic index before rebuild")
-                self.chroma_client.reset_collection()
+            if complete_rebuild and not use_openai_batch:
+                pending_mismatch = bool(
+                    getattr(self.chroma_client, "_pending_embedding_mismatch", False)
+                )
+                rebuild_force_clear = (
+                    bool(rebuild_state["force_clear"])
+                    if rebuild_state is not None
+                    else force_clear
+                )
+                if pending_mismatch and not rebuild_force_clear:
+                    raise RuntimeError(
+                        "The embedding model or collection metric changed. An "
+                        "in-place rebuild cannot mix incompatible vectors; start "
+                        "a new confirmed rebuild with --force-clear."
+                    )
+                if rebuild_state is None:
+                    rebuild_state = self._make_rebuild_state(
+                        fulltext=fulltext,
+                        force_clear=force_clear,
+                    )
+                    self._save_rebuild_state(rebuild_state)
+                if rebuild_state["phase"] == "preparing":
+                    if rebuild_state["force_clear"]:
+                        logger.warning("Force clearing semantic index before rebuild")
+                        self.chroma_client.reset_collection()
+                    else:
+                        invalidated = self.chroma_client.invalidate_embedding_hashes(
+                            rebuild_state["marker"]
+                        )
+                        stats["invalidated_records"] = invalidated
+                    rebuild_state = {**rebuild_state, "phase": "active"}
+                    self._save_rebuild_state(rebuild_state)
 
             # Decide whether to use since-based incremental ingest.
             # Incremental requires: not a forced rebuild, not a local-extraction
             # run (incremental path covers web-API metadata and optionally
             # fulltext only), not a test limit, and a known prior sync version.
-            last_sync_version = self._load_last_sync_version() if not force_full_rebuild else 0
+            last_sync_version = self._load_last_sync_version() if not complete_rebuild else 0
             use_incremental = (
-                not force_full_rebuild and not use_local_source and limit is None and last_sync_version > 0
+                not complete_rebuild and not use_local_source and limit is None and last_sync_version > 0
             )
 
             target_sync_version: int | None = None
@@ -2639,8 +2780,8 @@ class ZoteroSemanticSearch:
                     limit=limit,
                     fulltext=fulltext,
                     local_scan=bool(configured_collection_keys),
-                    chroma_client=self.chroma_client if not force_full_rebuild else None,
-                    force_rebuild=force_full_rebuild,
+                    chroma_client=self.chroma_client if not complete_rebuild else None,
+                    force_rebuild=complete_rebuild,
                     retry_failed_fulltext=retry_failed_fulltext,
                     pre_extraction_callback=(run_local_prephase if use_local_source else None),
                 )
@@ -2658,7 +2799,7 @@ class ZoteroSemanticSearch:
                 # stale, or unverifiable sqlite snapshot.
                 if (
                     use_local_source
-                    and not force_full_rebuild
+                    and not complete_rebuild
                     and limit is None
                     and local_snapshot_complete
                     and self._last_scan_indexable_keys is not None
@@ -2681,7 +2822,7 @@ class ZoteroSemanticSearch:
                 # API full scans (bootstrap, watermark recovery, and similar
                 # non-incremental runs) are authoritative too. Prune before
                 # embedding so removed records never wait behind a long queue.
-                if not use_local_source and not force_full_rebuild and limit is None:
+                if not use_local_source and not complete_rebuild and limit is None:
                     try:
                         deleted = self._delete_missing_index_items(
                             {item.get("key", "") for item in all_items if item.get("key")}
@@ -2696,11 +2837,11 @@ class ZoteroSemanticSearch:
 
                 # A forced scan also has an authoritative corpus view. Prune
                 # genuinely removed items from the live index before any
-                # replacement embeddings are staged. Deferred local items are
+                # replacement embeddings are written. Deferred local items are
                 # retained because the complete indexable-key set includes
                 # them; unverifiable SQLite snapshots never prune.
                 force_prune_keys: set[str] | None = None
-                if force_full_rebuild and not force_clear and limit is None:
+                if complete_rebuild and limit is None:
                     if use_local_source:
                         if (
                             local_snapshot_complete
@@ -2724,7 +2865,7 @@ class ZoteroSemanticSearch:
                         ) from e
 
             preserved_fulltext_items = 0
-            if not extract_fulltext and not force_full_rebuild and all_items:
+            if not extract_fulltext and not complete_rebuild and all_items:
                 (
                     all_items,
                     preserved_fulltext_items,
@@ -2760,14 +2901,13 @@ class ZoteroSemanticSearch:
             logger.info(f"Found {stats['total_items']} items to process")
 
             if (
-                force_full_rebuild
-                and not force_clear
+                complete_rebuild
                 and use_local_source
                 and limit is None
                 and not local_snapshot_complete
             ):
                 message = (
-                    "Cannot stage a complete full-text rebuild because the local "
+                    "Cannot complete a full-text rebuild because the local "
                     "Zotero SQLite snapshot could not be verified as complete. "
                     "The current index was left active; retry after Zotero "
                     "checkpoints its WAL data."
@@ -2775,6 +2915,7 @@ class ZoteroSemanticSearch:
                 logger.warning(message)
                 stats["errors"] += 1
                 stats["error"] = message
+                stats["rebuild_in_progress"] = True
                 end_time = datetime.now()
                 stats["duration"] = str(end_time - start_time)
                 stats["end_time"] = end_time.isoformat()
@@ -2811,18 +2952,6 @@ class ZoteroSemanticSearch:
                 stats["duration"] = str(end_time - start_time)
                 stats["end_time"] = end_time.isoformat()
                 return stats
-
-            if force_full_rebuild and not force_clear:
-                self.chroma_client.begin_staged_rebuild()
-                staged_rebuild_active = True
-                try:
-                    sys.stderr.write(
-                        "\nBuilding the replacement index in staging; the current "
-                        "index remains searchable until the rebuild completes.\n"
-                    )
-                    sys.stderr.flush()
-                except Exception:
-                    pass
 
             # User-friendly progress reporting
             total = len(all_items)
@@ -2883,8 +3012,9 @@ class ZoteroSemanticSearch:
                     item_started = time.monotonic()
                     batch_stats = self._process_item_batch(
                         [item],
-                        force_full_rebuild,
+                        False,
                         _failed_docs,
+                        item_atomic_rebuild=complete_rebuild,
                     )
                     indexing_eta.record(time.monotonic() - item_started)
                     report_item_progress(item)
@@ -2914,7 +3044,8 @@ class ZoteroSemanticSearch:
                             with chroma_access_lock:
                                 prepared = self._partition_reusable_embeddings(
                                     prepared,
-                                    force_rebuild=force_full_rebuild,
+                                    force_rebuild=False,
+                                    item_atomic_rebuild=complete_rebuild,
                                 )
                             if not put_with_backpressure(
                                 work_queue,
@@ -2997,8 +3128,9 @@ class ZoteroSemanticSearch:
                                     with chroma_access_lock:
                                         self._commit_prepared_batch(
                                             prepared,
-                                            force_rebuild=force_full_rebuild,
+                                            force_rebuild=False,
                                             embeddings=embeddings,
+                                            replace_item_records=complete_rebuild,
                                         )
                                 except Exception as e:
                                     error = e
@@ -3047,8 +3179,9 @@ class ZoteroSemanticSearch:
                             updated_before = prepared.stats["updated"]
                             self._commit_prepared_batch(
                                 prepared,
-                                force_rebuild=force_full_rebuild,
+                                force_rebuild=False,
                                 embeddings=embeddings,
+                                replace_item_records=complete_rebuild,
                             )
                             stats["added_items"] += prepared.stats["added"] - added_before
                             stats["updated_items"] += prepared.stats["updated"] - updated_before
@@ -3092,7 +3225,13 @@ class ZoteroSemanticSearch:
                         updated_before = prepared.stats["updated"]
                         self._commit_prepared_batch(
                             prepared,
-                            force_rebuild=force_full_rebuild,
+                            force_rebuild=False,
+                            embeddings=(
+                                self.chroma_client.embed_documents(prepared.documents)
+                                if complete_rebuild and prepared.documents
+                                else None
+                            ),
+                            replace_item_records=complete_rebuild,
                         )
                         stats["added_items"] += prepared.stats["added"] - added_before
                         stats["updated_items"] += prepared.stats["updated"] - updated_before
@@ -3113,19 +3252,29 @@ class ZoteroSemanticSearch:
             # Clear the progress line and show summary
             if stop_pipeline.is_set():
                 raise KeyboardInterrupt
-            if staged_rebuild_active:
-                if stats["errors"] == 0:
-                    self.chroma_client.commit_staged_rebuild()
-                    staged_rebuild_active = False
-                else:
-                    self.chroma_client.abort_staged_rebuild()
-                    staged_rebuild_active = False
-                    try:
-                        sys.stderr.write(
-                            "  Rebuild incomplete; discarded the staged index and left the previous index active.\n"
-                        )
-                    except Exception:
-                        pass
+            if complete_rebuild and rebuild_state is not None:
+                pending_keys = self.chroma_client.get_pending_rebuild_item_keys(
+                    rebuild_state["marker"]
+                )
+                stats["pending_rebuild_items"] = len(pending_keys)
+                if pending_keys and stats["errors"] == 0:
+                    stats["errors"] = len(pending_keys)
+                    stats["error"] = (
+                        f"{len(pending_keys)} item(s) remain marked for rebuild"
+                    )
+                if stats["errors"]:
+                    stats.setdefault(
+                        "error",
+                        "The rebuild is incomplete; a normal update will continue it",
+                    )
+                stats["rebuild_in_progress"] = stats["errors"] != 0
+            if (
+                complete_rebuild
+                and rebuild_state is not None
+                and stats["errors"] == 0
+            ):
+                self._save_rebuild_state(None)
+                rebuild_state = None
 
             try:
                 _clear_progress_line(sys.stderr)
@@ -3155,7 +3304,7 @@ class ZoteroSemanticSearch:
                 if stats["errors"] == 0
                 and limit is None
                 and completed_sync_version is not None
-                and (force_full_rebuild or not collection_has_items or not content_mismatch)
+                and (complete_rebuild or not collection_has_items or not content_mismatch)
                 else None
             )
             self._save_update_config(
@@ -3175,6 +3324,8 @@ class ZoteroSemanticSearch:
             logger.error(f"Error updating database: {e}")
             stats["errors"] += 1
             stats["error"] = str(e)
+            if rebuild_state is not None:
+                stats["rebuild_in_progress"] = True
             end_time = datetime.now()
             stats["duration"] = str(end_time - start_time)
             return stats
@@ -3197,11 +3348,6 @@ class ZoteroSemanticSearch:
                             "Could not clear embedding cancellation: %s",
                             e,
                         )
-            if staged_rebuild_active:
-                try:
-                    self.chroma_client.abort_staged_rebuild()
-                except Exception as e:
-                    logger.warning("Could not discard staged rebuild: %s", e)
             # Release the update flock on every exit path. Paired with the
             # __enter__ call above; the "not acquired" branch releases
             # separately before its early return, so this finally only runs
@@ -3353,6 +3499,7 @@ class ZoteroSemanticSearch:
         prepared: _PreparedIndexBatch,
         *,
         force_rebuild: bool,
+        item_atomic_rebuild: bool = False,
     ) -> _PreparedIndexBatch:
         """Move text-identical existing records to metadata-only updates."""
         if (
@@ -3364,6 +3511,42 @@ class ZoteroSemanticSearch:
             return prepared
 
         existing = self.chroma_client.get_records(prepared.ids)
+        if item_atomic_rebuild:
+            item_keys = list(dict.fromkeys(prepared.item_keys))
+            if len(item_keys) != 1:
+                raise ValueError(
+                    "In-place rebuild batches must contain exactly one Zotero item"
+                )
+            item_key = item_keys[0]
+            current_ids = set()
+            if hasattr(self.chroma_client, "get_item_chunk_ids"):
+                current_ids.update(
+                    self.chroma_client.get_item_chunk_ids(item_key)
+                )
+            current_ids.update(self.chroma_client.get_existing_ids([item_key]))
+            expected_ids = set(prepared.expected_ids)
+            complete = current_ids == expected_ids
+            for doc_id, document, metadata in zip(
+                prepared.ids,
+                prepared.documents,
+                prepared.metadatas,
+                strict=True,
+            ):
+                stored = existing.get(doc_id) or {}
+                stored_metadata = stored.get("metadata") or {}
+                stored_hash = stored_metadata.get("embedding_content_sha256")
+                if stored_hash != metadata["embedding_content_sha256"]:
+                    complete = False
+                    break
+            if complete:
+                prepared.metadata_only_ids.extend(prepared.ids)
+                prepared.metadata_only_metadatas.extend(prepared.metadatas)
+                prepared.stats["reused_embeddings"] += len(prepared.ids)
+                prepared.ids = []
+                prepared.documents = []
+                prepared.metadatas = []
+            return prepared
+
         embed_documents: list[str] = []
         embed_metadatas: list[dict[str, Any]] = []
         embed_ids: list[str] = []
@@ -3377,8 +3560,13 @@ class ZoteroSemanticSearch:
             stored = existing.get(doc_id) or {}
             stored_metadata = stored.get("metadata") or {}
             current_hash = metadata["embedding_content_sha256"]
+            stored_hash = stored_metadata.get("embedding_content_sha256")
             unchanged = (
-                stored_metadata.get("embedding_content_sha256") == current_hash or stored.get("document") == document
+                stored_hash == current_hash
+                or (
+                    not str(stored_hash or "").startswith("rebuild-pending:")
+                    and stored.get("document") == document
+                )
             )
             if unchanged:
                 prepared.metadata_only_ids.append(doc_id)
@@ -3400,6 +3588,7 @@ class ZoteroSemanticSearch:
         force_rebuild: bool = False,
         _failed_docs: list | None = None,
         embeddings: list[list[float]] | None = None,
+        replace_item_records: bool = False,
     ) -> dict[str, int]:
         """Write one prepared batch, optionally using precomputed embeddings."""
         documents = prepared.documents
@@ -3431,6 +3620,17 @@ class ZoteroSemanticSearch:
 
         try:
             if documents:
+                if replace_item_records:
+                    if embeddings is None:
+                        raise ValueError(
+                            "In-place rebuild replacement requires precomputed embeddings"
+                        )
+                    if not hasattr(self.chroma_client, "delete_item_records"):
+                        raise RuntimeError(
+                            "The Chroma client cannot replace complete item records"
+                        )
+                    for key in dict.fromkeys(item_keys_order):
+                        self.chroma_client.delete_item_records(key)
                 if embeddings is None:
                     self.chroma_client.upsert_documents(documents, metadatas, ids)
                 else:
@@ -3472,17 +3672,24 @@ class ZoteroSemanticSearch:
         items: list[dict[str, Any]],
         force_rebuild: bool = False,
         _failed_docs: list | None = None,
+        item_atomic_rebuild: bool = False,
     ) -> dict[str, int]:
         """Prepare, embed, and write a batch through the sequential path."""
         prepared = self._prepare_item_batch(items)
         prepared = self._partition_reusable_embeddings(
             prepared,
             force_rebuild=force_rebuild,
+            item_atomic_rebuild=item_atomic_rebuild,
         )
+        embeddings = None
+        if item_atomic_rebuild and prepared.documents:
+            embeddings = self.chroma_client.embed_documents(prepared.documents)
         return self._commit_prepared_batch(
             prepared,
             force_rebuild=force_rebuild,
             _failed_docs=_failed_docs,
+            embeddings=embeddings,
+            replace_item_records=item_atomic_rebuild,
         )
 
     def get_openai_batch_status(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
@@ -4138,6 +4345,18 @@ class ZoteroSemanticSearch:
     def get_database_status(self) -> dict[str, Any]:
         """Get status information about the semantic search database."""
         collection_info = self.chroma_client.get_collection_info()
+        rebuild_state = self._load_rebuild_state()
+        rebuild_status = None
+        if rebuild_state is not None:
+            rebuild_status = {
+                "phase": rebuild_state.get("phase"),
+                "fulltext": rebuild_state.get("fulltext"),
+                "force_clear": rebuild_state.get("force_clear"),
+                "embedding_identity": rebuild_state.get("embedding_identity"),
+                "index_layout_signature": rebuild_state.get(
+                    "index_layout_signature"
+                ),
+            }
 
         return {
             "collection_info": collection_info,
@@ -4148,6 +4367,7 @@ class ZoteroSemanticSearch:
             },
             "should_update": self.should_update_database(),
             "last_update": self.update_config.get("last_update"),
+            "rebuild_in_progress": rebuild_status,
         }
 
     def delete_item(self, item_key: str) -> bool:
