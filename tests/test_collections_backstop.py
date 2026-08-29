@@ -72,9 +72,13 @@ class _RecordingZotero(FakeZotero):
         # Update the stored item so subsequent reads see the new membership.
         stored = self._created_items.get(key)
         if stored:
+            if item["version"] != stored["version"]:
+                return _FakeResponse(412)
             cols = stored["data"].setdefault("collections", [])
             if collection_key not in cols:
                 cols.append(collection_key)
+            stored["version"] += 1
+            stored["data"]["version"] = stored["version"]
         return _FakeResponse(204)
 
 
@@ -113,6 +117,24 @@ class TestEnsureCollectionMembership:
         )
         assert failed == []
         assert z.addto_calls == [("BBBBBBBB", "KEY0000")]
+
+    def test_multiple_missing_collections_refetches_each_version(self):
+        z = _RecordingZotero(atomic_filing_works=False)
+        z.create_items([{"itemType": "journalArticle", "collections": []}])
+
+        failed = _helpers.ensure_collection_membership(
+            z,
+            "KEY0000",
+            ["AAAAAAAA", "BBBBBBBB", "CCCCCCCC"],
+        )
+
+        assert failed == []
+        assert z.addto_calls == [
+            ("AAAAAAAA", "KEY0000"),
+            ("BBBBBBBB", "KEY0000"),
+            ("CCCCCCCC", "KEY0000"),
+        ]
+        assert z._created_items["KEY0000"]["version"] == 4
 
 
 # ---------------------------------------------------------------------------

@@ -97,23 +97,26 @@ def force_local_mode(monkeypatch):
 
 def test_create_note_against_group_uses_plural_url(monkeypatch, force_local_mode):
     """Switching to a group library must route create_note via /groups/{id}/items."""
-    from zotero_mcp import client as zclient
-
     fake = FakeGroupZotero()
-    monkeypatch.setattr(zclient, "get_zotero_client", lambda: fake)
-    monkeypatch.setattr(zclient, "get_web_zotero_client", lambda: fake)
+    monkeypatch.setattr(
+        "zotero_mcp.tools._helpers._client.get_local_write_zotero_client",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools._helpers._client.get_web_zotero_client",
+        lambda: fake,
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools._helpers._client.get_active_library",
+        lambda: {"library_id": "5910265", "library_type": "group"},
+    )
 
-    # Simulate the runtime override left by zotero_switch_library(..., "group").
-    zclient.set_active_library(library_id="5910265", library_type="group")
-    try:
-        result = server.create_note(
-            item_key="ITEM0001",
-            note_title="t",
-            note_text="body",
-            ctx=DummyContext(),
-        )
-    finally:
-        zclient.clear_active_library()
+    result = server.create_note(
+        item_key="ITEM0001",
+        note_title="t",
+        note_text="body",
+        ctx=DummyContext(),
+    )
 
     assert "Successfully created note" in result, result
     assert fake.create_calls, "create_items was not called"

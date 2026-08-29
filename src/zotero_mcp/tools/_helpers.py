@@ -114,6 +114,8 @@ def _get_write_client(ctx):
     In local mode: read and write through the same Zotero Local API instance.
     The Web API is used only when the running Zotero lacks local write support.
     """
+    if _client.get_current_library().get("library_type") == "feed":
+        raise ValueError("Cannot perform write operations in an RSS feed library")
     if _utils.is_local_mode():
         local_zot = _client.get_local_write_zotero_client()
         if local_zot is not None:
@@ -212,20 +214,25 @@ def ensure_collection_membership(write_zot, item_key: str, coll_keys: list[str],
     """
     if not coll_keys:
         return []
-    try:
-        item = write_zot.item(item_key)
-    except Exception as e:
-        if ctx is not None:
-            context_warning(ctx, f"Could not re-fetch item {item_key} to verify collection membership: {e}")
-        return list(coll_keys)
-    actual = set(item.get("data", {}).get("collections") or [])
     failed: list[str] = []
-    for coll_key in coll_keys:
+    for index, coll_key in enumerate(coll_keys):
+        try:
+            item = write_zot.item(item_key)
+        except Exception as e:
+            if ctx is not None:
+                context_warning(
+                    ctx,
+                    f"Could not re-fetch item {item_key} to verify collection membership: {e}",
+                )
+            failed.extend(key for key in coll_keys[index:] if key not in failed)
+            break
+        actual = set(item.get("data", {}).get("collections") or [])
         if coll_key in actual:
             continue
         try:
-            write_zot.addto_collection(coll_key, item)
-            actual.add(coll_key)
+            response = write_zot.addto_collection(coll_key, item)
+            if not _handle_write_response(response, ctx):
+                failed.append(coll_key)
         except Exception as e:
             failed.append(coll_key)
             if ctx is not None:

@@ -197,6 +197,15 @@ class TestGetWriteClient:
         assert read_zot is write_zot
         assert read_zot is fake
 
+    def test_feed_library_is_read_only(self, monkeypatch):
+        monkeypatch.setattr(
+            "zotero_mcp.client.get_current_library",
+            lambda: {"library_id": "12", "library_type": "feed"},
+        )
+
+        with pytest.raises(ValueError, match="RSS feed"):
+            server._get_write_client(DummyContext())
+
     def test_local_mode_prefers_one_local_write_client(self, monkeypatch):
         local = FakeZotero()
         monkeypatch.setattr("zotero_mcp.utils.is_local_mode", lambda: True)

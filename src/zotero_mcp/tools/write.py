@@ -2715,18 +2715,48 @@ def _build_relation_uri(library_type: str, library_id: str, item_key: str) -> st
     return f"http://zotero.org/{kind}/{library_id}/items/{item_key}"
 
 
-def _relation_exists(rel_list: list, library_id: str, item_key: str) -> bool:
+def _relation_scope(item: dict, zot) -> tuple[str, str, set[str]]:
+    """Return canonical relation type/ID plus accepted legacy endpoint IDs."""
+    library = item.get("library") if isinstance(item, dict) else None
+    library = library if isinstance(library, dict) else {}
+    library_type = str(library.get("type") or zot.library_type)
+    canonical_id = str(library.get("id") or zot.library_id)
+    accepted_ids = {canonical_id, str(zot.library_id)}
+    return library_type, canonical_id, accepted_ids
+
+
+def _relation_ids(library_ids: str | set[str]) -> set[str]:
+    return {str(library_ids)} if isinstance(library_ids, str) else {
+        str(value) for value in library_ids
+    }
+
+
+def _relation_exists(
+    rel_list: list,
+    library_ids: str | set[str],
+    item_key: str,
+) -> bool:
     """Check whether a relation to *item_key* already exists (either URI variant)."""
+    ids = "|".join(
+        re.escape(value) for value in sorted(_relation_ids(library_ids))
+    )
     pattern = re.compile(
-        rf"http://zotero\.org/(?:users|groups)/{re.escape(str(library_id))}/items/{re.escape(item_key)}$"
+        rf"http://zotero\.org/(?:users|groups)/(?:{ids})/items/{re.escape(item_key)}$"
     )
     return any(isinstance(uri, str) and pattern.search(uri) for uri in rel_list)
 
 
-def _find_matching_uri(rel_list: list, library_id: str, item_key: str) -> str | None:
+def _find_matching_uri(
+    rel_list: list,
+    library_ids: str | set[str],
+    item_key: str,
+) -> str | None:
     """Find and return the actual URI string for *item_key* regardless of prefix."""
+    ids = "|".join(
+        re.escape(value) for value in sorted(_relation_ids(library_ids))
+    )
     pattern = re.compile(
-        rf"http://zotero\.org/(?:users|groups)/{re.escape(str(library_id))}/items/{re.escape(item_key)}$"
+        rf"http://zotero\.org/(?:users|groups)/(?:{ids})/items/{re.escape(item_key)}$"
     )
     for uri in rel_list:
         if isinstance(uri, str) and pattern.search(uri):
@@ -2739,7 +2769,11 @@ def _restore_relation_items(write_zot, originals: list[dict], ctx: Context) -> b
     restored = True
     for original in originals:
         try:
-            candidate = copy.deepcopy(original)
+            item_key = original.get("key") or original.get("data", {}).get("key")
+            candidate = write_zot.item(item_key)
+            candidate["data"] = copy.deepcopy(original.get("data", {}))
+            if "version" in candidate:
+                candidate["data"]["version"] = candidate["version"]
             _helpers._strip_unwritable_fields(candidate)
             response = write_zot.update_item(candidate)
             restored = _helpers._handle_write_response(response, ctx) and restored
@@ -2815,8 +2849,13 @@ def add_item_relation(
             relations = {}
 
         # Build the relation URI using the canonical format for the library type
-        library_type = write_zot.library_type
-        library_id = write_zot.library_id
+        library_type, library_id, accepted_library_ids = _relation_scope(
+            item,
+            write_zot,
+        )
+        related_scope = _relation_scope(related_item, write_zot)
+        if related_scope[1] != library_id:
+            return "Error: Relations can only be created within one Zotero library."
         related_uri = _build_relation_uri(library_type, library_id, related_item_key)
 
         # Add the relation to the primary item
@@ -2826,7 +2865,11 @@ def add_item_relation(
             relations[relation_type] = [relations[relation_type]]
 
         # Check if relation already exists (match both URI prefix variants)
-        if _relation_exists(relations[relation_type], library_id, related_item_key):
+        if _relation_exists(
+            relations[relation_type],
+            accepted_library_ids,
+            related_item_key,
+        ):
             return f"Relation already exists: '{item_key}' is already related to '{related_item_key}'."
 
         relations[relation_type].append(related_uri)
@@ -2856,7 +2899,11 @@ def add_item_relation(
             if not isinstance(reverse_relations[relation_type], list):
                 reverse_relations[relation_type] = [reverse_relations[relation_type]]
 
-            if not _relation_exists(reverse_relations[relation_type], library_id, item_key):
+            if not _relation_exists(
+                reverse_relations[relation_type],
+                accepted_library_ids,
+                item_key,
+            ):
                 reverse_relations[relation_type].append(item_uri)
                 related_data["relations"] = reverse_relations
                 _helpers._strip_unwritable_fields(related_item)
@@ -2950,14 +2997,21 @@ def remove_item_relation(
             return f"Item '{item_key}' has no relations of type '{relation_type}'."
 
         # Match any URI variant (users/ or groups/) for this library
-        library_id = write_zot.library_id
+        _library_type, _library_id, accepted_library_ids = _relation_scope(
+            item,
+            write_zot,
+        )
 
         rel_list = relations[relation_type]
         if not isinstance(rel_list, list):
             rel_list = [rel_list]
 
         # Find the matching URI regardless of users/ vs groups/ prefix
-        matched_uri = _find_matching_uri(rel_list, library_id, related_item_key)
+        matched_uri = _find_matching_uri(
+            rel_list,
+            accepted_library_ids,
+            related_item_key,
+        )
         if matched_uri is None:
             return f"Relation not found: '{item_key}' is not related to '{related_item_key}'."
 
@@ -2989,7 +3043,11 @@ def remove_item_relation(
                     if not isinstance(reverse_list, list):
                         reverse_list = [reverse_list]
 
-                    matched_reverse = _find_matching_uri(reverse_list, library_id, item_key)
+                    matched_reverse = _find_matching_uri(
+                        reverse_list,
+                        accepted_library_ids,
+                        item_key,
+                    )
                     if matched_reverse is not None:
                         reverse_list.remove(matched_reverse)
                         if not reverse_list:

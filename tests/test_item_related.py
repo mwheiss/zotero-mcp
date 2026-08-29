@@ -1,5 +1,6 @@
 """Tests for item related/relation functionality."""
 
+import copy
 
 from conftest import DummyContext, FakeZotero, _FakeResponse
 
@@ -10,9 +11,9 @@ from zotero_mcp import server
 # -----------------------------------------------------------------------------
 
 def _make_item(key="ABCD1234", version=10, title="Test Title",
-               relations=None, **kwargs):
+               relations=None, library_id=None, **kwargs):
     """Build a Zotero item dict with optional relations."""
-    return {
+    item = {
         "key": key,
         "version": version,
         "data": {
@@ -26,6 +27,13 @@ def _make_item(key="ABCD1234", version=10, title="Test Title",
             **kwargs
         },
     }
+    if library_id is not None:
+        item["library"] = {
+            "type": "user",
+            "id": library_id,
+            "name": "My Library",
+        }
+    return item
 
 
 class FakeZoteroForRelations(FakeZotero):
@@ -58,6 +66,37 @@ class FailingSecondRelationWrite(FakeZoteroForRelations):
             self.update_calls.append(item)
             return _FakeResponse(500)
         return super().update_item(item, **kwargs)
+
+
+class VersionedFailingReverseWrite(FakeZoteroForRelations):
+    """Enforce Zotero versions and reject the reverse side once."""
+
+    def __init__(self, items=None):
+        super().__init__(items=items)
+        self.write_number = 0
+        self.failed_reverse = False
+
+    def item(self, item_key):
+        return copy.deepcopy(super().item(item_key))
+
+    def update_item(self, item, **kwargs):
+        self.write_number += 1
+        key = item["key"]
+        current = self._items[key]
+        if (
+            item["version"] != current["version"]
+            or item["data"]["version"] != current["version"]
+        ):
+            return _FakeResponse(412)
+        if self.write_number == 2 and not self.failed_reverse:
+            self.failed_reverse = True
+            return _FakeResponse(500)
+        updated = copy.deepcopy(item)
+        updated["version"] = current["version"] + 1
+        updated["data"]["version"] = updated["version"]
+        self._items[key] = updated
+        self.update_calls.append(copy.deepcopy(item))
+        return _FakeResponse(204)
 
 
 # -----------------------------------------------------------------------------
@@ -193,10 +232,52 @@ class TestAddItemRelation:
 
         assert "already related" in result.lower()
 
+    def test_local_endpoint_alias_builds_canonical_user_relation(self, monkeypatch):
+        item1 = _make_item(key="ITEM0001", library_id=20765677)
+        item2 = _make_item(key="ITEM0002", library_id=20765677)
+        fake = FakeZoteroForRelations(
+            items=[item1, item2],
+            library_type="users",
+            library_id="0",
+        )
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client",
+            lambda ctx: (fake, fake),
+        )
+
+        result = server.add_item_relation(
+            item_key="ITEM0001",
+            related_item_key="ITEM0002",
+            ctx=DummyContext(),
+        )
+
+        assert "Successfully added relation" in result
+        relation = fake.update_calls[0]["data"]["relations"]["dc:relation"][0]
+        assert relation == "http://zotero.org/users/20765677/items/ITEM0002"
+
     def test_reverse_failure_rolls_back_both_items(self, monkeypatch):
         item1 = _make_item(key="ITEM0001")
         item2 = _make_item(key="ITEM0002")
         fake = FailingSecondRelationWrite(items=[item1, item2])
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client",
+            lambda ctx: (fake, fake),
+        )
+
+        result = server.add_item_relation(
+            item_key="ITEM0001",
+            related_item_key="ITEM0002",
+            ctx=DummyContext(),
+        )
+
+        assert "restored" in result.lower()
+        assert fake._items["ITEM0001"]["data"]["relations"] == {}
+        assert fake._items["ITEM0002"]["data"]["relations"] == {}
+
+    def test_reverse_failure_rollback_refetches_current_versions(self, monkeypatch):
+        item1 = _make_item(key="ITEM0001")
+        item2 = _make_item(key="ITEM0002")
+        fake = VersionedFailingReverseWrite(items=[item1, item2])
         monkeypatch.setattr(
             "zotero_mcp.tools._helpers._get_write_client",
             lambda ctx: (fake, fake),
@@ -309,3 +390,42 @@ class TestRemoveItemRelation:
         assert "restored" in result.lower()
         assert fake._items["ITEM0001"]["data"]["relations"]["dc:relation"]
         assert fake._items["ITEM0002"]["data"]["relations"]["dc:relation"]
+
+    def test_remove_accepts_legacy_local_user_zero_relation(self, monkeypatch):
+        item1 = _make_item(
+            key="ITEM0001",
+            library_id=20765677,
+            relations={
+                "dc:relation": [
+                    "http://zotero.org/users/0/items/ITEM0002"
+                ]
+            },
+        )
+        item2 = _make_item(
+            key="ITEM0002",
+            library_id=20765677,
+            relations={
+                "dc:relation": [
+                    "http://zotero.org/users/0/items/ITEM0001"
+                ]
+            },
+        )
+        fake = FakeZoteroForRelations(
+            items=[item1, item2],
+            library_type="users",
+            library_id="0",
+        )
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client",
+            lambda ctx: (fake, fake),
+        )
+
+        result = server.remove_item_relation(
+            item_key="ITEM0001",
+            related_item_key="ITEM0002",
+            ctx=DummyContext(),
+        )
+
+        assert "Successfully removed relation" in result
+        assert fake._items["ITEM0001"]["data"]["relations"] == {}
+        assert fake._items["ITEM0002"]["data"]["relations"] == {}
