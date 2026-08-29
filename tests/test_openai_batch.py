@@ -106,6 +106,7 @@ def test_submit_embedding_batches_writes_manifest_and_jsonl(tmp_path):
         model_name="text-embedding-3-small",
         embedding_config={"api_key": "test"},
         config_path=str(tmp_path / "config.json"),
+        source_server_id="local-database",
         metadata_only_records=[
             {"id": "UNCHANGED", "metadata": {"title": "Current title"}},
         ],
@@ -113,6 +114,8 @@ def test_submit_embedding_batches_writes_manifest_and_jsonl(tmp_path):
     )
 
     assert manifest["batches"][0]["batch_id"] == "batch-1"
+    assert manifest["source_server_id"] == "local-database"
+    assert manifest["source_guard_version"] == 2
     assert Path(manifest["manifest_path"]).exists()
     input_rows = openai_batch.read_jsonl(Path(manifest["batches"][0]["input_path"]))
     assert input_rows[0]["url"] == "/v1/embeddings"
@@ -1176,3 +1179,46 @@ def test_batch_source_guard_allows_unrelated_item_change(monkeypatch):
     }
 
     search._validate_openai_batch_source(manifest)
+
+
+def test_batch_source_guard_rejects_different_local_database(monkeypatch):
+    zotero = object()
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: zotero)
+    monkeypatch.setattr(
+        semantic_search,
+        "get_zotero_server_id",
+        lambda _client: "current-database",
+    )
+    search = semantic_search.ZoteroSemanticSearch(
+        chroma_client=FakeChromaClient()
+    )
+
+    with pytest.raises(RuntimeError, match="database changed"):
+        search._validate_openai_batch_source(
+            {
+                "source_server_id": "submitted-database",
+                "source_guard_version": 2,
+                "target_sync_version": 5,
+            }
+        )
+
+
+def test_batch_source_guard_rejects_legacy_manifest_in_local_mode(monkeypatch):
+    zotero = object()
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: zotero)
+    monkeypatch.setattr(
+        semantic_search,
+        "get_zotero_server_id",
+        lambda _client: "current-database",
+    )
+    search = semantic_search.ZoteroSemanticSearch(
+        chroma_client=FakeChromaClient()
+    )
+
+    with pytest.raises(RuntimeError, match="predates Local API"):
+        search._validate_openai_batch_source(
+            {
+                "source_guard_version": 1,
+                "target_sync_version": 5,
+            }
+        )

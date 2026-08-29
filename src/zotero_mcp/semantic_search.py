@@ -45,6 +45,7 @@ from .client import (
     get_current_library,
     get_default_library,
     get_zotero_client,
+    get_zotero_server_id,
     library_identity,
 )
 from .local_db import LocalZoteroReader
@@ -71,6 +72,7 @@ _IMMEDIATE_METADATA_FIELDS = {
     "doi",
     "tags",
     "citation_key",
+    "zotero_server_id",
 }
 
 
@@ -946,6 +948,18 @@ class ZoteroSemanticSearch:
                 semantic = file_config.get("semantic_search", {})
                 _, identity, is_default = self._library_scope()
                 state = semantic.get("library_states", {}).get(identity, {})
+                if is_local_mode():
+                    current_server_id = self._source_server_id()
+                    stored_server_id = state.get(
+                        "zotero_server_id",
+                        semantic.get("zotero_server_id") if is_default else None,
+                    )
+                    if current_server_id and stored_server_id != current_server_id:
+                        logger.warning(
+                            "Discarding the stored Zotero sync watermark because "
+                            "the Local API server identity is new or changed"
+                        )
+                        return 0
                 value = state.get(
                     "last_sync_version",
                     semantic.get("last_sync_version", 0) if is_default else 0,
@@ -954,6 +968,19 @@ class ZoteroSemanticSearch:
         except Exception as e:
             logger.warning(f"Error loading last_sync_version: {e}")
             return 0
+
+    def _source_server_id(self) -> str | None:
+        """Return and cache the Local API database identity for source guards."""
+        cached = getattr(self, "_zotero_server_id", None)
+        if cached:
+            return cached
+        zotero_client = getattr(self, "zotero_client", None)
+        if zotero_client is None:
+            return None
+        server_id = get_zotero_server_id(zotero_client)
+        if server_id:
+            self._zotero_server_id = server_id
+        return server_id
 
     def _load_indexed_fulltext(self) -> bool | None:
         """Return whether the completed index contains maintained full text."""
@@ -1054,6 +1081,7 @@ class ZoteroSemanticSearch:
             "library_identity": self.library_identity,
             "index_layout_signature": self._index_layout_signature,
             "content_signature": _CONTENT_CONTRACT_SIGNATURE,
+            "zotero_server_id": self._source_server_id(),
         }
 
     def _validate_rebuild_state(self, state: dict[str, Any]) -> None:
@@ -1070,6 +1098,8 @@ class ZoteroSemanticSearch:
             "index_layout_signature": self._index_layout_signature,
             "content_signature": _CONTENT_CONTRACT_SIGNATURE,
         }
+        if state.get("zotero_server_id") is not None:
+            expected["zotero_server_id"] = self._source_server_id()
         mismatched = [
             key for key, value in expected.items() if state.get(key) != value
         ]
@@ -1128,6 +1158,11 @@ class ZoteroSemanticSearch:
             state["collection_name"] = collection_name
         state["last_update"] = self.update_config.get("last_update")
         if last_sync_version is not None:
+            source_server_id = self._source_server_id()
+            if source_server_id:
+                state["zotero_server_id"] = source_server_id
+                if is_default:
+                    full_config["semantic_search"]["zotero_server_id"] = source_server_id
             state["last_sync_version"] = int(last_sync_version)
             if is_default:
                 full_config["semantic_search"]["last_sync_version"] = int(last_sync_version)
@@ -1219,6 +1254,7 @@ class ZoteroSemanticSearch:
             "publication": data.get("publicationTitle", ""),
             "url": data.get("url", ""),
             "doi": data.get("DOI", ""),
+            "zotero_server_id": self._source_server_id() or "",
             "embedding_metadata_sha256": _embedding_content_hash(self._create_document_text(item).strip()),
         }
         # If fulltext was extracted (or attempted), mark it so incremental
@@ -2512,6 +2548,7 @@ class ZoteroSemanticSearch:
             config_path=self.config_path,
             force_full_rebuild=force_full_rebuild,
             target_sync_version=target_sync_version,
+            source_server_id=self._source_server_id(),
             fulltext=indexed_fulltext_state,
             content_signature=_CONTENT_CONTRACT_SIGNATURE,
             expected_ids_by_item=expected_ids_by_item,
@@ -3984,6 +4021,18 @@ class ZoteroSemanticSearch:
 
     def _validate_openai_batch_source(self, manifest: dict[str, Any]) -> None:
         """Reject delayed results when their Zotero source items changed."""
+        manifest_server_id = manifest.get("source_server_id")
+        current_server_id = self._source_server_id()
+        if current_server_id and not manifest_server_id:
+            raise RuntimeError(
+                "This OpenAI batch predates Local API server-identity guards; "
+                "discard it and run a new update"
+            )
+        if manifest_server_id and current_server_id != manifest_server_id:
+            raise RuntimeError(
+                "The Zotero Local API database changed after this OpenAI batch "
+                "was submitted; discard the batch and run a new update"
+            )
         if not manifest.get("source_guard_version"):
             logger.warning(
                 "OpenAI batch manifest predates Zotero source-version "

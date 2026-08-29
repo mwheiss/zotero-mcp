@@ -1255,3 +1255,83 @@ def test_load_last_sync_version_reads_int(monkeypatch, tmp_path):
     search = _build_search(monkeypatch, FakeZoteroClient(), FakeChromaClient(),
                            config_path=config_path)
     assert search._load_last_sync_version() == 123
+
+
+def test_local_sync_watermark_is_partitioned_by_server_id(monkeypatch, tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        extra={
+            "last_sync_version": 123,
+            "zotero_server_id": "old-database",
+        },
+    )
+    search = _build_search(
+        monkeypatch,
+        FakeZoteroClient(),
+        FakeChromaClient(),
+        config_path=config_path,
+    )
+    monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
+    monkeypatch.setattr(
+        semantic_search,
+        "get_zotero_server_id",
+        lambda _client: "new-database",
+    )
+
+    assert search._load_last_sync_version() == 0
+
+
+def test_local_sync_watermark_is_reused_for_same_server_id(monkeypatch, tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        extra={
+            "last_sync_version": 123,
+            "zotero_server_id": "same-database",
+        },
+    )
+    search = _build_search(
+        monkeypatch,
+        FakeZoteroClient(),
+        FakeChromaClient(),
+        config_path=config_path,
+    )
+    monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
+    monkeypatch.setattr(
+        semantic_search,
+        "get_zotero_server_id",
+        lambda _client: "same-database",
+    )
+
+    assert search._load_last_sync_version() == 123
+
+
+def test_failed_local_sync_does_not_pair_new_server_id_with_old_watermark(
+    monkeypatch,
+    tmp_path,
+):
+    config_path = _write_config(
+        tmp_path,
+        extra={
+            "last_sync_version": 123,
+            "zotero_server_id": "old-database",
+        },
+    )
+    search = _build_search(
+        monkeypatch,
+        FakeZoteroClient(),
+        FakeChromaClient(),
+        config_path=config_path,
+    )
+    monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
+    monkeypatch.setattr(
+        semantic_search,
+        "get_zotero_server_id",
+        lambda _client: "new-database",
+    )
+
+    search._save_update_config(last_sync_version=None)
+
+    with open(config_path) as config_file:
+        saved = json.load(config_file)["semantic_search"]
+    assert saved["last_sync_version"] == 123
+    assert saved["zotero_server_id"] == "old-database"
