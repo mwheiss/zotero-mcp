@@ -19,6 +19,12 @@ from markitdown import MarkItDown
 from pyzotero import zotero
 
 from zotero_mcp._file_lock import acquire_file_lock, release_file_lock
+from zotero_mcp.local_api import (
+    LocalApiHttpClient,
+    LocalApiWriteUnavailableError,
+    LocalWriteZotero,
+    local_api_endpoint,
+)
 from zotero_mcp.utils import format_creators
 from zotero_mcp.webdav import (
     WebDAVNotConfiguredError,
@@ -285,7 +291,7 @@ def get_current_library() -> dict[str, str]:
     return get_active_library() or get_default_library()
 
 
-def _make_local_http_client() -> httpx.Client:
+def _make_local_http_client(*, authorize_writes: bool = False) -> httpx.Client:
     """Return an httpx.Client pinned to HTTP/1.1 for the local Zotero server.
 
     Zotero 8's local server (port 23119) only speaks HTTP/1.0. httpx defaults
@@ -294,10 +300,13 @@ def _make_local_http_client() -> httpx.Client:
     (#160). Forcing http1=True / http2=False on the transport keeps requests
     on HTTP/1.1 and the local API answers normally.
     """
-    return httpx.Client(
-        transport=httpx.HTTPTransport(http1=True, http2=False),
-        follow_redirects=True,
-    )
+    return LocalApiHttpClient(authorize_writes=authorize_writes)
+
+
+def _configure_local_endpoint(client: zotero.Zotero) -> zotero.Zotero:
+    """Point pyzotero at the configured local port."""
+    client.endpoint = local_api_endpoint()
+    return client
 
 
 @dataclass
@@ -350,15 +359,19 @@ def get_zotero_client() -> zotero.Zotero:
             "or use ZOTERO_LOCAL=true for local Zotero instance."
         )
 
-    return _SerializedCallProxy(
-        zotero.Zotero(
+    raw_client = zotero.Zotero(
             library_id=library_id,
             library_type=library_type,
-            api_key=api_key,
+            # zotero.org keys and Local API keys are unrelated. Never send a
+            # cloud credential to localhost; authenticated local writes obtain
+            # their own key through /api/local/authorize.
+            api_key=None if local else api_key,
             local=local,
             client=_make_local_http_client() if local else None,
         )
-    )
+    if local:
+        _configure_local_endpoint(raw_client)
+    return _SerializedCallProxy(raw_client)
 
 
 def get_local_zotero_client() -> zotero.Zotero | None:
@@ -378,7 +391,7 @@ def get_local_zotero_client() -> zotero.Zotero | None:
         library_type = current.get("library_type") or "user"
         # HTTP/1.1-only transport for compatibility with Zotero 8's local
         # server (#160) — httpx default HTTP/2 negotiation returns 502.
-        client = _SerializedCallProxy(
+        raw_client = _configure_local_endpoint(
             zotero.Zotero(
                 library_id=library_id,
                 library_type=library_type,
@@ -387,9 +400,55 @@ def get_local_zotero_client() -> zotero.Zotero | None:
                 client=_make_local_http_client(),
             )
         )
+        client = _SerializedCallProxy(raw_client)
         # Test connection by making a simple request
         client.items(limit=1)
         return client
+    except Exception:
+        return None
+
+
+def get_local_write_zotero_client() -> zotero.Zotero | None:
+    """Return a local-first writable client when Zotero supports local writes.
+
+    This probes only capability and server identity. Zotero's authorization
+    dialog is shown lazily on the first actual write request.
+    """
+    try:
+        current = get_current_library()
+        library_id = current.get("library_id") or "0"
+        library_type = current.get("library_type") or "user"
+        http_client = _make_local_http_client(authorize_writes=True)
+        server_id = _call_with_zotero_api_lock(http_client.ensure_server_id)
+        raw_client = _configure_local_endpoint(
+            LocalWriteZotero(
+                library_id=library_id,
+                library_type=library_type,
+                api_key=None,
+                local=True,
+                client=http_client,
+            )
+        )
+        raw_client.local_server_id = server_id
+        return _SerializedCallProxy(raw_client)
+    except (
+        LocalApiWriteUnavailableError,
+        httpx.HTTPError,
+        OSError,
+    ):
+        return None
+
+
+def get_zotero_server_id(client: zotero.Zotero | None = None) -> str | None:
+    """Return the current Local API server ID, probing once when necessary."""
+    zot = client or get_zotero_client()
+    if not getattr(zot, "local", False):
+        return None
+    ensure_server_id = getattr(getattr(zot, "client", None), "ensure_server_id", None)
+    if not callable(ensure_server_id):
+        return None
+    try:
+        return str(ensure_server_id())
     except Exception:
         return None
 

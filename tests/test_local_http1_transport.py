@@ -115,3 +115,25 @@ def test_get_zotero_client_uses_http1_only_when_local(monkeypatch):
     assert captured["kwargs"].get("client") is None, (
         "Cloud API path should not override the transport — only the local API needs HTTP/1.1."
     )
+
+
+def test_local_client_never_sends_cloud_api_key(monkeypatch):
+    captured = {}
+
+    def spy_init(self, *args, **kwargs):
+        captured.update(kwargs)
+        self.library_id = kwargs.get("library_id")
+        self.library_type = kwargs.get("library_type")
+        self.api_key = kwargs.get("api_key")
+        self.client = kwargs.get("client")
+        self.endpoint = "http://localhost:23119/api"
+
+    monkeypatch.setattr(zotero.Zotero, "__init__", spy_init)
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "0")
+    monkeypatch.setenv("ZOTERO_API_KEY", "cloud-key-must-not-go-local")
+
+    zclient.get_zotero_client()
+
+    assert captured["local"] is True
+    assert captured["api_key"] is None

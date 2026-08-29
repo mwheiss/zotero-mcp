@@ -43,6 +43,13 @@ def _resolve_update_fulltext_mode(search, requested: bool, force_rebuild: bool) 
     return requested, False
 
 
+def _get_local_write_client_for_authorization():
+    """Resolve the local-write factory lazily for the authorization command."""
+    from zotero_mcp.client import get_local_write_zotero_client
+
+    return get_local_write_zotero_client()
+
+
 def obfuscate_sensitive_value(value, keep_chars=4):
     """Obfuscate sensitive values by showing only the first few characters."""
     if not value or not isinstance(value, str):
@@ -370,8 +377,8 @@ def main():
         choices=["auto", "research", "full", "admin", "connector", "all"],
         default="auto",
         help=(
-            "MCP tool surface (default: auto; research without an API key, "
-            "full with one)"
+            "MCP tool surface (default: auto; full for local mode or with a "
+            "Web API key, otherwise research)"
         ),
     )
 
@@ -390,6 +397,11 @@ def main():
                              help="Skip semantic search configuration")
     setup_parser.add_argument("--semantic-config-only", action="store_true",
                              help="Only configure semantic search, skip Zotero setup")
+
+    subparsers.add_parser(
+        "authorize-local-writes",
+        help="Request Zotero desktop permission for Local API writes",
+    )
 
     # Update database command
     update_db_parser = subparsers.add_parser("update-db", help="Update semantic search database")
@@ -638,6 +650,32 @@ def main():
     elif args.command == "setup":
         from zotero_mcp.setup_helper import main as setup_main
         sys.exit(setup_main(args))
+
+    elif args.command == "authorize-local-writes":
+        setup_zotero_environment()
+        write_zot = _get_local_write_client_for_authorization()
+        if write_zot is None:
+            print(
+                "Local writes are unavailable. Start a compatible Zotero "
+                "version and enable local API access in Settings > Advanced.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            authorization = write_zot.client.ensure_write_authorization()
+        except Exception as exc:
+            print(f"Local write authorization failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        persistence = (
+            "remembered until revoked"
+            if authorization.get("remembered")
+            else "single-use; Zotero will prompt again on the next write"
+        )
+        print(
+            "Local write authorization granted "
+            f"for Zotero server {authorization['server_id']} ({persistence})."
+        )
+        sys.exit(0)
 
     elif args.command == "update-db":
         if args.force_rebuild and args.limit is not None:
