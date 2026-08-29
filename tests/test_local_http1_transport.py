@@ -137,3 +137,37 @@ def test_local_client_never_sends_cloud_api_key(monkeypatch):
 
     assert captured["local"] is True
     assert captured["api_key"] is None
+
+
+def test_web_fallback_maps_local_user_zero_to_configured_account(monkeypatch):
+    captured = {}
+
+    def spy_init(self, *args, **kwargs):
+        captured.update(kwargs)
+        self.library_id = kwargs.get("library_id")
+        self.library_type = kwargs.get("library_type")
+        self.api_key = kwargs.get("api_key")
+        self.client = kwargs.get("client")
+
+    monkeypatch.setattr(zotero.Zotero, "__init__", spy_init)
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "20765677")
+    monkeypatch.setenv("ZOTERO_API_KEY", "cloud-key")
+    zclient.set_active_library("0", "user", session_id=None)
+    try:
+        client = zclient.get_web_zotero_client()
+    finally:
+        zclient.clear_active_library(session_id=None)
+
+    assert client is not None
+    assert captured["library_id"] == "20765677"
+    assert captured["library_type"] == "user"
+
+
+def test_web_fallback_rejects_feed_library(monkeypatch):
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "20765677")
+    monkeypatch.setenv("ZOTERO_API_KEY", "cloud-key")
+    zclient.set_active_library("12", "feed", session_id=None)
+    try:
+        assert zclient.get_web_zotero_client() is None
+    finally:
+        zclient.clear_active_library(session_id=None)

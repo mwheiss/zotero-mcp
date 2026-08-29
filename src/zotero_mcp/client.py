@@ -503,8 +503,15 @@ def get_web_zotero_client() -> zotero.Zotero | None:
         A web API Zotero client instance, or None if credentials are not available.
     """
     current = get_current_library()
-    library_id = current.get("library_id") or os.getenv("ZOTERO_LIBRARY_ID")
     library_type = current.get("library_type") or os.getenv("ZOTERO_LIBRARY_TYPE", "user")
+    if _normalize_library_type(library_type) == "feed":
+        return None
+    current_id = current.get("library_id")
+    library_id = (
+        os.getenv("ZOTERO_LIBRARY_ID")
+        if _normalize_library_type(library_type) == "user" and current_id == "0"
+        else current_id or os.getenv("ZOTERO_LIBRARY_ID")
+    )
     api_key = os.getenv("ZOTERO_API_KEY")
 
     if not library_id or not api_key:

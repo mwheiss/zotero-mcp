@@ -255,6 +255,7 @@ def test_local_file_upload_uses_raw_bytes_and_two_authorized_stages(tmp_path):
                 }
             )
         if request.url.path == "/api/local/uploads/UPLOAD1":
+            request.read()
             raw_upload.append(request)
             assert "Zotero-API-Key" not in request.headers
             return _response(201)
@@ -292,7 +293,60 @@ def test_local_file_upload_uses_raw_bytes_and_two_authorized_stages(tmp_path):
     assert len(authorized_requests) == 2
     assert raw_upload[0].content == source.read_bytes()
     assert raw_upload[0].headers["Content-Type"] == "application/pdf"
+    assert raw_upload[0].headers["Content-Length"] == str(source.stat().st_size)
+    assert "Transfer-Encoding" not in raw_upload[0].headers
     assert "upload=UPLOAD1" in authorized_requests[1].content.decode()
+
+
+def test_local_item_template_is_synthesized_from_supported_schema(monkeypatch):
+    zot = LocalWriteZotero.__new__(LocalWriteZotero)
+    zot.client = None
+    monkeypatch.setattr(
+        zot,
+        "item_type_fields",
+        lambda itemtype: [
+            {"field": "title"},
+            {"field": "abstractNote"},
+            {"field": "DOI"},
+        ],
+    )
+    monkeypatch.setattr(
+        zot,
+        "item_creator_types",
+        lambda itemtype: [{"creatorType": "author"}],
+    )
+
+    template = zot.item_template("journalArticle")
+
+    assert template["itemType"] == "journalArticle"
+    assert template["DOI"] == ""
+    assert template["creators"] == [
+        {"creatorType": "author", "firstName": "", "lastName": ""}
+    ]
+    assert template["tags"] == []
+    assert template["collections"] == []
+    assert template["relations"] == {}
+
+
+def test_local_attachment_template_matches_upload_contract(monkeypatch):
+    zot = LocalWriteZotero.__new__(LocalWriteZotero)
+    zot.client = None
+    monkeypatch.setattr(
+        zot,
+        "item_type_fields",
+        lambda itemtype: [{"field": "title"}, {"field": "url"}],
+    )
+    monkeypatch.setattr(zot, "item_creator_types", lambda itemtype: [])
+
+    imported = zot.item_template("attachment", "imported_file")
+    linked = zot.item_template("attachment", "linked_url")
+
+    assert imported["linkMode"] == "imported_file"
+    assert imported["filename"] == ""
+    assert imported["md5"] is None
+    assert imported["mtime"] is None
+    assert linked["linkMode"] == "linked_url"
+    assert "filename" not in linked
 
 
 def test_remote_file_upload_ignores_backend_localhost_upload_url(tmp_path):
@@ -320,6 +374,7 @@ def test_remote_file_upload_ignores_backend_localhost_upload_url(tmp_path):
                 },
             )
         if request.url.path == "/api/local/uploads/REMOTE1":
+            request.read()
             raw_upload_urls.append(str(request.url))
             return httpx.Response(201)
         if not raw_upload_urls:

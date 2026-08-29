@@ -356,6 +356,56 @@ def test_deleted_attachment_reconciles_parent(monkeypatch):
     assert [item["key"] for item in changed] == ["P1"]
 
 
+def test_local_api_without_deleted_endpoint_requires_full_scan(monkeypatch):
+    class LocalNoDeleted(FakeZoteroClient):
+        local = True
+
+        def deleted(self, since):
+            raise RuntimeError(
+                "Code: 404\nResponse: No endpoint found"
+            )
+
+    zot = LocalNoDeleted()
+    zot.load_scenario([_paper("P1")], library_version=8)
+    zot.versions_state = {"P1": 8}
+    search = _build_search(monkeypatch, zot, FakeChromaClient())
+
+    with pytest.raises(
+        semantic_search._IncrementalDiscoveryUnsupported,
+        match="does not expose /deleted",
+    ):
+        search._get_changed_items_from_api(since_version=5)
+
+
+def test_local_api_without_deleted_endpoint_falls_back_to_full_update(
+    monkeypatch,
+    tmp_path,
+):
+    class LocalNoDeleted(FakeZoteroClient):
+        local = True
+
+        def deleted(self, since):
+            raise RuntimeError("Code: 404\nResponse: No endpoint found")
+
+    config_path = _write_config(tmp_path, extra={"last_sync_version": 5})
+    zot = LocalNoDeleted()
+    zot.load_scenario([_paper("P1")], library_version=8)
+    zot.versions_state = {"P1": 8}
+    search = _build_search(
+        monkeypatch,
+        zot,
+        FakeChromaClient(),
+        config_path=config_path,
+    )
+
+    stats = search.update_database()
+
+    assert stats["errors"] == 0
+    assert stats["processed_items"] == 1
+    assert any(call[0] == "item_versions" and call[1] == 5 for call in zot.calls)
+    assert any(call[0] == "items" for call in zot.calls)
+
+
 # --------- Integration tests: update_database orchestration ----------
 
 def _write_config(tmp_path, extra: dict | None = None):
@@ -1303,6 +1353,27 @@ def test_local_sync_watermark_is_reused_for_same_server_id(monkeypatch, tmp_path
     )
 
     assert search._load_last_sync_version() == 123
+
+
+def test_local_sync_watermark_is_discarded_without_server_id(monkeypatch, tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        extra={"last_sync_version": 123},
+    )
+    search = _build_search(
+        monkeypatch,
+        FakeZoteroClient(),
+        FakeChromaClient(),
+        config_path=config_path,
+    )
+    monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
+    monkeypatch.setattr(
+        semantic_search,
+        "get_zotero_server_id",
+        lambda _client: None,
+    )
+
+    assert search._load_last_sync_version() == 0
 
 
 def test_failed_local_sync_does_not_pair_new_server_id_with_old_watermark(

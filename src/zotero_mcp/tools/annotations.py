@@ -1196,7 +1196,9 @@ def create_annotation(
         except ValueError as exc:
             return f"Error: {exc}"
         web_client = (
-            write_client if not getattr(write_client, "local", False) else None
+            _client.get_web_zotero_client()
+            if getattr(write_client, "local", False)
+            else write_client
         )
 
         # Verify the attachment exists and is a PDF
@@ -1481,7 +1483,9 @@ def create_area_annotation(
         except ValueError as exc:
             return f"Error: {exc}"
         web_client = (
-            write_client if not getattr(write_client, "local", False) else None
+            _client.get_web_zotero_client()
+            if getattr(write_client, "local", False)
+            else write_client
         )
 
         try:

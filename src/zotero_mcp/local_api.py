@@ -372,6 +372,44 @@ class LocalApiHttpClient(httpx.Client):
 class LocalWriteZotero(zotero.Zotero):
     """Pyzotero client with Zotero Local API's raw-byte upload protocol."""
 
+    def item_template(self, itemtype: str, linkmode: str | None = None) -> dict[str, Any]:
+        """Synthesize templates from schema endpoints absent in Zotero 10.0.1."""
+        fields = self.item_type_fields(itemtype)
+        template: dict[str, Any] = {"itemType": itemtype}
+        for field in fields:
+            field_name = field.get("field") if isinstance(field, dict) else None
+            if field_name:
+                template[str(field_name)] = ""
+
+        creator_types = self.item_creator_types(itemtype)
+        if creator_types:
+            first = creator_types[0]
+            creator_type = (
+                first.get("creatorType") if isinstance(first, dict) else None
+            )
+            if creator_type:
+                template["creators"] = [
+                    {
+                        "creatorType": creator_type,
+                        "firstName": "",
+                        "lastName": "",
+                    }
+                ]
+
+        template.update({"tags": [], "collections": [], "relations": {}})
+        if itemtype == "attachment":
+            template.update(
+                {
+                    "linkMode": linkmode or "imported_file",
+                    "note": "",
+                    "contentType": "",
+                    "charset": "",
+                }
+            )
+            if linkmode != "linked_url":
+                template.update({"filename": "", "md5": None, "mtime": None})
+        return template
+
     def _upload_local_file(
         self,
         attachment_key: str,
@@ -414,16 +452,17 @@ class LocalWriteZotero(zotero.Zotero):
             f"{self.endpoint}/local/uploads/"
             f"{quote(str(auth['uploadKey']), safe='')}"
         )
-        upload = self.client.post(
-            upload_url,
-            content=source.read_bytes(),
-            headers={
-                "Content-Type": auth.get("contentType")
-                or mimetypes.guess_type(source.name)[0]
-                or "application/octet-stream"
-            },
-            timeout=self.upload_timeout,
-        )
+        with source.open("rb") as source_file:
+            upload = self.client.post(
+                upload_url,
+                content=source_file,
+                headers={
+                    "Content-Type": auth.get("contentType")
+                    or mimetypes.guess_type(source.name)[0]
+                    or "application/octet-stream"
+                },
+                timeout=self.upload_timeout,
+            )
         upload.raise_for_status()
         completion = self.client.post(
             file_endpoint,

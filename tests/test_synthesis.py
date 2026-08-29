@@ -116,11 +116,20 @@ def test_synthesize_annotations_keeps_same_title_papers_separate(monkeypatch):
 
 
 class _BibZotero(FakeZotero):
-    """FakeZotero honoring a content= kwarg for CSL/bibtex rendering."""
+    """FakeZotero honoring format/content kwargs for CSL/BibTeX rendering."""
 
     def __init__(self):
         super().__init__()
         self.last_kwargs = None
+        self._items = [
+            {
+                "key": "ABCD1234",
+                "data": {
+                    "itemType": "journalArticle",
+                    "collections": ["COLL1234"],
+                },
+            }
+        ]
 
     def _render(self, content, style):
         if content == "bibtex":
@@ -132,17 +141,38 @@ class _BibZotero(FakeZotero):
 
     def items(self, **kwargs):
         self.last_kwargs = kwargs
-        content = kwargs.get("content")
+        content = kwargs.get("content") or kwargs.get("format")
         if content:
             return self._render(content, kwargs.get("style"))
         return self._items
 
+    def item(self, item_key, **kwargs):
+        self.last_kwargs = kwargs
+        content = kwargs.get("content") or kwargs.get("format")
+        if content:
+            return self._render(content, kwargs.get("style"))
+        return super().item(item_key)
+
     def collection_items(self, key, **kwargs):
         self.last_kwargs = kwargs
-        content = kwargs.get("content")
+        content = kwargs.get("content") or kwargs.get("format")
         if content:
             return self._render(content, kwargs.get("style"))
         return super().collection_items(key, **kwargs)
+
+
+def test_render_entries_decodes_and_splits_local_bibliography_bytes():
+    rendered = (
+        b'<div class="csl-bib-body">'
+        b'<div class="csl-entry">First reference</div>'
+        b'<div class="csl-entry">Second reference</div>'
+        b"</div>"
+    )
+
+    assert synthesis._render_entries(rendered) == [
+        '<div class="csl-entry">First reference</div>',
+        '<div class="csl-entry">Second reference</div>',
+    ]
 
 
 def test_export_bibliography_bib_strips_html(monkeypatch):
@@ -157,7 +187,7 @@ def test_export_bibliography_bib_strips_html(monkeypatch):
     assert "Bibliography" in out
     # style passed through to the API.
     assert fake.last_kwargs.get("style") == "apa"
-    assert fake.last_kwargs.get("content") == "bib"
+    assert fake.last_kwargs.get("format") == "bib"
 
 
 def test_export_bibliography_style_passthrough(monkeypatch):
@@ -177,6 +207,21 @@ def test_export_bibliography_style_passthrough(monkeypatch):
     assert "ieee" in out
 
 
+def test_local_in_text_citation_requires_cloud_fallback(monkeypatch):
+    fake = _BibZotero()
+    fake.local = True
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
+    monkeypatch.setattr(zotero_client, "get_web_zotero_client", lambda: None)
+
+    out = synthesis.export_bibliography(
+        item_keys=["ABCD1234"],
+        export_format="citation",
+        ctx=DummyContext(),
+    )
+
+    assert "Local API does not support in-text citation" in out
+
+
 def test_export_bibliography_bibtex_fenced(monkeypatch):
     fake = _BibZotero()
     monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
@@ -191,6 +236,7 @@ def test_export_bibliography_bibtex_fenced(monkeypatch):
     assert "```bibtex" in out
     # bibtex ignores style (not passed to the API).
     assert "style" not in fake.last_kwargs
+    assert fake.last_kwargs.get("format") == "bibtex"
 
 
 def test_export_bibliography_collection(monkeypatch):
@@ -203,7 +249,7 @@ def test_export_bibliography_collection(monkeypatch):
         ctx=DummyContext(),
     )
     assert "Smith, J. (2020). Title. Journal." in out
-    assert fake.last_kwargs.get("content") == "bib"
+    assert fake.last_kwargs.get("format") == "bib"
 
 
 def test_export_bibliography_api_error(monkeypatch):

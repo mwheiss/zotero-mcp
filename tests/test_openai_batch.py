@@ -1181,6 +1181,46 @@ def test_batch_source_guard_allows_unrelated_item_change(monkeypatch):
     search._validate_openai_batch_source(manifest)
 
 
+def test_batch_source_guard_rejects_when_local_deletions_are_unavailable(
+    monkeypatch,
+):
+    class Zotero:
+        local = True
+
+        def last_modified_version(self):
+            return 6
+
+        def item_versions(self, **kwargs):
+            if kwargs.get("since") is not None:
+                return {"B": 6}
+            return {"A": 5, "B": 6}
+
+        def item(self, key):
+            return {
+                "key": key,
+                "data": {"itemType": "journalArticle", "title": "Unrelated"},
+            }
+
+        def deleted(self, **kwargs):
+            raise RuntimeError("Code: 404\nResponse: No endpoint found")
+
+    zotero = Zotero()
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: zotero)
+    search = semantic_search.ZoteroSemanticSearch(
+        chroma_client=FakeChromaClient()
+    )
+
+    with pytest.raises(RuntimeError, match="deletion-complete"):
+        search._validate_openai_batch_source(
+            {
+                "source_guard_version": 2,
+                "target_sync_version": 5,
+                "force_full_rebuild": False,
+                "expected_ids_by_item": {"A": ["A#0"]},
+            }
+        )
+
+
 def test_batch_source_guard_rejects_different_local_database(monkeypatch):
     zotero = object()
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: zotero)

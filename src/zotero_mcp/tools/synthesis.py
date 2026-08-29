@@ -6,6 +6,7 @@ drop formatted references into a manuscript. They do NOT call an LLM
 themselves; they only collect and format.
 """
 
+import re
 from typing import Literal
 
 from zotero_mcp import client as _client
@@ -265,11 +266,18 @@ def _render_entries(rendered) -> list[str]:
     """Normalize pyzotero content output into a list of plain-text entries."""
     if rendered is None:
         return []
+    if isinstance(rendered, bytes):
+        rendered = rendered.decode("utf-8", errors="replace")
     if isinstance(rendered, str):
-        return [rendered]
+        csl_entries = re.findall(
+            r"(<div\b[^>]*class=[\"'][^\"']*\bcsl-entry\b[^\"']*[\"'][^>]*>.*?</div>)",
+            rendered,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return csl_entries or [rendered]
     entries: list[str] = []
     for item in rendered:
-        entries.append(item if isinstance(item, str) else str(item))
+        entries.extend(_render_entries(item))
     return entries
 
 
@@ -287,8 +295,8 @@ def _render_entries(rendered) -> list[str]:
         "association', 'chicago-note-bibliography', 'ieee'. Ignored for "
         "bibtex. "
         "export_format: 'bib' (formatted reference-list entries, default), "
-        "'citation' (in-text citation strings), or 'bibtex' (raw BibTeX for "
-        ".bib files). "
+        "'citation' (in-text citation strings; requires Web API fallback when "
+        "the active transport is local), or 'bibtex' (raw BibTeX for .bib files). "
         "Output: markdown naming the style/format, then the rendered entries "
         "(a fenced block for bibtex, a numbered list otherwise). "
         "Requires bibliography rendering support from the active Zotero API. "
@@ -328,24 +336,52 @@ def export_bibliography(
         context_info(ctx, f"Exporting bibliography (format={export_format}, style={style})")
         zot = _client.get_zotero_client()
 
+        if not keys:
+            source_items = (
+                zot.collection_items(collection_key, limit=100)
+                if collection_key
+                else zot.items(limit=100)
+            )
+            keys = [
+                item.get("key", "")
+                for item in source_items
+                if item.get("key")
+                and item.get("data", {}).get("itemType")
+                not in {"attachment", "note", "annotation"}
+            ][:100]
+        else:
+            keys = keys[:100]
+        if not keys:
+            scope = (
+                f" for collection {collection_key}"
+                if collection_key
+                else " for the requested items"
+                if item_keys is not None
+                else ""
+            )
+            return f"No bibliography entries produced{scope}."
+
+        render_zot = zot
+        if export_format == "citation" and getattr(zot, "local", False):
+            render_zot = _client.get_web_zotero_client()
+            if render_zot is None:
+                return (
+                    "Error: Zotero's Local API does not support in-text citation "
+                    "rendering. Configure Web API credentials or request "
+                    "export_format='bib' instead."
+                )
+
         content = "bibtex" if export_format == "bibtex" else export_format
+        api_parameter = "content" if export_format == "citation" else "format"
 
         try:
-            if keys:
-                fetch_kwargs = {"itemKey": ",".join(keys), "content": content, "limit": 100}
-                if content != "bibtex":
-                    fetch_kwargs["style"] = style
-                rendered = zot.items(**fetch_kwargs)
-            elif collection_key:
-                page_kwargs = {"content": content}
-                if content != "bibtex":
-                    page_kwargs["style"] = style
-                rendered = _helpers._paginate(zot.collection_items, collection_key, max_items=100, **page_kwargs)
-            else:
-                fetch_kwargs = {"content": content, "limit": 100}
-                if content != "bibtex":
-                    fetch_kwargs["style"] = style
-                rendered = zot.items(**fetch_kwargs)
+            fetch_kwargs = {api_parameter: content}
+            if content != "bibtex":
+                fetch_kwargs["style"] = style
+            rendered = [
+                render_zot.item(item_key, **fetch_kwargs)
+                for item_key in keys
+            ]
         except Exception as api_error:
             context_error(ctx, f"Bibliography rendering failed: {api_error}")
             return (

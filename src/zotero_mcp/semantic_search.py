@@ -76,6 +76,10 @@ _IMMEDIATE_METADATA_FIELDS = {
 }
 
 
+class _IncrementalDiscoveryUnsupported(RuntimeError):
+    """The source cannot provide a deletion-complete incremental change set."""
+
+
 def _sort_local_items_by_fulltext_priority(items: list[Any]) -> list[Any]:
     """Queue cheap metadata-only items, then full text from best to worst."""
 
@@ -950,6 +954,12 @@ class ZoteroSemanticSearch:
                 state = semantic.get("library_states", {}).get(identity, {})
                 if is_local_mode():
                     current_server_id = self._source_server_id()
+                    if not current_server_id:
+                        logger.warning(
+                            "Discarding the stored Zotero sync watermark because "
+                            "the Local API did not provide Zotero-Server-ID"
+                        )
+                        return 0
                     stored_server_id = state.get(
                         "zotero_server_id",
                         semantic.get("zotero_server_id") if is_default else None,
@@ -2071,6 +2081,14 @@ class ZoteroSemanticSearch:
                 deleted = deleted_method(since=since_version) or {}
                 changed_keys.update(deleted.get("items", []))
             except Exception as e:
+                if (
+                    getattr(self.zotero_client, "local", False)
+                    and "Code: 404" in str(e)
+                    and "No endpoint found" in str(e)
+                ):
+                    raise _IncrementalDiscoveryUnsupported(
+                        "This Zotero Local API does not expose /deleted"
+                    ) from e
                 logger.warning(
                     "Failed to fetch deletions since version %s: %s",
                     since_version,
@@ -2540,6 +2558,12 @@ class ZoteroSemanticSearch:
                 "OpenAI Batch submission requires a verified Zotero library "
                 "version so delayed imports cannot overwrite newer source data"
             )
+        source_server_id = self._source_server_id()
+        if is_local_mode() and not source_server_id:
+            raise RuntimeError(
+                "OpenAI Batch submission requires Zotero-Server-ID when the "
+                "source is a Local API; use realtime embeddings or upgrade Zotero"
+            )
         model_name = self.chroma_client.embedding_config.get("model_name", "text-embedding-3-small")
         manifest = openai_batch.submit_embedding_batches(
             records=records,
@@ -2548,7 +2572,7 @@ class ZoteroSemanticSearch:
             config_path=self.config_path,
             force_full_rebuild=force_full_rebuild,
             target_sync_version=target_sync_version,
-            source_server_id=self._source_server_id(),
+            source_server_id=source_server_id,
             fulltext=indexed_fulltext_state,
             content_signature=_CONTENT_CONTRACT_SIGNATURE,
             expected_ids_by_item=expected_ids_by_item,
@@ -2832,7 +2856,19 @@ class ZoteroSemanticSearch:
                 return stats
 
             if use_incremental:
-                all_items, current_library_keys = self._get_changed_items_from_api(since_version=last_sync_version)
+                try:
+                    all_items, current_library_keys = self._get_changed_items_from_api(
+                        since_version=last_sync_version
+                    )
+                except _IncrementalDiscoveryUnsupported as error:
+                    logger.warning(
+                        "%s; falling back to a deletion-complete full scan",
+                        error,
+                    )
+                    use_incremental = False
+                    all_items = []
+
+            if use_incremental:
                 # Delete collection entries that are no longer present in the
                 # library. Map any chunk ids (``<key>#<n>``) back to item keys
                 # so deletion works identically whether or not chunking is on.
@@ -4054,21 +4090,23 @@ class ZoteroSemanticSearch:
                 "submit a new rebuild so the replacement corpus is complete"
             )
 
-        changed_items, current_keys = self._get_changed_items_from_api(int(target_version))
+        try:
+            changed_items, current_keys = self._get_changed_items_from_api(
+                int(target_version)
+            )
+        except _IncrementalDiscoveryUnsupported as error:
+            raise RuntimeError(
+                "Cannot safely import this delayed batch because the Zotero "
+                "Local API cannot provide a deletion-complete change set; "
+                "submit a new update instead"
+            ) from error
         if current_keys is None:
             raise RuntimeError("Could not completely verify Zotero changes before OpenAI batch import")
         expected_parents = set((manifest.get("expected_ids_by_item") or {}).keys())
         changed_parents = {item.get("key", "") for item in changed_items if item.get("key")}
-        deleted_method = getattr(self.zotero_client, "deleted", None)
-        deleted_keys: set[str] = set()
-        if callable(deleted_method):
-            try:
-                deleted_keys = set((deleted_method(since=int(target_version)) or {}).get("items", []))
-            except Exception as e:
-                raise RuntimeError("Could not verify Zotero deletions before OpenAI batch import") from e
         affected = (expected_parents - current_keys) | (expected_parents & changed_parents)
-        if affected or deleted_keys:
-            sample_keys = sorted(affected or deleted_keys)
+        if affected:
+            sample_keys = sorted(affected)
             sample = ", ".join(sample_keys[:10])
             suffix = "" if len(sample_keys) <= 10 else f" and {len(sample_keys) - 10} more"
             raise RuntimeError(
