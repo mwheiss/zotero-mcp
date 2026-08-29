@@ -108,23 +108,27 @@ def apply_library_override(zot, override: dict | None) -> None:
 
 
 def _get_write_client(ctx):
-    """Return (read_client, write_client) for hybrid-mode operations.
+    """Return a version-compatible read/write client pair.
 
     In web-only mode: both are the web client.
-    In local mode with web credentials: read from local, write to web.
-    In local-only mode: raises ValueError with clear message.
+    In local mode: read and write through the same Zotero Local API instance.
+    The Web API is used only when the running Zotero lacks local write support.
     """
-    read_zot = _client.get_zotero_client()
-    if not _utils.is_local_mode():
-        return read_zot, read_zot
-    web_zot = _client.get_web_zotero_client()
-    if web_zot is not None:
-        apply_library_override(web_zot, _client.get_active_library())
-        return read_zot, web_zot
-    raise ValueError(
-        "Cannot perform write operations in local-only mode. "
-        "Add ZOTERO_API_KEY and ZOTERO_LIBRARY_ID to enable hybrid mode."
-    )
+    if _utils.is_local_mode():
+        local_zot = _client.get_local_write_zotero_client()
+        if local_zot is not None:
+            return local_zot, local_zot
+        web_zot = _client.get_web_zotero_client()
+        if web_zot is not None:
+            apply_library_override(web_zot, _client.get_active_library())
+            return web_zot, web_zot
+        raise ValueError(
+            "Cannot perform write operations: the running Zotero does not "
+            "support Local API writes and no Web API fallback is configured. "
+            "Upgrade Zotero, or configure ZOTERO_API_KEY and ZOTERO_LIBRARY_ID."
+        )
+    web_zot = _client.get_zotero_client()
+    return web_zot, web_zot
 
 
 def fetch_trashed_collections(zot) -> list[dict]:
@@ -818,13 +822,18 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
                 parentid=item_key,
             )
             # Must run inside the with-block — temp file disappears on exit.
-            return _maybe_upload_to_webdav(attach_result, filepath, ctx)
+            return _maybe_upload_to_webdav(
+                attach_result,
+                filepath,
+                ctx,
+                write_zot=write_zot,
+            )
     except Exception as e:
         context_info(ctx, f"PDF download/attach failed: {e}")
         return None
 
 
-def _maybe_upload_to_webdav(attach_result, file_path, ctx):
+def _maybe_upload_to_webdav(attach_result, file_path, ctx, write_zot=None):
     """Suffix to append to a user-facing 'file attached' message.
 
     PR #279 added WebDAV-aware upload to ``zotero_add_from_file``. The same
@@ -840,6 +849,12 @@ def _maybe_upload_to_webdav(attach_result, file_path, ctx):
     so callers can keep the user-visible signal without re-implementing the
     branch.
     """
+    # A local file upload lands directly in Zotero's managed storage. Zotero
+    # itself owns any subsequent cloud/WebDAV sync, so a second direct PUT
+    # would be redundant and could race Zotero's own sync bookkeeping.
+    if write_zot is not None and getattr(write_zot, "local", False):
+        return ""
+
     from zotero_mcp import webdav as _webdav
 
     if not _webdav.is_webdav_configured():

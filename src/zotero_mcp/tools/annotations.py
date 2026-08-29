@@ -5,8 +5,6 @@ import os
 import tempfile
 import uuid
 
-import requests
-
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
@@ -57,21 +55,14 @@ def _download_attachment_for_processing(
 def _get_note_write_client(op_description: str):
     """Return (client, None) or (None, error_msg) for note-write operations.
 
-    Zotero's local API is read-only, so in local mode this falls back to the
-    web client and propagates any active library override.
+    Prefer Zotero's authenticated Local API and use the Web API only as a
+    compatibility fallback for older desktop versions.
     """
-    if _utils.is_local_mode():
-        zot = _client.get_web_zotero_client()
-        if zot is None:
-            return None, (
-                f"Error: Web API credentials required for {op_description}.\n\n"
-                "Please configure the following environment variables:\n"
-                + _WEB_API_ENV_VARS
-            )
-        _helpers.apply_library_override(zot, _client.get_active_library())
-    else:
-        zot = _client.get_zotero_client()
-    return zot, None
+    try:
+        _read_zot, write_zot = _helpers._get_write_client(None)
+        return write_zot, None
+    except ValueError as exc:
+        return None, f"Error: Cannot perform {op_description}: {exc}"
 
 
 @mcp.tool(
@@ -907,8 +898,8 @@ def search_notes(
         "note_text: note body; simple HTML is preserved (p, strong, em, "
         "ul/ol/li, a, blockquote, code). "
         "tags: optional list of tag strings to attach to the note. "
-        "Requires a writable library (web API key or hybrid mode) — fails "
-        "in local-only mode. To edit an existing note instead, use "
+        "Requires Zotero write authorization; local desktop writes are "
+        "preferred and the Web API is only a fallback. To edit an existing note, use "
         "zotero_update_note. Example: zotero_create_note("
         "item_key='ABC12345', note_title='Reading notes', "
         "note_text='<p>Key claim: ...</p>', tags=['to-cite'])."
@@ -939,11 +930,14 @@ def create_note(
         context_info(ctx, f"Creating note for item {item_key}")
         # Normalize tags (LLMs often pass JSON strings instead of lists)
         tags = _helpers._normalize_str_list_input(tags, "tags") if tags is not None else []
-        zot = _client.get_zotero_client()
+        try:
+            read_zot, write_zot = _helpers._get_write_client(ctx)
+        except ValueError as exc:
+            return f"Error: {exc}"
 
         # First verify the parent item exists
         try:
-            parent = zot.item(item_key)
+            parent = read_zot.item(item_key)
             parent_title = parent["data"].get("title", "Untitled Item")
         except Exception:
             return f"Error: No item found with key: {item_key}"
@@ -980,71 +974,14 @@ def create_note(
             "tags": [{"tag": tag} for tag in (tags or [])]
         }
 
-        # In local mode, the local API does not support POST to create items,
-        # and the connector/saveItems endpoint ignores parentItem (creating
-        # standalone notes instead of child notes). If an API key is available,
-        # use the web API which properly supports parentItem.
-        if _utils.is_local_mode():
-            web_zot = _client.get_web_zotero_client()
-            if web_zot is not None:
-                # Propagate library override if user switched libraries
-                _helpers.apply_library_override(web_zot, _client.get_active_library())
-                result = web_zot.create_items([note_data])
-                if "success" in result and result["success"]:
-                    successful = result["success"]
-                    if len(successful) > 0:
-                        note_key = next(iter(successful.values()))
-                        return f"Successfully created note for \"{parent_title}\"\n\nNote key: {note_key}"
-                    else:
-                        return f"Note creation response was successful but no key was returned: {result}"
-                else:
-                    return f"Failed to create note: {result.get('failed', 'Unknown error')}"
-            else:
-                # Fallback: connector endpoint (note will NOT be attached as child)
-                port = os.getenv("ZOTERO_LOCAL_PORT", "23119")
-                connector_url = f"http://127.0.0.1:{port}/connector/saveItems"
-                payload = {
-                    "items": [
-                        {
-                            "itemType": "note",
-                            "note": html_content,
-                            "tags": [tag for tag in (tags or [])],
-                            "parentItem": item_key,
-                        }
-                    ],
-                    "uri": "about:blank",
-                }
-                resp = _client.call_with_zotero_api_lock(
-                    requests.post,
-                    connector_url,
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                    timeout=30,
-                )
-                if resp.status_code == 201:
-                    return (
-                        f"Note created for \"{parent_title}\" but it is a standalone note, not attached "
-                        f"to the paper.\n\n"
-                        "To create properly attached child notes, add these environment variables "
-                        "to your Claude Desktop config alongside ZOTERO_LOCAL=true:\n"
-                        + _WEB_API_ENV_VARS
-                    )
-                else:
-                    return f"Failed to create note via local connector (HTTP {resp.status_code}): {resp.text}"
-        else:
-            # Remote API: use pyzotero's create_items
-            result = zot.create_items([note_data])
-
-            # Check if creation was successful
-            if "success" in result and result["success"]:
-                successful = result["success"]
-                if len(successful) > 0:
-                    note_key = next(iter(successful.values()))
-                    return f"Successfully created note for \"{parent_title}\"\n\nNote key: {note_key}"
-                else:
-                    return f"Note creation response was successful but no key was returned: {result}"
-            else:
-                return f"Failed to create note: {result.get('failed', 'Unknown error')}"
+        result = write_zot.create_items([note_data])
+        if "success" in result and result["success"]:
+            successful = result["success"]
+            if successful:
+                note_key = next(iter(successful.values()))
+                return f"Successfully created note for \"{parent_title}\"\n\nNote key: {note_key}"
+            return f"Note creation response was successful but no key was returned: {result}"
+        return f"Failed to create note: {result.get('failed', 'Unknown error')}"
 
     except Exception as e:
         context_error(ctx, f"Error creating note: {str(e)}")
@@ -1063,8 +1000,7 @@ def create_note(
         "To preserve existing formatting when editing, first fetch the note "
         "with zotero_get_notes(raw_html=True), modify the HTML, then pass "
         "the full HTML back. "
-        "Requires a writable library (web API key or hybrid mode) — fails "
-        "in local-only mode. "
+        "Requires Zotero write authorization; local desktop writes are preferred. "
         "Example: zotero_update_note(item_key='NOTE1234', "
         "note_text='<p>Revised summary</p>', append=False)."
     )
@@ -1132,8 +1068,7 @@ def update_note(
         "UI — no API exists for that step. "
         "Scope: notes only; this tool cannot trash items, collections, or "
         "attachments. "
-        "Requires a writable library (web API key or hybrid mode) — fails "
-        "in local-only mode. "
+        "Requires Zotero write authorization; local desktop writes are preferred. "
         "Example: zotero_delete_note(item_key='NOTE1234')."
     )
 )
@@ -1205,8 +1140,8 @@ def delete_note(
         "color: hex color (default '#ffd400' yellow). "
         "comment: optional note attached to the highlight. "
         "tags: optional list of tag strings to apply to the annotation. "
-        "Requires PyMuPDF (pip install zotero-mcp-server[pdf]) and a "
-        "writable library (web API key or hybrid mode). "
+        "Requires PyMuPDF (pip install zotero-mcp-server[pdf]) and Zotero "
+        "write authorization; local desktop writes are preferred. "
         "Example: zotero_create_annotation(attachment_key='NHZFE5A7', "
         "page=4, text='mindfulness-based therapy', comment='definition to "
         "cite')."
@@ -1226,9 +1161,10 @@ def create_annotation(
     Create a highlight annotation on a PDF or EPUB attachment.
 
     This tool handles multiple storage configurations:
-    - Zotero Cloud Storage: Downloads file via Web API
+    - Local Zotero storage: Downloads directly from the desktop API
+    - Zotero Cloud Storage: Uses the Web API only as a file fallback
     - WebDAV Storage: Downloads file via local Zotero or direct WebDAV access
-    - Annotations are always created via the Web API (required for write operations)
+    - Annotations are created through the selected local-first write transport
 
     Args:
         attachment_key: Attachment key (e.g., "NHZFE5A7")
@@ -1252,26 +1188,16 @@ def create_annotation(
     try:
         context_info(ctx, f"Creating annotation on attachment {attachment_key}, page {page}")
 
-        # Get clients for different operations
+        # Keep metadata and writes in one version namespace. A separate local
+        # read client is retained for the file:// attachment download path.
         local_client = _client.get_local_zotero_client()
-        web_client = _client.get_web_zotero_client()
-
-        # Propagate library override if user switched libraries
-        if web_client:
-            _helpers.apply_library_override(web_client, _client.get_active_library())
-
-        # REQUIREMENT: Web API is required for creating annotations
-        # Zotero's local API (port 23119) is read-only
-        if not web_client:
-            return (
-                "Error: Web API credentials required for creating annotations.\n\n"
-                "Please configure the following environment variables:\n"
-                + _WEB_API_ENV_VARS
-                + "\n\nNote: Zotero's local API is read-only and cannot create annotations."
-            )
-
-        # Use web client for metadata (it has the credentials)
-        metadata_client = web_client
+        try:
+            metadata_client, write_client = _helpers._get_write_client(ctx)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        web_client = (
+            write_client if not getattr(write_client, "local", False) else None
+        )
 
         # Verify the attachment exists and is a PDF
         try:
@@ -1427,10 +1353,8 @@ def create_annotation(
             if page_label:
                 annotation_data["annotationPageLabel"] = page_label
 
-            context_info(ctx, "Creating annotation via Web API...")
-
-            # Create the annotation using web client
-            result = web_client.create_items([annotation_data])
+            context_info(ctx, "Creating annotation via Zotero API...")
+            result = write_client.create_items([annotation_data])
 
             # Check if creation was successful
             if "success" in result and result["success"]:
@@ -1485,8 +1409,7 @@ def create_annotation(
         "comment: optional note attached to the annotation. "
         "color: hex color (default '#ffd400' yellow). "
         "Scope: PDFs only — EPUB attachments are NOT supported. "
-        "Requires a writable library (web API key or hybrid mode) — fails "
-        "in local-only mode. "
+        "Requires Zotero write authorization; local desktop writes are preferred. "
         "Example: zotero_create_area_annotation("
         "attachment_key='NHZFE5A7', page=7, x=0.15, y=0.22, width=0.6, "
         "height=0.35, comment='Figure 3 — mean completion rates')."
@@ -1553,23 +1476,16 @@ def create_area_annotation(
             return "Error: Rectangle must fit within the page height (y + height must be <= 1)"
 
         local_client = _client.get_local_zotero_client()
-        web_client = _client.get_web_zotero_client()
-
-        if web_client:
-            _helpers.apply_library_override(web_client, _client.get_active_library())
-
-        if not web_client:
-            return (
-                "Error: Web API credentials required for creating annotations.\n\n"
-                "Please configure the following environment variables:\n"
-                "- ZOTERO_API_KEY: Your Zotero API key (from zotero.org/settings/keys)\n"
-                "- ZOTERO_LIBRARY_ID: Your library ID\n"
-                "- ZOTERO_LIBRARY_TYPE: 'user' or 'group'\n\n"
-                "Note: Zotero's local API is read-only and cannot create annotations."
-            )
+        try:
+            metadata_client, write_client = _helpers._get_write_client(ctx)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        web_client = (
+            write_client if not getattr(write_client, "local", False) else None
+        )
 
         try:
-            attachment = web_client.item(attachment_key)
+            attachment = metadata_client.item(attachment_key)
             attachment_data = attachment.get("data", {})
 
             if attachment_data.get("itemType") != "attachment":
@@ -1625,8 +1541,8 @@ def create_area_annotation(
                 "tags": [{"tag": t} for t in tag_list],
             }
 
-            context_info(ctx, "Creating area annotation via Web API...")
-            result = web_client.create_items([annotation_data])
+            context_info(ctx, "Creating area annotation via Zotero API...")
+            result = write_client.create_items([annotation_data])
 
             if "success" in result and result["success"]:
                 successful = result["success"]
@@ -1770,7 +1686,7 @@ def get_page_layout(
         if web_client:
             _helpers.apply_library_override(web_client, _client.get_active_library())
 
-        meta_client = web_client or local_client
+        meta_client = local_client or web_client
         if meta_client is None:
             return (
                 "Error: No Zotero client configured.\n\n"

@@ -27,6 +27,7 @@ def _listed_tool_names() -> set[str]:
 
 def test_auto_profile_uses_research_without_api_key(monkeypatch):
     monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "auto")
+    monkeypatch.setenv("ZOTERO_LOCAL", "false")
     monkeypatch.delenv("ZOTERO_API_KEY", raising=False)
 
     assert effective_tool_profile() == "research"
@@ -41,6 +42,15 @@ def test_auto_profile_uses_full_with_api_key(monkeypatch):
     assert effective_tool_profile() == "full"
     assert tool_visible("zotero_add_by_doi")
     assert not tool_visible("search")
+
+
+def test_auto_profile_exposes_local_write_tools_without_cloud_key(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "auto")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.delenv("ZOTERO_API_KEY", raising=False)
+
+    assert effective_tool_profile() == "full"
+    assert tool_visible("zotero_add_by_doi")
 
 
 def test_connector_profile_is_small_and_coherent(monkeypatch):
@@ -78,7 +88,7 @@ def test_all_profile_still_enforces_path_and_write_capabilities(monkeypatch):
     assert "search" in names
     assert "fetch" in names
     assert "zotero_get_attachment_path" not in names
-    assert "zotero_add_by_doi" not in names
+    assert "zotero_add_by_doi" in names
 
 
 def test_all_profile_exposes_paths_only_with_explicit_local_opt_in(monkeypatch):
@@ -94,12 +104,17 @@ def test_capabilities_reports_effective_contract(monkeypatch):
     monkeypatch.setenv("ZOTERO_LOCAL", "true")
     monkeypatch.setenv("ZOTERO_LIBRARY_ID", "0")
     monkeypatch.delenv("ZOTERO_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "zotero_mcp.tools.operational._client.get_local_write_zotero_client",
+        lambda: object(),
+    )
 
     result = get_capabilities(ctx=DummyContext())
 
     assert "**Tool profile:** research" in result
     assert "**Active library:** user:0" in result
     assert "**Write tools usable:** no" in result
+    assert "**Write transport:** local desktop API" in result
 
 
 def test_capabilities_path_report_matches_visible_tools(monkeypatch):

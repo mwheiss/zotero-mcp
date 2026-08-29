@@ -44,21 +44,13 @@ def test_create_note_includes_title_heading(monkeypatch):
     assert "<p>Line one</p>" in note_html
 
 
-def test_local_connector_note_write_uses_shared_api_lock(monkeypatch):
+def test_local_note_write_creates_a_real_child_note(monkeypatch):
     fake_zot = FakeZotero()
-    locked_calls = []
-
-    class Response:
-        status_code = 201
-
-    def locked(func, *args, **kwargs):
-        locked_calls.append((func, args, kwargs))
-        return Response()
-
-    monkeypatch.setattr(annotations._utils, "is_local_mode", lambda: True)
-    monkeypatch.setattr(annotations._client, "get_zotero_client", lambda: fake_zot)
-    monkeypatch.setattr(annotations._client, "get_web_zotero_client", lambda: None)
-    monkeypatch.setattr(annotations._client, "call_with_zotero_api_lock", locked)
+    monkeypatch.setattr(
+        annotations._helpers,
+        "_get_write_client",
+        lambda _ctx: (fake_zot, fake_zot),
+    )
 
     result = annotations.create_note(
         item_key="ITEM0001",
@@ -67,6 +59,5 @@ def test_local_connector_note_write_uses_shared_api_lock(monkeypatch):
         ctx=DummyContext(),
     )
 
-    assert "standalone note" in result
-    assert len(locked_calls) == 1
-    assert locked_calls[0][0] is annotations.requests.post
+    assert "Successfully created note" in result
+    assert fake_zot.created[0]["parentItem"] == "ITEM0001"

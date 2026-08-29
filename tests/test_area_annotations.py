@@ -66,7 +66,10 @@ def test_create_area_annotation_happy_path(monkeypatch, fake_zot):
 
     monkeypatch.setattr("zotero_mcp.client.get_web_zotero_client", lambda: fake_zot)
     monkeypatch.setattr("zotero_mcp.client.get_local_zotero_client", lambda: None)
-    monkeypatch.setattr("zotero_mcp.client.get_active_library", lambda: None)
+    monkeypatch.setattr(
+        "zotero_mcp.tools.annotations._helpers._get_write_client",
+        lambda _ctx: (fake_zot, fake_zot),
+    )
     _patch_fitz(monkeypatch, [FakePage(width=600, height=800, label="7")])
 
     result = server.create_area_annotation(
@@ -110,7 +113,10 @@ def test_create_area_annotation_offset_mediabox(monkeypatch, fake_zot):
 
     monkeypatch.setattr("zotero_mcp.client.get_web_zotero_client", lambda: fake_zot)
     monkeypatch.setattr("zotero_mcp.client.get_local_zotero_client", lambda: None)
-    monkeypatch.setattr("zotero_mcp.client.get_active_library", lambda: None)
+    monkeypatch.setattr(
+        "zotero_mcp.tools.annotations._helpers._get_write_client",
+        lambda _ctx: (fake_zot, fake_zot),
+    )
     _patch_fitz(
         monkeypatch,
         [FakePage(
@@ -173,7 +179,10 @@ def test_create_area_annotation_rejects_non_pdf_attachment(monkeypatch, fake_zot
 
     monkeypatch.setattr("zotero_mcp.client.get_web_zotero_client", lambda: fake_zot)
     monkeypatch.setattr("zotero_mcp.client.get_local_zotero_client", lambda: None)
-    monkeypatch.setattr("zotero_mcp.client.get_active_library", lambda: None)
+    monkeypatch.setattr(
+        "zotero_mcp.tools.annotations._helpers._get_write_client",
+        lambda _ctx: (fake_zot, fake_zot),
+    )
 
     result = server.create_area_annotation(
         attachment_key="ATTACH01",
@@ -188,9 +197,12 @@ def test_create_area_annotation_rejects_non_pdf_attachment(monkeypatch, fake_zot
     assert "not a PDF attachment" in result
 
 
-def test_create_area_annotation_requires_web_api(monkeypatch):
-    monkeypatch.setattr("zotero_mcp.client.get_web_zotero_client", lambda: None)
+def test_create_area_annotation_requires_a_write_transport(monkeypatch):
     monkeypatch.setattr("zotero_mcp.client.get_local_zotero_client", lambda: None)
+    monkeypatch.setattr(
+        "zotero_mcp.tools.annotations._helpers._get_write_client",
+        lambda _ctx: (_ for _ in ()).throw(ValueError("no write transport")),
+    )
 
     result = server.create_area_annotation(
         attachment_key="ATTACH01",
@@ -202,5 +214,4 @@ def test_create_area_annotation_requires_web_api(monkeypatch):
         ctx=DummyContext(),
     )
 
-    assert "Web API credentials required for creating annotations" in result
-
+    assert "no write transport" in result

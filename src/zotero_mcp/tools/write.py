@@ -184,8 +184,8 @@ def _handle_existing_item(write_zot, existing, coll_keys, tags, if_exists,
         "string). Existing tags are preserved; this is not a replace-all. "
         "limit: max items to process (default 50). Attachments are "
         "auto-skipped. "
-        "Requires a writable library (web API key or hybrid mode) — fails "
-        "in local-only mode. Use zotero_get_tags to discover existing tag "
+        "Requires Zotero write authorization; local desktop writes are preferred. "
+        "Use zotero_get_tags to discover existing tag "
         "names first. "
         "Example: zotero_batch_update_tags(tag='to-read', "
         "add_tags=['reviewed'], remove_tags=['to-read'], limit=100) — "
@@ -233,11 +233,8 @@ def batch_update_tags(
             return "Error: After parsing, no valid tags were provided to add or remove"
 
         context_info(ctx, f"Batch updating tags for items matching '{query}'")
-        zot = _client.get_zotero_client()
-
-        # Use shared hybrid-mode helper for correct library override propagation
         try:
-            _, write_zot = _helpers._get_write_client(ctx)
+            zot, write_zot = _helpers._get_write_client(ctx)
         except ValueError as e:
             return str(e)
 
@@ -327,16 +324,16 @@ def batch_update_tags(
                 try:
                     item_key = item.get("key", "unknown")
 
-                    # If writing via web API, re-fetch the item from web to get
-                    # the correct version number for the update
+                    # A fallback transport may use a distinct client; re-fetch
+                    # there so the update carries that transport's version.
                     if write_zot is not zot:
                         try:
-                            web_item = write_zot.item(item_key)
-                            web_item["data"]["tags"] = current_tags
-                            context_info(ctx, f"Updating item {item_key} via web API with tags: {current_tags}")
-                            result = write_zot.update_item(web_item)
+                            write_item = write_zot.item(item_key)
+                            write_item["data"]["tags"] = current_tags
+                            context_info(ctx, f"Updating item {item_key} with tags: {current_tags}")
+                            result = write_zot.update_item(write_item)
                         except Exception as e:
-                            context_error(ctx, f"Failed to fetch/update item {item_key} via web API: {str(e)}")
+                            context_error(ctx, f"Failed to fetch/update item {item_key}: {str(e)}")
                             skipped_count += 1
                             continue
                     else:
@@ -450,8 +447,7 @@ def _apply_extra_edits(
         "free-form lines without a colon are preserved. Items needing no "
         "change, attachments/notes/annotations, and unknown keys are "
         "skipped (counted in the summary). "
-        "Requires a writable library (web API key or hybrid mode) — fails "
-        "in local-only mode. "
+        "Requires Zotero write authorization; local desktop writes are preferred. "
         "Example: zotero_batch_update_extra(item_keys=['ABCD1234', "
         "'EFGH5678'], set_keys={'tex.otscore': '2'}, "
         "remove_keys=['tex.draft'])."
@@ -513,10 +509,8 @@ def batch_update_extra(
             return "Error: replace=True is incompatible with remove_keys"
 
         context_info(ctx, f"Batch updating Extra field for {len(item_keys)} item(s)")
-        zot = _client.get_zotero_client()
-
         try:
-            _, write_zot = _helpers._get_write_client(ctx)
+            zot, write_zot = _helpers._get_write_client(ctx)
         except ValueError as e:
             return str(e)
 
@@ -547,8 +541,8 @@ def batch_update_extra(
                 continue
 
             try:
-                # If writing via web API, re-fetch the item from web to get
-                # the correct version number for the update
+                # A fallback transport may use a distinct client; re-fetch
+                # there so the update carries that transport's version.
                 if write_zot is not zot:
                     web_item = write_zot.item(item_key)
                     web_item["data"]["extra"] = new_extra
@@ -881,8 +875,8 @@ def manage_collections(
         "failure if no PDF is attached (the metadata item remains). PDF uploads may fail "
         "on the Zotero cloud free-tier 300MB quota — metadata still lands "
         "even when the upload fails. "
-        "Requires a writable library (web API key or hybrid mode); fails "
-        "in local-only mode. Remember to run zotero_update_search_database "
+        "Requires Zotero write authorization; local desktop writes are preferred. "
+        "Remember to run zotero_update_search_database "
         "afterwards to make the new item searchable semantically. "
         "Example: zotero_add_by_doi(doi='10.1145/3708319', "
         "collections=['9SU943GB'], tags=['MCP'])."
@@ -1121,7 +1115,7 @@ def add_by_doi(
         "a 'webpage' itemType that often isn't acceptable as a citation; "
         "resolve to a DOI and use zotero_add_by_doi instead when "
         "possible. "
-        "Requires a writable library (fails in local-only mode). Run "
+        "Requires Zotero write authorization. Run "
         "zotero_update_search_database afterwards for semantic search. "
         "Example: zotero_add_by_url(url='https://arxiv.org/abs/2602.14878', "
         "collections=['9SU943GB'])."
@@ -1417,7 +1411,10 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
                     )
                     # Must run inside the with-block — temp file disappears on exit.
                     webdav_suffix = _helpers._maybe_upload_to_webdav(
-                        attach_result, filepath, ctx
+                        attach_result,
+                        filepath,
+                        ctx,
+                        write_zot=write_zot,
                     )
                 pdf_status = "PDF attached" + webdav_suffix
             except Exception as e:
@@ -1734,8 +1731,8 @@ _UPDATE_ITEM_API_TO_PARAM = {
         "To migrate an item across types (e.g., journalArticle → book), pass item_type "
         "with a valid Zotero item-type vocabulary value; overlapping fields are preserved "
         "and type-specific fields that do not map to the target type are dropped. "
-        "Requires a writable library (web API key or hybrid mode); fails "
-        "in local-only mode. To edit notes use zotero_update_note, not "
+        "Requires Zotero write authorization; local desktop writes are preferred. "
+        "To edit notes use zotero_update_note, not "
         "this. "
         "Example: zotero_update_item(item_key='RTKZQI8E', "
         "add_tags=['reviewed'], doi='10.1145/3708319')."
@@ -2229,8 +2226,7 @@ def find_duplicates(
         "string) — pass as an array, not a single concatenated string. "
         "The keeper itself must NOT appear in this list. "
         "confirm: False (default) runs dry; True executes the merge. "
-        "Requires a writable library (web API key or hybrid mode); fails "
-        "in local-only mode. "
+        "Requires Zotero write authorization; local desktop writes are preferred. "
         "Example dry-run: zotero_merge_duplicates("
         "keeper_key='ABC12345', duplicate_keys=['XYZ98765']). "
         "Example execute: same, plus confirm=True."
@@ -2532,7 +2528,7 @@ def get_pdf_outline(
         "the same filename exists) | 'duplicate'. Legacy aliases: "
         "skip=reuse, file=merge. "
         "create_missing_collections: create unknown collection specs. "
-        "Requires a writable library (fails in local-only mode). PDF "
+        "Requires Zotero write authorization. PDF "
         "uploads may hit the 300MB Zotero cloud free-tier quota — "
         "metadata still lands. Run zotero_update_search_database "
         "afterwards for semantic search. "
@@ -2681,7 +2677,12 @@ def add_from_file(
             )
             attach_info = (
                 f"File attached: {display_name}"
-                + _helpers._maybe_upload_to_webdav(attach_result, file_path, ctx)
+                + _helpers._maybe_upload_to_webdav(
+                    attach_result,
+                    file_path,
+                    ctx,
+                    write_zot=write_zot,
+                )
             )
         except Exception as e:
             attach_info = f"Item created but file attachment failed: {e}"

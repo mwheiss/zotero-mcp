@@ -197,31 +197,45 @@ class TestGetWriteClient:
         assert read_zot is write_zot
         assert read_zot is fake
 
-    def test_hybrid_mode_different_clients(self, monkeypatch):
+    def test_local_mode_prefers_one_local_write_client(self, monkeypatch):
         local = FakeZotero()
-        web = FakeZotero()
-        monkeypatch.setattr("zotero_mcp.client.get_zotero_client", lambda: local)
         monkeypatch.setattr("zotero_mcp.utils.is_local_mode", lambda: True)
+        monkeypatch.setattr(
+            "zotero_mcp.client.get_local_write_zotero_client", lambda: local
+        )
+        read_zot, write_zot = server._get_write_client(DummyContext())
+        assert read_zot is local
+        assert write_zot is local
+
+    def test_old_local_api_falls_back_entirely_to_web(self, monkeypatch):
+        web = FakeZotero()
+        monkeypatch.setattr("zotero_mcp.utils.is_local_mode", lambda: True)
+        monkeypatch.setattr(
+            "zotero_mcp.client.get_local_write_zotero_client", lambda: None
+        )
         monkeypatch.setattr("zotero_mcp.client.get_web_zotero_client", lambda: web)
         monkeypatch.setattr("zotero_mcp.client.get_active_library", lambda: {})
         read_zot, write_zot = server._get_write_client(DummyContext())
-        assert read_zot is local
+        assert read_zot is web
         assert write_zot is web
 
     def test_local_only_raises(self, monkeypatch):
-        monkeypatch.setattr("zotero_mcp.client.get_zotero_client", lambda: FakeZotero())
         monkeypatch.setattr("zotero_mcp.utils.is_local_mode", lambda: True)
+        monkeypatch.setattr(
+            "zotero_mcp.client.get_local_write_zotero_client", lambda: None
+        )
         monkeypatch.setattr("zotero_mcp.client.get_web_zotero_client", lambda: None)
         with pytest.raises(ValueError, match="Cannot perform write"):
             server._get_write_client(DummyContext())
 
     def test_library_override_propagated(self, monkeypatch):
-        local = FakeZotero()
         web = FakeZotero()
         web.library_id = "personal"
         web.library_type = "user"
-        monkeypatch.setattr("zotero_mcp.client.get_zotero_client", lambda: local)
         monkeypatch.setattr("zotero_mcp.utils.is_local_mode", lambda: True)
+        monkeypatch.setattr(
+            "zotero_mcp.client.get_local_write_zotero_client", lambda: None
+        )
         monkeypatch.setattr("zotero_mcp.client.get_web_zotero_client", lambda: web)
         monkeypatch.setattr("zotero_mcp.client.get_active_library", lambda: {
             "library_id": "group123", "library_type": "group"
@@ -231,12 +245,13 @@ class TestGetWriteClient:
         assert write_zot.library_type == "groups"
 
     def test_cleared_override_no_change(self, monkeypatch):
-        local = FakeZotero()
         web = FakeZotero()
         web.library_id = "personal"
         web.library_type = "user"
-        monkeypatch.setattr("zotero_mcp.client.get_zotero_client", lambda: local)
         monkeypatch.setattr("zotero_mcp.utils.is_local_mode", lambda: True)
+        monkeypatch.setattr(
+            "zotero_mcp.client.get_local_write_zotero_client", lambda: None
+        )
         monkeypatch.setattr("zotero_mcp.client.get_web_zotero_client", lambda: web)
         monkeypatch.setattr("zotero_mcp.client.get_active_library", lambda: {})
         _, write_zot = server._get_write_client(DummyContext())

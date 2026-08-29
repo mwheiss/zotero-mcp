@@ -71,7 +71,8 @@ def effective_tool_profile() -> str:
     requested = requested_tool_profile()
     if requested != "auto":
         return requested
-    return "full" if os.getenv("ZOTERO_API_KEY") else "research"
+    local = os.getenv("ZOTERO_LOCAL", "").lower() in {"1", "true", "yes"}
+    return "full" if local or os.getenv("ZOTERO_API_KEY") else "research"
 
 
 def tool_visible(name: str, profile: str | None = None) -> bool:
@@ -106,8 +107,9 @@ def tool_visible(name: str, profile: str | None = None) -> bool:
         "yes",
     }:
         return False
+    local = os.getenv("ZOTERO_LOCAL", "").lower() in {"1", "true", "yes"}
     if name in WRITE_TOOLS and (
-        profile == "research" or not os.getenv("ZOTERO_API_KEY")
+        profile == "research" or not (local or os.getenv("ZOTERO_API_KEY"))
     ):
         return False
     return visible

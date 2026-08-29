@@ -214,4 +214,4 @@ def test_export_bibliography_api_error(monkeypatch):
     monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: _ErrZot())
 
     out = synthesis.export_bibliography(item_keys=["ABCD1234"], ctx=DummyContext())
-    assert "web API" in out.lower() or "ZOTERO_API_KEY" in out
+    assert "active Zotero API could not render" in out
