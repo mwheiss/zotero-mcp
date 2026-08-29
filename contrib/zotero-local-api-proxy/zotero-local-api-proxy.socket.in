@@ -1,0 +1,15 @@
+[Unit]
+Description=LAN listener for the Zotero Local API
+Documentation=https://www.zotero.org/support/dev/web_api/v3/local_api
+After=network-online.target
+Wants=network-online.target
+
+[Socket]
+ListenStream=@LISTEN_STREAM@
+Accept=no
+NoDelay=true
+KeepAlive=true
+Service=zotero-local-api-proxy.service
+
+[Install]
+WantedBy=sockets.target

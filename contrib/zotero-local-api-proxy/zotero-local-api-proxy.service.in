@@ -1,0 +1,20 @@
+[Unit]
+Description=Proxy LAN connections to Zotero's loopback Local API
+Documentation=man:systemd-socket-proxyd(8)
+Requires=zotero-local-api-proxy.socket
+After=zotero-local-api-proxy.socket
+
+[Service]
+Type=notify
+ExecStart=@PROXY_BINARY@ --exit-idle-time=5min @TARGET_STREAM@
+DynamicUser=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6

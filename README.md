@@ -318,6 +318,10 @@ After installation, either:
    zotero-mcp authorize-local-writes
    ```
 
+   To expose a different Linux workstation's loopback-only Zotero API as a
+   boot-persistent LAN endpoint, use the included
+   [`systemd-socket-proxyd` installer](contrib/zotero-local-api-proxy/README.md).
+
    > **Important Note**: Environmental variables set in the shell you run `claude` in will override these values.
 
    > **Tip:** If Claude Desktop reports it can't find the `zotero-mcp` command, use the
