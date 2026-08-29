@@ -7,7 +7,7 @@ Use this document as instructions for Claude Co-Work. Copy/paste each section as
 - The local API is enabled in Zotero preferences ("Allow other applications on this computer to communicate with Zotero")
 - The modified zotero-mcp is installed (run `zotero-mcp version` in terminal to verify)
 
-**Important:** After each write operation, open Zotero and verify the change appeared. This confirms hybrid mode is working (local reads + web writes syncing back to local).
+**Important:** After each write operation, open Zotero and verify the change appeared immediately. This confirms the authenticated Local API write path is active; no cloud sync round trip should be required.
 
 **Test item tagging and cleanup rules:**
 

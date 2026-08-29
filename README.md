@@ -55,7 +55,7 @@
 - **Add papers by URL** (arXiv, DOI links, generic webpages) or from local files
 - Create and manage collections, update item metadata, batch-update tags
 - Find and merge duplicate items with dry-run preview
-- **Hybrid mode**: local reads + web API writes for local-mode users
+- **Local-first writes**: Zotero desktop authorizes changes directly; no cloud API key required
 
 ### 📊 Scite Citation Intelligence (optional `[scite]` extra)
 - **Citation tallies**: See how many papers support, contrast, or mention each item — the MCP version of the [Scite Zotero Plugin](https://github.com/scitedotai/scite-zotero-plugin)
@@ -63,9 +63,9 @@
 - No Scite account required — uses public API endpoints
 
 ### 🌐 Flexible Access Methods
-- Local mode for offline access (no API key needed)
+- Local mode for offline reads and writes (Zotero 10+; no cloud API key needed)
 - Web API for cloud library access
-- Hybrid mode: read from local Zotero, write via web API
+- Automatic Web API fallback for older Zotero versions when credentials exist
 
 ### ⌨️ Standalone CLI (`zotero-cli`)
 - Search, browse, and edit your library directly from the terminal — no AI assistant required
@@ -296,23 +296,27 @@ After installation, either:
        "zotero": {
          "command": "zotero-mcp",
          "env": {
-           "ZOTERO_LOCAL": "true",
-           "ZOTERO_API_KEY": "YOUR_API_KEY",
-           "ZOTERO_LIBRARY_ID": "YOUR_LIBRARY_ID"
+           "ZOTERO_LOCAL": "true"
          }
        }
      }
    }
    ```
 
-   For **local read-only use**, `ZOTERO_LOCAL: "true"` is all you need — drop the `ZOTERO_API_KEY` and `ZOTERO_LIBRARY_ID` lines entirely.
+   `ZOTERO_LOCAL: "true"` is sufficient for reads and, with Zotero 10 or
+   newer, writes. The first write opens Zotero's authorization dialog. Choose
+   **Always Allow** to reuse the local authorization; otherwise Zotero grants a
+   single-use key and prompts again for the next write.
 
-   The local API is fast but read-only, so the MCP server uses the Zotero web API for write operations.
-   
-   To enable **write mode**:
-   - Keep `ZOTERO_LOCAL: "true"` — with API credentials set, the server runs in hybrid mode (fast local reads, web API writes)
-   - Click [here](https://www.zotero.org/settings/security#applications) to generate a Zotero API key and replace `YOUR_API_KEY` with it
-   - `ZOTERO_LIBRARY_ID` is your numeric **userID**, shown on that same page (for a group library, use the group's ID and also set `ZOTERO_LIBRARY_TYPE: "group"`).
+   Cloud credentials are optional in local mode. When configured, they are
+   used only as a compatibility fallback if the running Zotero does not expose
+   local writes. For remote Web API setup, use the instructions below.
+
+   You can authorize before the first MCP write from a terminal:
+
+   ```bash
+   zotero-mcp authorize-local-writes
+   ```
 
    > **Important Note**: Environmental variables set in the shell you run `claude` in will override these values.
 
@@ -342,13 +346,13 @@ Example prompts:
 
 ### For Autohand Code
 
-After installing Zotero MCP, add a local read-only server with:
+After installing Zotero MCP, add a local server with:
 
 ```bash
 autohand mcp add zotero env ZOTERO_LOCAL=true zotero-mcp
 ```
 
-Add `--scope project` after `add` to keep the server configuration in the current project. For hybrid or web API access, add the credentials described above to the `env` command. See [Autohand Code](https://github.com/autohandai/code-cli/) for current installation and CLI details.
+Add `--scope project` after `add` to keep the server configuration in the current project. For remote Web API access, add the credentials described below to the `env` command. See [Autohand Code](https://github.com/autohandai/code-cli/) for current installation and CLI details.
 
 ### For Cherry Studio
 
@@ -389,6 +393,8 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 
 **Zotero Connection:**
 - `ZOTERO_LOCAL=true`: Use the local Zotero API (default: false)
+- `ZOTERO_LOCAL_PORT`: Override the local Zotero API port (default: 23119)
+- `ZOTERO_MCP_LOCAL_AUTH_PATH`: Override the private remembered local-write authorization file
 - `ZOTERO_API_KEY`: Your Zotero API key (for web API)
 - `ZOTERO_LIBRARY_ID`: Your Zotero library ID (for web API)
 - `ZOTERO_LIBRARY_TYPE`: The type of library (user or group, default: user)

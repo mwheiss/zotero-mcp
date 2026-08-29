@@ -16,7 +16,7 @@ The server needs to know how to connect to your Zotero library. There are two ma
 
 ### Option 1: Local Zotero (Recommended)
 
-If you're running Zotero 7 or newer on the same machine, you can connect to the local API:
+If you're running Zotero on the same machine, you can connect to the local API. Zotero 10+ supports both reads and writes:
 
 1. Enable the local API in Zotero's preferences:
    - Open Zotero
@@ -27,6 +27,10 @@ If you're running Zotero 7 or newer on the same machine, you can connect to the 
    ```bash
    export ZOTERO_LOCAL=true
    ```
+
+3. On the first write, approve Zotero MCP in Zotero's authorization dialog.
+   **Always Allow** stores a local-only authorization key; **Allow** grants a
+   key for one write. A zotero.org API key is not required.
 
 ### Option 2: Zotero Web API
 

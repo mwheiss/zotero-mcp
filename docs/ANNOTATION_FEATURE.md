@@ -182,12 +182,14 @@ Solution: `normalize_for_matching()` removes ALL spaces and lowercases, making c
 ### 3. Neighboring Page Search
 PDF page numbers often don't match document page numbers (due to front matter). The tool automatically searches ±2 pages if text isn't found on the specified page.
 
-### 4. Hybrid Storage Support
+### 4. Local-First Storage Support
 Works with both:
-- **Zotero Cloud Storage**: Downloads via Web API
-- **WebDAV Storage**: Downloads via local Zotero (port 23119)
+- **Local Zotero storage**: Downloads and writes via the desktop API
+- **Zotero Cloud Storage**: Downloads via Web API as a fallback
+- **WebDAV Storage**: Downloads via local Zotero or direct WebDAV
 
-Annotations are always created via Web API (local API is read-only).
+Annotations are created through the authenticated Local API on Zotero 10+.
+The Web API is only a compatibility fallback for older desktop versions.
 
 ---
 
