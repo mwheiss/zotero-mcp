@@ -180,7 +180,8 @@ Zotero must be running with local API access enabled. If a firewall is active,
 allow TCP port $LISTEN_PORT from the MCP server's LAN address.
 
 Verify from the MCP server:
-  curl -i http://<CACHYOS-LAN-IP>:$LISTEN_PORT/api/
+  curl -i -H 'Host: 127.0.0.1:$TARGET_PORT' \\
+    http://<CACHYOS-LAN-IP>:$LISTEN_PORT/api/
 
 Then authorize the selected endpoint:
   ZOTERO_REMOTE_LOCAL_URL=http://<CACHYOS-LAN-IP>:$LISTEN_PORT/api \\

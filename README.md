@@ -399,6 +399,9 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `ZOTERO_LOCAL=true`: Use the local Zotero API (default: false)
 - `ZOTERO_LOCAL_PORT`: Override the local Zotero API port (default: 23119)
 - `ZOTERO_REMOTE_LOCAL_URL`: Prefer another Zotero Local API for writes, then fall back to server-local Zotero. Accepts LAN HTTP, HTTPS, or a loopback SSH tunnel URL ending in `/api`
+- `ZOTERO_REMOTE_LOCAL_HOST_HEADER`: Host header sent through a remote-local proxy (default: `127.0.0.1:23119`; set `preserve` when a reverse proxy rewrites Host itself)
+- `ZOTERO_REMOTE_LOCAL_API_KEY`: Optional remembered Local API key for the remote-local Zotero instance
+- `ZOTERO_LOCAL_API_KEY`: Optional remembered Local API key used for local endpoints when a remote-specific key is not set
 - `ZOTERO_MCP_LOCAL_AUTH_PATH`: Override the private remembered local-write authorization file
 - `ZOTERO_API_KEY`: Your Zotero API key (for web API)
 - `ZOTERO_LIBRARY_ID`: Your Zotero library ID (for web API)

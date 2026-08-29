@@ -28,10 +28,14 @@ ss -ltnp | grep 23120
 From the MCP server:
 
 ```bash
-curl -i http://CACHYOS_LAN_IP:23120/api/
+curl -i -H 'Host: 127.0.0.1:23119' \
+  http://CACHYOS_LAN_IP:23120/api/
 ```
 
 The response should include `Zotero-API-Version` and `Zotero-Server-ID` headers.
+Zotero validates the HTTP `Host` header even though the TCP listener is proxied;
+Zotero MCP applies this loopback Host header automatically for remote-local
+requests.
 
 ## Firewall
 
@@ -72,6 +76,24 @@ ZOTERO_REMOTE_LOCAL_URL=http://CACHYOS_LAN_IP:23120/api \
 
 The dialog appears in Zotero on the workstation. Choose **Always Allow** to
 avoid a prompt for every write.
+
+If another trusted application already stores a remembered key for the same
+`Zotero-Server-ID`, that exact key can be shared explicitly instead:
+
+```bash
+ZOTERO_REMOTE_LOCAL_API_KEY=THE_EXISTING_32_CHARACTER_KEY
+```
+
+Zotero does not provide an endpoint that reveals remembered keys, so the key
+must be copied from that application's private configuration; the server ID
+alone is not enough to recover it.
+
+BetterIssa's authorization store can be imported without printing the key:
+
+```bash
+zotero-mcp import-local-authorization \
+  ~/.config/betterissa/zotero-local-authorizations.json
+```
 
 ## Reconfigure or uninstall
 
