@@ -66,6 +66,21 @@ def remote_local_api_endpoint() -> str | None:
     return parsed._replace(path=path, params="", query="", fragment="").geturl()
 
 
+def remote_local_host_header() -> str | None:
+    """Return the Host header expected by the proxied Zotero HTTP server."""
+    configured = os.getenv("ZOTERO_REMOTE_LOCAL_HOST_HEADER")
+    if configured is None or not configured.strip():
+        return "127.0.0.1:23119"
+    value = configured.strip()
+    if value.lower() in {"none", "preserve"}:
+        return None
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        raise ValueError(
+            "ZOTERO_REMOTE_LOCAL_HOST_HEADER must be a single HTTP Host value"
+        )
+    return value
+
+
 def writable_local_api_endpoints() -> list[tuple[str, str]]:
     """Return remote-first writable endpoints with stable role labels."""
     local_endpoint = local_api_endpoint()
@@ -85,6 +100,63 @@ def local_auth_path() -> Path:
     return Path.home() / ".config" / "zotero-mcp" / "local-api-auth.json"
 
 
+def import_local_authorization_store(
+    source_path: str | Path,
+    *,
+    destination_path: str | Path | None = None,
+) -> list[str]:
+    """Import remembered keys from BetterIssa or Zotero MCP without exposing them."""
+    source = Path(source_path).expanduser()
+    source_mode = source.stat().st_mode & 0o777
+    if source_mode & 0o077:
+        raise ValueError(
+            f"Authorization source must not be group/world accessible (mode {source_mode:o})"
+        )
+    with source.open(encoding="utf-8") as source_file:
+        payload = json.load(source_file)
+    if not isinstance(payload, dict):
+        raise ValueError("Authorization source must contain a JSON object")
+    source_servers = payload.get("servers") if payload.get("version") else payload
+    if not isinstance(source_servers, dict):
+        raise ValueError("Authorization source has no server-key mapping")
+
+    imported: dict[str, dict[str, str]] = {}
+    for server_id, entry in source_servers.items():
+        if not isinstance(server_id, str) or not server_id:
+            continue
+        if not isinstance(entry, dict) or entry.get("remember") is False:
+            continue
+        key = entry.get("key")
+        if not isinstance(key, str) or len(key) != 32:
+            continue
+        imported[server_id] = {"key": key}
+    if not imported:
+        raise ValueError("Authorization source contains no remembered 32-character keys")
+
+    destination = (
+        Path(destination_path).expanduser()
+        if destination_path is not None
+        else local_auth_path()
+    )
+    try:
+        with destination.open(encoding="utf-8") as destination_file:
+            current = json.load(destination_file)
+        if not isinstance(current, dict):
+            current = {}
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        current = {}
+    current["version"] = 1
+    servers = current.setdefault("servers", {})
+    if not isinstance(servers, dict):
+        servers = {}
+        current["servers"] = servers
+    servers.update(imported)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(destination, current, indent=2)
+    destination.chmod(0o600)
+    return sorted(imported)
+
+
 class LocalApiHttpClient(httpx.Client):
     """HTTP/1.1 client that adds Zotero's local write authorization contract."""
 
@@ -93,6 +165,8 @@ class LocalApiHttpClient(httpx.Client):
         *,
         authorize_writes: bool = False,
         endpoint: str | None = None,
+        host_header: str | None = None,
+        api_key: str | None = None,
         auth_path: Path | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
@@ -101,14 +175,17 @@ class LocalApiHttpClient(httpx.Client):
         self.auth_path = auth_path or local_auth_path()
         self.server_id: str | None = None
         self.api_version: str | None = None
-        self._api_key: str | None = None
-        self._key_remembered = False
+        self._api_key: str | None = api_key
+        self._key_remembered = bool(api_key)
         self._identity_lock = threading.RLock()
+        headers = {
+            "User-Agent": "Zotero-MCP",
+            "Zotero-API-Version": LOCAL_API_VERSION,
+        }
+        if host_header:
+            headers["Host"] = host_header
         super().__init__(
-            headers={
-                "User-Agent": "Zotero-MCP",
-                "Zotero-API-Version": LOCAL_API_VERSION,
-            },
+            headers=headers,
             follow_redirects=True,
             timeout=30.0,
             transport=transport or httpx.HTTPTransport(http1=True, http2=False),

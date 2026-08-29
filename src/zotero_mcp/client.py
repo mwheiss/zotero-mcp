@@ -24,6 +24,7 @@ from zotero_mcp.local_api import (
     LocalApiWriteUnavailableError,
     LocalWriteZotero,
     local_api_endpoint,
+    remote_local_host_header,
     writable_local_api_endpoints,
 )
 from zotero_mcp.utils import format_creators
@@ -296,6 +297,8 @@ def _make_local_http_client(
     *,
     authorize_writes: bool = False,
     endpoint: str | None = None,
+    host_header: str | None = None,
+    api_key: str | None = None,
 ) -> httpx.Client:
     """Return an httpx.Client pinned to HTTP/1.1 for the local Zotero server.
 
@@ -308,6 +311,8 @@ def _make_local_http_client(
     return LocalApiHttpClient(
         authorize_writes=authorize_writes,
         endpoint=endpoint,
+        host_header=host_header,
+        api_key=api_key,
     )
 
 
@@ -435,6 +440,17 @@ def get_local_write_zotero_client() -> zotero.Zotero | None:
             http_client = _make_local_http_client(
                 authorize_writes=True,
                 endpoint=endpoint,
+                host_header=(
+                    remote_local_host_header()
+                    if endpoint_role == "remote-local"
+                    else None
+                ),
+                api_key=(
+                    os.getenv("ZOTERO_REMOTE_LOCAL_API_KEY")
+                    or os.getenv("ZOTERO_LOCAL_API_KEY")
+                    if endpoint_role == "remote-local"
+                    else os.getenv("ZOTERO_LOCAL_API_KEY")
+                ),
             )
             server_id = _call_with_zotero_api_lock(http_client.ensure_server_id)
             raw_client = _configure_local_endpoint(

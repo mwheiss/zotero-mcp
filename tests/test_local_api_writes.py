@@ -16,7 +16,9 @@ from zotero_mcp.local_api import (
     LocalApiHttpClient,
     LocalApiServerChangedError,
     LocalWriteZotero,
+    import_local_authorization_store,
     remote_local_api_endpoint,
+    remote_local_host_header,
     writable_local_api_endpoints,
 )
 from zotero_mcp.tools import _helpers
@@ -73,6 +75,71 @@ def test_remembered_local_grant_is_persisted_and_reused(tmp_path):
     second.close()
 
     assert [request.url.path for request in calls].count("/api/local/authorize") == 1
+
+
+def test_explicit_local_api_key_skips_authorization(tmp_path):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if request.url.path == "/api/":
+            return _response()
+        assert request.url.path != "/api/local/authorize"
+        assert request.headers["Zotero-API-Key"] == "shared-betterissa-key"
+        return _response(204)
+
+    client = LocalApiHttpClient(
+        authorize_writes=True,
+        endpoint=ENDPOINT,
+        api_key="shared-betterissa-key",
+        auth_path=tmp_path / "auth.json",
+        transport=httpx.MockTransport(handler),
+    )
+    response = client.patch(f"{ENDPOINT}/users/0/items/A", json={})
+    client.close()
+
+    assert response.status_code == 204
+    assert "/api/local/authorize" not in [request.url.path for request in calls]
+
+
+def test_import_betterissa_authorization_store(tmp_path):
+    source = tmp_path / "betterissa.json"
+    source.write_text(
+        json.dumps(
+            {
+                SERVER_ID: {
+                    "key": "b" * 32,
+                    "remember": True,
+                    "updated_at": "2026-08-29T21:22:09+00:00",
+                },
+                "single-use": {"key": "c" * 32, "remember": False},
+            }
+        )
+    )
+    source.chmod(0o600)
+    destination = tmp_path / "zotero-mcp.json"
+
+    imported = import_local_authorization_store(
+        source,
+        destination_path=destination,
+    )
+
+    assert imported == [SERVER_ID]
+    stored = json.loads(destination.read_text())
+    assert stored == {
+        "version": 1,
+        "servers": {SERVER_ID: {"key": "b" * 32}},
+    }
+    assert destination.stat().st_mode & 0o777 == 0o600
+
+
+def test_import_authorization_store_rejects_public_source(tmp_path):
+    source = tmp_path / "public.json"
+    source.write_text(json.dumps({SERVER_ID: {"key": "b" * 32}}))
+    source.chmod(0o644)
+
+    with pytest.raises(ValueError, match="group/world"):
+        import_local_authorization_store(source)
 
 
 def test_single_use_grant_is_requested_for_each_write(tmp_path):
@@ -323,6 +390,28 @@ def test_authorize_local_writes_cli_reports_remembered_grant(
     assert "remembered until revoked" in output
 
 
+def test_import_local_authorization_cli_redacts_key(monkeypatch, tmp_path, capsys):
+    source = tmp_path / "betterissa.json"
+    secret = "z" * 32
+    source.write_text(json.dumps({SERVER_ID: {"key": secret, "remember": True}}))
+    source.chmod(0o600)
+    destination = tmp_path / "zotero-mcp.json"
+    monkeypatch.setenv("ZOTERO_MCP_LOCAL_AUTH_PATH", str(destination))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["zotero-mcp", "import-local-authorization", str(source)],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == 0
+    output = capsys.readouterr().out
+    assert SERVER_ID in output
+    assert secret not in output
+
+
 def test_local_attachment_upload_never_duplicates_bytes_to_webdav(monkeypatch):
     monkeypatch.setattr(
         "zotero_mcp.webdav.is_webdav_configured",
@@ -393,6 +482,20 @@ def test_writable_endpoints_are_remote_first(monkeypatch):
     ]
 
 
+def test_remote_local_host_header_defaults_for_raw_tcp_proxy(monkeypatch):
+    monkeypatch.delenv("ZOTERO_REMOTE_LOCAL_HOST_HEADER", raising=False)
+
+    assert remote_local_host_header() == "127.0.0.1:23119"
+
+
+def test_remote_local_host_header_can_be_preserved_or_overridden(monkeypatch):
+    monkeypatch.setenv("ZOTERO_REMOTE_LOCAL_HOST_HEADER", "preserve")
+    assert remote_local_host_header() is None
+
+    monkeypatch.setenv("ZOTERO_REMOTE_LOCAL_HOST_HEADER", "localhost:24119")
+    assert remote_local_host_header() == "localhost:24119"
+
+
 def test_write_client_falls_back_to_server_local_when_remote_is_offline(
     monkeypatch,
     tmp_path,
@@ -401,11 +504,19 @@ def test_write_client_falls_back_to_server_local_when_remote_is_offline(
     local = "http://127.0.0.1:23119/api"
     probes = []
 
-    def make_client(*, authorize_writes=False, endpoint=None):
+    def make_client(
+        *,
+        authorize_writes=False,
+        endpoint=None,
+        host_header=None,
+        api_key=None,
+    ):
         def handler(request):
             probes.append(str(request.url))
             if endpoint == remote:
+                assert request.headers["Host"] == "127.0.0.1:23119"
                 raise httpx.ConnectError("workstation offline", request=request)
+            assert request.headers["Host"] == "127.0.0.1:23119"
             return httpx.Response(
                 200,
                 headers={
@@ -417,6 +528,8 @@ def test_write_client_falls_back_to_server_local_when_remote_is_offline(
         return LocalApiHttpClient(
             authorize_writes=authorize_writes,
             endpoint=endpoint,
+            host_header=host_header,
+            api_key=api_key,
             auth_path=tmp_path / "auth.json",
             transport=httpx.MockTransport(handler),
         )
@@ -450,9 +563,16 @@ def test_write_client_uses_remote_without_probing_server_local(
     local = "http://127.0.0.1:23119/api"
     probes = []
 
-    def make_client(*, authorize_writes=False, endpoint=None):
+    def make_client(
+        *,
+        authorize_writes=False,
+        endpoint=None,
+        host_header=None,
+        api_key=None,
+    ):
         def handler(request):
             probes.append(str(request.url))
+            assert request.headers["Host"] == "127.0.0.1:23119"
             return httpx.Response(
                 200,
                 headers={
@@ -464,6 +584,8 @@ def test_write_client_uses_remote_without_probing_server_local(
         return LocalApiHttpClient(
             authorize_writes=authorize_writes,
             endpoint=endpoint,
+            host_header=host_header,
+            api_key=api_key,
             auth_path=tmp_path / "auth.json",
             transport=httpx.MockTransport(handler),
         )

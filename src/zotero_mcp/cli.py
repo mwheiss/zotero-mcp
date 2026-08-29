@@ -402,6 +402,14 @@ def main():
         "authorize-local-writes",
         help="Request Zotero desktop permission for Local API writes",
     )
+    import_local_auth_parser = subparsers.add_parser(
+        "import-local-authorization",
+        help="Import remembered Local API keys from BetterIssa or Zotero MCP",
+    )
+    import_local_auth_parser.add_argument(
+        "source",
+        help="Private JSON authorization store to import",
+    )
 
     # Update database command
     update_db_parser = subparsers.add_parser("update-db", help="Update semantic search database")
@@ -676,6 +684,20 @@ def main():
             f"for Zotero server {authorization['server_id']} via "
             f"{getattr(write_zot, 'local_endpoint_role', 'server-local')} "
             f"({persistence})."
+        )
+        sys.exit(0)
+
+    elif args.command == "import-local-authorization":
+        from zotero_mcp.local_api import import_local_authorization_store
+
+        try:
+            server_ids = import_local_authorization_store(args.source)
+        except Exception as exc:
+            print(f"Local authorization import failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(
+            "Imported remembered Local API authorization for server ID(s): "
+            + ", ".join(server_ids)
         )
         sys.exit(0)
 
