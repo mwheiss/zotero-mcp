@@ -32,6 +32,25 @@ If you're running Zotero on the same machine, you can connect to the local API. 
    **Always Allow** stores a local-only authorization key; **Allow** grants a
    key for one write. A zotero.org API key is not required.
 
+### Prefer a Different Zotero Desktop for Writes
+
+Keep `ZOTERO_LOCAL=true` so search and retrieval use Zotero on the MCP server,
+then point writes at your interactive workstation:
+
+```bash
+ssh -N -L 23120:127.0.0.1:23119 your-workstation
+export ZOTERO_REMOTE_LOCAL_URL=http://127.0.0.1:23120/api
+```
+
+Write tools probe that endpoint first and perform both their reads and writes
+there, preserving its local object-version namespace. If the tunnel or remote
+Zotero is unavailable when a workflow begins, they fall back to Zotero on the
+MCP server. A write that loses its connection after starting is reported as an
+error rather than repeated against another instance. LAN HTTP
+endpoints are accepted when explicitly configured, but their local
+authorization key travels unencrypted. An SSH tunnel or HTTPS reverse proxy is
+preferable whenever the network is not fully trusted.
+
 ### Option 2: Zotero Web API
 
 If you want to connect to your Zotero library via the web API:
