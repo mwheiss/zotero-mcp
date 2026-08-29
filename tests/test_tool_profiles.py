@@ -114,7 +114,25 @@ def test_capabilities_reports_effective_contract(monkeypatch):
     assert "**Tool profile:** research" in result
     assert "**Active library:** user:0" in result
     assert "**Write tools usable:** no" in result
-    assert "**Write transport:** local desktop API" in result
+    assert "**Write transport:** server-local" in result
+
+
+def test_capabilities_reports_remote_local_write_target(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "full")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setattr(
+        "zotero_mcp.tools.operational._client.get_local_write_zotero_client",
+        lambda: type(
+            "RemoteClient",
+            (),
+            {"local_endpoint_role": "remote-local"},
+        )(),
+    )
+
+    result = get_capabilities(ctx=DummyContext())
+
+    assert "**Write transport:** remote-local" in result
+    assert "**Write tools usable:** yes" in result
 
 
 def test_capabilities_path_report_matches_visible_tools(monkeypatch):

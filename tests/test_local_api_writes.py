@@ -10,11 +10,14 @@ import httpx
 import pytest
 
 from zotero_mcp import cli
+from zotero_mcp import client as zclient
 from zotero_mcp.local_api import (
     LocalApiAuthorizationError,
     LocalApiHttpClient,
     LocalApiServerChangedError,
     LocalWriteZotero,
+    remote_local_api_endpoint,
+    writable_local_api_endpoints,
 )
 from zotero_mcp.tools import _helpers
 
@@ -225,6 +228,74 @@ def test_local_file_upload_uses_raw_bytes_and_two_authorized_stages(tmp_path):
     assert "upload=UPLOAD1" in authorized_requests[1].content.decode()
 
 
+def test_remote_file_upload_ignores_backend_localhost_upload_url(tmp_path):
+    endpoint = "http://paper-workstation:23119/api"
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-remote-upload")
+    raw_upload_urls = []
+
+    def handler(request):
+        if request.url.path == "/api/":
+            return httpx.Response(
+                200,
+                headers={
+                    "Zotero-API-Version": "3",
+                    "Zotero-Server-ID": "remote-database",
+                },
+            )
+        if request.url.path == "/api/local/authorize":
+            return httpx.Response(
+                200,
+                json={"key": "a" * 32, "remember": True},
+                headers={
+                    "Zotero-API-Version": "3",
+                    "Zotero-Server-ID": "remote-database",
+                },
+            )
+        if request.url.path == "/api/local/uploads/REMOTE1":
+            raw_upload_urls.append(str(request.url))
+            return httpx.Response(201)
+        if not raw_upload_urls:
+            return httpx.Response(
+                200,
+                json={
+                    "url": "http://127.0.0.1:23119/api/local/uploads/REMOTE1",
+                    "uploadKey": "REMOTE1",
+                    "contentType": "application/pdf",
+                },
+                headers={
+                    "Zotero-API-Version": "3",
+                    "Zotero-Server-ID": "remote-database",
+                },
+            )
+        return httpx.Response(
+            204,
+            headers={
+                "Zotero-API-Version": "3",
+                "Zotero-Server-ID": "remote-database",
+            },
+        )
+
+    http_client = LocalApiHttpClient(
+        authorize_writes=True,
+        endpoint=endpoint,
+        auth_path=tmp_path / "auth.json",
+        transport=httpx.MockTransport(handler),
+    )
+    zot = LocalWriteZotero(
+        library_id="0",
+        library_type="user",
+        local=True,
+        client=http_client,
+    )
+    zot.endpoint = endpoint
+
+    assert zot._upload_local_file("ATTACH01", source) is True
+    zot.client.close()
+
+    assert raw_upload_urls == [f"{endpoint}/local/uploads/REMOTE1"]
+
+
 def test_authorize_local_writes_cli_reports_remembered_grant(
     monkeypatch,
     capsys,
@@ -270,3 +341,149 @@ def test_local_attachment_upload_never_duplicates_bytes_to_webdav(monkeypatch):
     )
 
     assert suffix == ""
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("http://paper-workstation:23119/api", "http://paper-workstation:23119/api"),
+        ("https://zotero.lan/api/", "https://zotero.lan/api"),
+        ("http://127.0.0.1:23120", "http://127.0.0.1:23120/api"),
+    ],
+)
+def test_remote_local_endpoint_accepts_lan_https_and_tunnels(
+    monkeypatch,
+    configured,
+    expected,
+):
+    monkeypatch.setenv("ZOTERO_REMOTE_LOCAL_URL", configured)
+
+    assert remote_local_api_endpoint() == expected
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "ftp://paper-workstation/api",
+        "http://user:password@paper-workstation/api",
+        "http://paper-workstation/not-api",
+        "http://paper-workstation/api?key=secret",
+    ],
+)
+def test_remote_local_endpoint_rejects_ambiguous_or_credentialed_urls(
+    monkeypatch,
+    configured,
+):
+    monkeypatch.setenv("ZOTERO_REMOTE_LOCAL_URL", configured)
+
+    with pytest.raises(ValueError, match="ZOTERO_REMOTE_LOCAL_URL"):
+        remote_local_api_endpoint()
+
+
+def test_writable_endpoints_are_remote_first(monkeypatch):
+    monkeypatch.setenv(
+        "ZOTERO_REMOTE_LOCAL_URL",
+        "http://paper-workstation:23119/api",
+    )
+    monkeypatch.setenv("ZOTERO_LOCAL_PORT", "23119")
+
+    assert writable_local_api_endpoints() == [
+        ("remote-local", "http://paper-workstation:23119/api"),
+        ("server-local", "http://127.0.0.1:23119/api"),
+    ]
+
+
+def test_write_client_falls_back_to_server_local_when_remote_is_offline(
+    monkeypatch,
+    tmp_path,
+):
+    remote = "http://paper-workstation:23119/api"
+    local = "http://127.0.0.1:23119/api"
+    probes = []
+
+    def make_client(*, authorize_writes=False, endpoint=None):
+        def handler(request):
+            probes.append(str(request.url))
+            if endpoint == remote:
+                raise httpx.ConnectError("workstation offline", request=request)
+            return httpx.Response(
+                200,
+                headers={
+                    "Zotero-API-Version": "3",
+                    "Zotero-Server-ID": "server-local-database",
+                },
+            )
+
+        return LocalApiHttpClient(
+            authorize_writes=authorize_writes,
+            endpoint=endpoint,
+            auth_path=tmp_path / "auth.json",
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(
+        zclient,
+        "writable_local_api_endpoints",
+        lambda: [("remote-local", remote), ("server-local", local)],
+    )
+    monkeypatch.setattr(zclient, "_make_local_http_client", make_client)
+    monkeypatch.setattr(
+        zclient,
+        "get_current_library",
+        lambda: {"library_id": "0", "library_type": "user"},
+    )
+
+    write_zot = zclient.get_local_write_zotero_client()
+
+    assert write_zot is not None
+    assert write_zot.endpoint == local
+    assert write_zot.local_endpoint_role == "server-local"
+    assert len(probes) == 2
+    write_zot.client.close()
+
+
+def test_write_client_uses_remote_without_probing_server_local(
+    monkeypatch,
+    tmp_path,
+):
+    remote = "http://paper-workstation:23119/api"
+    local = "http://127.0.0.1:23119/api"
+    probes = []
+
+    def make_client(*, authorize_writes=False, endpoint=None):
+        def handler(request):
+            probes.append(str(request.url))
+            return httpx.Response(
+                200,
+                headers={
+                    "Zotero-API-Version": "3",
+                    "Zotero-Server-ID": "workstation-database",
+                },
+            )
+
+        return LocalApiHttpClient(
+            authorize_writes=authorize_writes,
+            endpoint=endpoint,
+            auth_path=tmp_path / "auth.json",
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(
+        zclient,
+        "writable_local_api_endpoints",
+        lambda: [("remote-local", remote), ("server-local", local)],
+    )
+    monkeypatch.setattr(zclient, "_make_local_http_client", make_client)
+    monkeypatch.setattr(
+        zclient,
+        "get_current_library",
+        lambda: {"library_id": "0", "library_type": "user"},
+    )
+
+    write_zot = zclient.get_local_write_zotero_client()
+
+    assert write_zot is not None
+    assert write_zot.endpoint == remote
+    assert write_zot.local_endpoint_role == "remote-local"
+    assert probes == [f"{remote}/"]
+    write_zot.client.close()

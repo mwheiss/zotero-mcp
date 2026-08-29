@@ -673,7 +673,9 @@ def main():
         )
         print(
             "Local write authorization granted "
-            f"for Zotero server {authorization['server_id']} ({persistence})."
+            f"for Zotero server {authorization['server_id']} via "
+            f"{getattr(write_zot, 'local_endpoint_role', 'server-local')} "
+            f"({persistence})."
         )
         sys.exit(0)
 

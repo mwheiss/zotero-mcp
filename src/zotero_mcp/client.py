@@ -24,6 +24,7 @@ from zotero_mcp.local_api import (
     LocalApiWriteUnavailableError,
     LocalWriteZotero,
     local_api_endpoint,
+    writable_local_api_endpoints,
 )
 from zotero_mcp.utils import format_creators
 from zotero_mcp.webdav import (
@@ -291,7 +292,11 @@ def get_current_library() -> dict[str, str]:
     return get_active_library() or get_default_library()
 
 
-def _make_local_http_client(*, authorize_writes: bool = False) -> httpx.Client:
+def _make_local_http_client(
+    *,
+    authorize_writes: bool = False,
+    endpoint: str | None = None,
+) -> httpx.Client:
     """Return an httpx.Client pinned to HTTP/1.1 for the local Zotero server.
 
     Zotero 8's local server (port 23119) only speaks HTTP/1.0. httpx defaults
@@ -300,12 +305,18 @@ def _make_local_http_client(*, authorize_writes: bool = False) -> httpx.Client:
     (#160). Forcing http1=True / http2=False on the transport keeps requests
     on HTTP/1.1 and the local API answers normally.
     """
-    return LocalApiHttpClient(authorize_writes=authorize_writes)
+    return LocalApiHttpClient(
+        authorize_writes=authorize_writes,
+        endpoint=endpoint,
+    )
 
 
-def _configure_local_endpoint(client: zotero.Zotero) -> zotero.Zotero:
+def _configure_local_endpoint(
+    client: zotero.Zotero,
+    endpoint: str | None = None,
+) -> zotero.Zotero:
     """Point pyzotero at the configured local port."""
-    client.endpoint = local_api_endpoint()
+    client.endpoint = endpoint or local_api_endpoint()
     return client
 
 
@@ -409,34 +420,46 @@ def get_local_zotero_client() -> zotero.Zotero | None:
 
 
 def get_local_write_zotero_client() -> zotero.Zotero | None:
-    """Return a local-first writable client when Zotero supports local writes.
+    """Return a remote-first writable Local API client when available.
 
-    This probes only capability and server identity. Zotero's authorization
-    dialog is shown lazily on the first actual write request.
+    A configured remote-local endpoint is probed first. The server-local API is
+    used only if the remote endpoint is unreachable or lacks write support.
+    Authorization remains lazy until the first actual write request.
     """
-    try:
-        current = get_current_library()
-        library_id = current.get("library_id") or "0"
-        library_type = current.get("library_type") or "user"
-        http_client = _make_local_http_client(authorize_writes=True)
-        server_id = _call_with_zotero_api_lock(http_client.ensure_server_id)
-        raw_client = _configure_local_endpoint(
-            LocalWriteZotero(
-                library_id=library_id,
-                library_type=library_type,
-                api_key=None,
-                local=True,
-                client=http_client,
+    current = get_current_library()
+    library_id = current.get("library_id") or "0"
+    library_type = current.get("library_type") or "user"
+    for endpoint_role, endpoint in writable_local_api_endpoints():
+        http_client = None
+        try:
+            http_client = _make_local_http_client(
+                authorize_writes=True,
+                endpoint=endpoint,
             )
-        )
-        raw_client.local_server_id = server_id
-        return _SerializedCallProxy(raw_client)
-    except (
-        LocalApiWriteUnavailableError,
-        httpx.HTTPError,
-        OSError,
-    ):
-        return None
+            server_id = _call_with_zotero_api_lock(http_client.ensure_server_id)
+            raw_client = _configure_local_endpoint(
+                LocalWriteZotero(
+                    library_id=library_id,
+                    library_type=library_type,
+                    api_key=None,
+                    local=True,
+                    client=http_client,
+                ),
+                endpoint,
+            )
+            raw_client.local_server_id = server_id
+            raw_client.local_endpoint_role = endpoint_role
+            raw_client.local_endpoint = endpoint
+            return _SerializedCallProxy(raw_client)
+        except (
+            LocalApiWriteUnavailableError,
+            httpx.HTTPError,
+            OSError,
+        ):
+            if http_client is not None:
+                http_client.close()
+            continue
+    return None
 
 
 def get_zotero_server_id(client: zotero.Zotero | None = None) -> str | None:

@@ -38,10 +38,14 @@ def get_capabilities(*, ctx: Context) -> str:
     requested = requested_tool_profile()
     effective = effective_tool_profile()
     local_paths = tool_visible("zotero_get_attachment_path", effective)
-    local_write_available = (
-        _client.get_local_write_zotero_client() is not None
-        if local_mode
-        else False
+    local_write_client = (
+        _client.get_local_write_zotero_client() if local_mode else None
+    )
+    local_write_available = local_write_client is not None
+    local_write_role = getattr(
+        local_write_client,
+        "local_endpoint_role",
+        "server-local",
     )
     write_usable = (local_write_available or api_key) and any(
         tool_visible(tool_name, effective) for tool_name in WRITE_TOOLS
@@ -54,7 +58,7 @@ def get_capabilities(*, ctx: Context) -> str:
         f"**Active library:** {library.get('library_type', 'user')}:{library.get('library_id', '')}",
         f"**Zotero access:** {'local desktop API' if local_mode else 'Web API'}",
         f"**Write transport:** "
-        f"{'local desktop API' if local_write_available else 'Web API fallback' if api_key else 'unavailable'}",
+        f"{local_write_role if local_write_available else 'Web API fallback' if api_key else 'unavailable'}",
         f"**Write tools usable:** {'yes' if write_usable else 'no'}",
         f"**Semantic search installed:** {'yes' if semantic_available else 'no'}",
         f"**PDF page/outline support:** {'yes' if pdf_available else 'no'}",

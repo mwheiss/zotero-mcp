@@ -9,6 +9,7 @@ import os
 import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlparse
 
 import httpx
 from pyzotero import zotero
@@ -37,6 +38,43 @@ def local_api_endpoint() -> str:
     """Return the configured local API endpoint without a trailing slash."""
     port = os.getenv("ZOTERO_LOCAL_PORT", "23119").strip() or "23119"
     return f"http://127.0.0.1:{port}/api"
+
+
+def remote_local_api_endpoint() -> str | None:
+    """Return a validated remote-local endpoint, when configured.
+
+    Local API keys authorize broad writes. HTTPS and loopback tunnels are
+    preferable, but an explicitly configured LAN HTTP endpoint is accepted.
+    """
+    configured = os.getenv("ZOTERO_REMOTE_LOCAL_URL", "").strip()
+    if not configured:
+        return None
+    parsed = urlparse(configured)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(
+            "ZOTERO_REMOTE_LOCAL_URL must not contain credentials, a query, or a fragment"
+        )
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(
+            "ZOTERO_REMOTE_LOCAL_URL must be an absolute HTTP(S) URL"
+        )
+    path = parsed.path.rstrip("/")
+    if not path:
+        path = "/api"
+    elif not path.endswith("/api"):
+        raise ValueError("ZOTERO_REMOTE_LOCAL_URL must end in /api")
+    return parsed._replace(path=path, params="", query="", fragment="").geturl()
+
+
+def writable_local_api_endpoints() -> list[tuple[str, str]]:
+    """Return remote-first writable endpoints with stable role labels."""
+    local_endpoint = local_api_endpoint()
+    remote_endpoint = remote_local_api_endpoint()
+    endpoints = []
+    if remote_endpoint and remote_endpoint != local_endpoint:
+        endpoints.append(("remote-local", remote_endpoint))
+    endpoints.append(("server-local", local_endpoint))
+    return endpoints
 
 
 def local_auth_path() -> Path:
@@ -295,8 +333,12 @@ class LocalWriteZotero(zotero.Zotero):
         auth = registration.json()
         if auth.get("exists"):
             return False
+        upload_url = (
+            f"{self.endpoint}/local/uploads/"
+            f"{quote(str(auth['uploadKey']), safe='')}"
+        )
         upload = self.client.post(
-            auth["url"],
+            upload_url,
             content=source.read_bytes(),
             headers={
                 "Content-Type": auth.get("contentType")
