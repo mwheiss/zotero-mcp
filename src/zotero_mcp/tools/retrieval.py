@@ -103,7 +103,8 @@ def get_item_metadata(
         "DOI or title. attachment_key: optional exact child attachment key; "
         "use this when the caller wants a specific artifact. Returns item "
         "metadata, the selected attachment/source, and the selected "
-        "model-facing document text. In local mode that may be a preferred "
+        "model-facing document text directly in the tool response; it never "
+        "returns merely a server-local file path. In local mode that may be a preferred "
         "BetterIssa, structured-text, HTML, or PDF artifact; otherwise it "
         "uses Zotero indexed text and download conversion fallbacks. Direct "
         "PDF extraction may be page-capped, and image-only PDFs without OCR "
@@ -245,7 +246,11 @@ def get_item_fulltext(
                     tmpdir,
                     attachment.filename or f"{attachment.key}.pdf",
                     local_client=_client.get_local_zotero_client(),
-                    web_client=None if _utils.is_local_mode() else zot,
+                    web_client=(
+                        _client.get_web_zotero_client()
+                        if _utils.is_local_mode()
+                        else zot
+                    ),
                 )
 
                 if download.path and download.path.exists():
@@ -640,6 +645,9 @@ def get_collection_items(
         "item_key: the parent item's 8-character key. "
         "Returns parent-child structure as markdown: each attachment with "
         "its content type and filename, each note with its title. "
+        "This tool lists attachment keys but does not download files; pass an "
+        "attachment key to zotero_get_item_fulltext to retrieve its extracted "
+        "text. "
         "Scope: active library only. "
         "Example: zotero_get_item_children(item_key='RTKZQI8E') → its "
         "PDF attachment key + any notes."

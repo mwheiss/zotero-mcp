@@ -98,7 +98,11 @@ def _get_pdf_path(item_key: str, ctx: Context) -> tuple[str, str, str] | None:
             tmpdir,
             os.path.basename(filename),
             local_client=_client.get_local_zotero_client(),
-            web_client=None if _utils.is_local_mode() else zot,
+            web_client=(
+                _client.get_web_zotero_client()
+                if _utils.is_local_mode()
+                else zot
+            ),
         )
     except Exception:
         _cleanup_path(probe)
