@@ -40,6 +40,9 @@ then point writes at your interactive workstation:
 ```bash
 ssh -N -L 23120:127.0.0.1:23119 your-workstation
 export ZOTERO_REMOTE_LOCAL_URL=http://127.0.0.1:23120/api
+export ZOTERO_MCP_WRITE_SECRET='choose-a-private-admin-secret'
+# Required only for externally usable signed attachment transfer URLs:
+export ZOTERO_MCP_PUBLIC_BASE_URL='https://example.net/your-zotero-mcp-path'
 ```
 
 Write tools probe that endpoint first and perform both their reads and writes
@@ -210,6 +213,16 @@ When connected to Claude Desktop or another MCP client, you'll have access to th
 - **zotero_search_items**: Search your library by title, creator, or content
 - **zotero_get_item_metadata**: Get detailed information about a specific item, including complete raw metadata via `format="json"`
 - **zotero_get_item_fulltext**: Get the full text content of an item
+- **zotero_get_document_text**: Return canonical BetterIssa-first document text, never a local path
+- **zotero_list_attachments / zotero_get_attachment**: Discover and stream exact attachment binaries
+- **zotero_prepare_attachment_upload / zotero_put_attachment**: Stage and commit remote binary uploads
+- **zotero_update_attachment / zotero_set_attachment_trashed**: Update, trash, or restore attachments
+
+Every MCP mutation requires the private `write_secret` argument advertised in
+the tool schema. Its configured value is deliberately absent from descriptions
+and error messages. Attachment replacement, reparenting, and trashing also use
+a short-lived operation-bound confirmation from
+`zotero_prepare_attachment_change`.
 - **zotero_get_collections**: List all collections in your library
 - **zotero_get_collection_items**: Get all items in a specific collection
 - **zotero_get_item_children**: Get child items (attachments, notes) for a specific item

@@ -408,6 +408,10 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `ZOTERO_LIBRARY_TYPE`: The type of library (user or group, default: user)
 - `ZOTERO_MCP_LOCK_TIMEOUT`: Maximum seconds to wait for another Zotero API request across threads or processes (default: 45; `0` waits indefinitely)
 - `ZOTERO_MCP_API_LOCK_PATH`: Optional shared API lock-file path when MCP and CLI processes use different home/config directories
+- `ZOTERO_MCP_WRITE_SECRET`: Required per-call admin secret for every MCP tool that mutates Zotero or the semantic index. The value is never exposed in tool descriptions
+- `ZOTERO_MCP_PUBLIC_BASE_URL`: Public MCP URL prefix used to create short-lived signed attachment upload/download URLs
+- `ZOTERO_MCP_ATTACHMENT_MAX_BYTES`: Maximum staged attachment upload size (default: 512 MiB)
+- `ZOTERO_MCP_ATTACHMENT_STATE_DIR`: Private staging/token state directory (default: `~/.cache/zotero-mcp/attachments`)
 - `ZOTERO_WEBDAV_URL`: Optional WebDAV folder URL for direct attachment downloads in remote mode
 - `ZOTERO_WEBDAV_USERNAME`: Optional WebDAV username
 - `ZOTERO_WEBDAV_PASSWORD`: Optional WebDAV password
@@ -635,6 +639,14 @@ dependencies.
 ### 📚 Content Tools
 - `zotero_get_item_metadata`: Get detailed metadata (supports `format="markdown"`, `format="json"` for complete raw Zotero metadata, and `format="bibtex"`)
 - `zotero_get_item_fulltext`: Get full text content
+- `zotero_get_document_text`: Get the canonical BetterIssa-first model-facing document text with source provenance
+- `zotero_list_attachments`: List every attachment and its binary capabilities
+- `zotero_get_attachment`: Return an exact binary resource and short-lived streaming download URL
+- `zotero_prepare_attachment_upload`: Create a checksummed staged binary upload
+- `zotero_prepare_attachment_change`: Preview and authorize a version-bound destructive attachment change
+- `zotero_put_attachment`: Create or replace an imported attachment from a staged upload
+- `zotero_update_attachment`: Update attachment metadata, with confirmation for reparenting
+- `zotero_set_attachment_trashed`: Trash or restore an attachment; permanent deletion is unavailable
 - `zotero_get_item_children`: Get attachments and notes
 
 ### 📝 Annotation & Notes Tools
