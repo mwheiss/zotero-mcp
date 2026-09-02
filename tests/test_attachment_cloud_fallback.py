@@ -22,6 +22,21 @@ class _MetadataClient:
     def fulltext_item(self, _attachment_key):
         raise RuntimeError("not indexed")
 
+    def children(self, _item_key):
+        return [
+            {
+                "key": "ATTACH01",
+                "data": {
+                    "key": "ATTACH01",
+                    "itemType": "attachment",
+                    "parentItem": "PARENT01",
+                    "title": "PDF",
+                    "filename": "paper.pdf",
+                    "contentType": "application/pdf",
+                },
+            }
+        ]
+
 
 def _unavailable_reader(**_kwargs):
     raise OSError("local snapshot unavailable")
@@ -43,16 +58,10 @@ def test_fulltext_local_mode_retains_web_api_file_fallback(monkeypatch):
     monkeypatch.setattr(retrieval._client, "get_local_zotero_client", lambda: local_client)
     monkeypatch.setattr(retrieval._client, "get_web_zotero_client", lambda: web_client)
     monkeypatch.setattr(retrieval._client, "download_attachment_file", download)
-    monkeypatch.setattr(retrieval._client, "convert_to_markdown", lambda _path: "Converted cloud text")
     monkeypatch.setattr(
-        retrieval._client,
-        "get_attachment_details",
-        lambda *_args: AttachmentDetails(
-            key="ATTACH01",
-            title="PDF",
-            filename="paper.pdf",
-            content_type="application/pdf",
-        ),
+        retrieval._attachments,
+        "document_text_from_file",
+        lambda _path, _kind: "Converted cloud text",
     )
     monkeypatch.setattr(retrieval._utils, "is_local_mode", lambda: True)
     monkeypatch.setattr("zotero_mcp.local_db.LocalZoteroReader", _unavailable_reader)

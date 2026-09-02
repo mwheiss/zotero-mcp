@@ -1,7 +1,10 @@
 """Tool modules — importing this package registers all tools with the MCP app."""
 
+# Signed attachment transfer routes share the same HTTP app but are not MCP tools.
+from zotero_mcp import attachment_http as attachment_http  # noqa: F401,E402
 from zotero_mcp.tools import (  # noqa: F401
     annotations,
+    attachments,
     connectors,
     discovery,
     operational,

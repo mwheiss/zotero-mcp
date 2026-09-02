@@ -8,6 +8,7 @@ import tempfile
 import time as _time
 from typing import Literal
 
+from zotero_mcp import attachment_service as _attachments
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
@@ -138,6 +139,7 @@ def get_item_fulltext(
             return f"No item found with key: {item_key}"
 
         selected_attachment = None
+        selected_artifact_type = None
         if attachment_key:
             selected_item = zot.item(attachment_key)
             selected_data = selected_item.get("data", {})
@@ -149,6 +151,7 @@ def get_item_fulltext(
                     f"item `{item_key}`."
                 )
             selected_attachment = _client.get_attachment_details(zot, selected_item)
+            selected_artifact_type = _attachments.attachment_artifact_type(selected_item)
 
         # Get item metadata in markdown format
         metadata = _client.format_item_metadata(item, include_abstract=True)
@@ -204,8 +207,19 @@ def get_item_fulltext(
                                 source = extracted[1] if len(extracted) > 1 else "file"
                                 context_info(ctx, f"Retrieved full text from local storage ({source})")
                                 source_line = f"**Selected source:** {source}"
-                                if attachment_key:
-                                    source_line += f" (`{attachment_key}`)"
+                                extraction_details = reader.last_extraction_details or {}
+                                selected_key = extraction_details.get("attachment_key") or attachment_key
+                                if selected_key:
+                                    source_line += f"\n\n**Selected attachment:** `{selected_key}`"
+                                page_count = extraction_details.get("page_count")
+                                page_cap = extraction_details.get("page_cap")
+                                if page_count is not None and page_cap is not None:
+                                    complete = page_count <= page_cap
+                                    source_line += (
+                                        f"\n\n**Extraction completeness:** "
+                                        f"{'complete' if complete else 'page-capped'} "
+                                        f"({min(page_count, page_cap)}/{page_count} pages)"
+                                    )
                                 return _helpers._prepend_size_warning(
                                     f"{metadata}\n\n---\n\n## Full Text\n\n"
                                     f"{source_line}\n\n{extracted[0]}",
@@ -216,7 +230,18 @@ def get_item_fulltext(
             context_info(ctx, f"Local extraction fallback not available: {str(local_extract_error)}")
 
         # Try to get attachment details
-        attachment = selected_attachment or _client.get_attachment_details(zot, item)
+        attachment = selected_attachment
+        if attachment is None:
+            selected = _attachments.select_best_attachment(zot.children(item_key))
+            if selected is not None:
+                selected_item, selected_artifact_type = selected
+                selected_data = selected_item.get("data", {}) or {}
+                attachment = _client.AttachmentDetails(
+                    key=selected_item.get("key") or selected_data.get("key", ""),
+                    title=selected_data.get("title", "Untitled"),
+                    filename=selected_data.get("filename", ""),
+                    content_type=selected_data.get("contentType", ""),
+                )
         if not attachment:
             return f"{metadata}\n\n---\n\nNo suitable attachment found for this item."
 
@@ -224,6 +249,9 @@ def get_item_fulltext(
 
         # Try fetching full text from Zotero's full text index first
         try:
+            use_zotero_index = selected_artifact_type in {"ocr-pdf", "pdf"}
+            if not use_zotero_index:
+                raise ValueError("selected artifact should be read directly")
             full_text_data = zot.fulltext_item(attachment.key)
             if full_text_data and "content" in full_text_data and full_text_data["content"]:
                 context_info(ctx, "Successfully retrieved full text from Zotero's index")
@@ -255,10 +283,14 @@ def get_item_fulltext(
 
                 if download.path and download.path.exists():
                     context_info(ctx, f"Downloaded file via {download.source} to {download.path}, converting to markdown")
-                    converted_text = _client.convert_to_markdown(download.path)
+                    converted_text = _attachments.document_text_from_file(
+                        download.path,
+                        selected_artifact_type or "file",
+                    )
                     return _helpers._prepend_size_warning(
                         f"{metadata}\n\n---\n\n## Full Text\n\n"
-                        f"**Selected attachment:** `{attachment.key}` ({download.source})\n\n"
+                        f"**Selected attachment:** `{attachment.key}`\n\n"
+                        f"**Selected source:** {selected_artifact_type or 'file'} via {download.source}\n\n"
                         f"{converted_text}",
                         "Consider using zotero_semantic_search to find specific content instead of reading full papers.",
                     )

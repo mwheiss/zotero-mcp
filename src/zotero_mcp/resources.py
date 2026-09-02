@@ -10,6 +10,8 @@ The Zotero client is reached lazily via module-level attribute access
 resource holds the shared API lock while talking to Zotero.
 """
 
+import tempfile
+
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
@@ -99,3 +101,33 @@ def collection_items_resource(collection_key: str) -> str:
         return _helpers._prepend_size_warning("\n".join(lines))
     except Exception as e:
         return f"# Collection {collection_key}\n\nError loading collection items: {e}"
+
+
+@mcp.resource(
+    "zotero://attachments/{attachment_key}/content",
+    name="Zotero attachment binary",
+    description=(
+        "Exact binary content for one Zotero attachment. Intended for MCP clients "
+        "that support binary resources; use zotero_get_attachment for a streaming "
+        "download URL when the file is large."
+    ),
+    mime_type="application/octet-stream",
+)
+def attachment_binary_resource(attachment_key: str) -> bytes:
+    with tempfile.TemporaryDirectory() as temporary:
+        zot = _client.get_zotero_client()
+        item = zot.item(attachment_key)
+        data = item.get("data", {}) if item else {}
+        if data.get("itemType") != "attachment":
+            raise ValueError(f"No attachment found with key {attachment_key}")
+        filename = data.get("filename") or f"{attachment_key}.bin"
+        result = _client.download_attachment_file(
+            attachment_key,
+            temporary,
+            filename,
+            local_client=_client.get_local_zotero_client(),
+            web_client=_client.get_web_zotero_client(),
+        )
+        if not result.path:
+            raise ValueError("Attachment binary unavailable: " + "; ".join(result.errors))
+        return result.path.read_bytes()

@@ -64,6 +64,16 @@ from zotero_mcp.tools.annotations import (  # noqa: F401
     update_annotation,
     update_note,
 )
+from zotero_mcp.tools.attachments import (  # noqa: F401
+    get_attachment,
+    get_document_text,
+    list_attachments,
+    prepare_attachment_change,
+    prepare_attachment_upload,
+    put_attachment,
+    set_attachment_trashed,
+    update_attachment,
+)
 from zotero_mcp.tools.connectors import (  # noqa: F401
     chatgpt_connector_search,
     connector_fetch,
