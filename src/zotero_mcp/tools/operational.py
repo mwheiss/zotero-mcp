@@ -47,9 +47,11 @@ def get_capabilities(*, ctx: Context) -> str:
         "local_endpoint_role",
         "server-local",
     )
-    write_usable = (local_write_available or api_key) and any(
+    write_transport_usable = (local_write_available or api_key) and any(
         tool_visible(tool_name, effective) for tool_name in WRITE_TOOLS
     )
+    write_gate_configured = bool(os.getenv("ZOTERO_MCP_WRITE_SECRET"))
+    write_usable = write_transport_usable and write_gate_configured
 
     lines = [
         "# Zotero MCP Capabilities",
@@ -60,6 +62,8 @@ def get_capabilities(*, ctx: Context) -> str:
         f"**Write transport:** "
         f"{local_write_role if local_write_available else 'Web API fallback' if api_key else 'unavailable'}",
         f"**Write tools usable:** {'yes' if write_usable else 'no'}",
+        f"**Write transport usable:** {'yes' if write_transport_usable else 'no'}",
+        f"**Per-call write secret required:** {'yes' if write_gate_configured else 'misconfigured'}",
         f"**Semantic search installed:** {'yes' if semantic_available else 'no'}",
         f"**PDF page/outline support:** {'yes' if pdf_available else 'no'}",
         f"**Local full-text extraction:** {'yes' if local_mode else 'no'}",

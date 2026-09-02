@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import importlib.util
 import os
 from typing import Literal
@@ -30,6 +31,7 @@ FEED_TOOLS = {"zotero_list_feeds", "zotero_get_feed_items"}
 WRITE_TOOLS = {
     "zotero_create_note",
     "zotero_update_note",
+    "zotero_update_search_database",
     "zotero_delete_note",
     "zotero_create_annotation",
     "zotero_create_area_annotation",
@@ -51,6 +53,11 @@ WRITE_TOOLS = {
     "zotero_remove_item_relation",
     "zotero_add_by_bibtex",
     "zotero_add_by_csl_json",
+    "zotero_prepare_attachment_upload",
+    "zotero_prepare_attachment_change",
+    "zotero_put_attachment",
+    "zotero_update_attachment",
+    "zotero_set_attachment_trashed",
 }
 ADMIN_TOOLS = {
     "zotero_get_capabilities",
@@ -73,6 +80,31 @@ def effective_tool_profile() -> str:
         return requested
     local = os.getenv("ZOTERO_LOCAL", "").lower() in {"1", "true", "yes"}
     return "full" if local or os.getenv("ZOTERO_API_KEY") else "research"
+
+
+def write_admin_authorized(presented: str | None) -> bool:
+    """Validate the per-call write secret without disclosing its value."""
+    expected = os.getenv("ZOTERO_MCP_WRITE_SECRET", "")
+    return bool(expected and presented) and hmac.compare_digest(presented, expected)
+
+
+def _with_write_secret_parameter(tool):
+    if tool.name not in WRITE_TOOLS:
+        return tool
+    parameters = dict(tool.parameters)
+    properties = dict(parameters.get("properties", {}))
+    properties["write_secret"] = {
+        "type": "string",
+        "description": (
+            "Private Zotero MCP write-admin secret supplied by the user. "
+            "The server never reveals or suggests its value."
+        ),
+    }
+    required = list(parameters.get("required", []))
+    if "write_secret" not in required:
+        required.append("write_secret")
+    parameters.update({"properties": properties, "required": required})
+    return tool.model_copy(update={"parameters": parameters})
 
 
 def tool_visible(name: str, profile: str | None = None) -> bool:
@@ -121,7 +153,11 @@ class ToolProfileMiddleware(Middleware):
     async def on_list_tools(self, context, call_next):
         tools = await call_next(context)
         profile = effective_tool_profile()
-        return [tool for tool in tools if tool_visible(tool.name, profile)]
+        return [
+            _with_write_secret_parameter(tool)
+            for tool in tools
+            if tool_visible(tool.name, profile)
+        ]
 
     async def on_list_prompts(self, context, call_next):
         prompts = await call_next(context)
@@ -156,5 +192,15 @@ class ToolProfileMiddleware(Middleware):
             raise ToolError(
                 f"Tool {name!r} is unavailable in the {profile!r} profile. "
                 "Call zotero_get_capabilities to inspect the active contract."
+            )
+        if name in WRITE_TOOLS:
+            arguments = dict(context.message.arguments or {})
+            presented = arguments.pop("write_secret", None)
+            if not write_admin_authorized(presented):
+                raise ToolError(
+                    f"Tool {name!r} requires the private Zotero MCP write-admin secret."
+                )
+            context = context.copy(
+                message=context.message.model_copy(update={"arguments": arguments})
             )
         return await call_next(context)

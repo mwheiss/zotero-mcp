@@ -3,6 +3,8 @@ import asyncio
 import pytest
 from conftest import DummyContext
 from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import MiddlewareContext
+from mcp.types import CallToolRequestParams
 
 from zotero_mcp.server import get_capabilities, get_search_database_health, mcp
 from zotero_mcp.tool_profiles import (
@@ -120,6 +122,7 @@ def test_capabilities_reports_effective_contract(monkeypatch):
 def test_capabilities_reports_remote_local_write_target(monkeypatch):
     monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "full")
     monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_MCP_WRITE_SECRET", "admin-secret")
     monkeypatch.setattr(
         "zotero_mcp.tools.operational._client.get_local_write_zotero_client",
         lambda: type(
@@ -208,3 +211,62 @@ def test_hidden_resource_and_prompt_calls_are_rejected(monkeypatch):
         asyncio.run(middleware.on_get_prompt(None, call_next))
     with pytest.raises(ToolError, match="Resources are unavailable"):
         asyncio.run(middleware.on_read_resource(None, call_next))
+
+
+def test_every_write_tool_schema_requires_undisclosed_secret(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "full")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_MCP_WRITE_SECRET", "never-disclose-this")
+    middleware = ToolProfileMiddleware()
+
+    async def listed(_context):
+        return await mcp.list_tools(run_middleware=False)
+
+    tools = asyncio.run(middleware.on_list_tools(None, listed))
+    write_tool = next(tool for tool in tools if tool.name == "zotero_add_by_doi")
+
+    assert "write_secret" in write_tool.parameters["required"]
+    assert write_tool.parameters["properties"]["write_secret"]["type"] == "string"
+    assert "never-disclose-this" not in str(write_tool.parameters)
+    assert "never-disclose-this" not in (write_tool.description or "")
+
+
+def test_write_gate_rejects_missing_or_wrong_secret(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "full")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_MCP_WRITE_SECRET", "correct-secret")
+    middleware = ToolProfileMiddleware()
+
+    async def unexpected(_context):
+        raise AssertionError("unauthorized write reached the tool")
+
+    for arguments in ({"doi": "10.1/test"}, {"doi": "10.1/test", "write_secret": "wrong"}):
+        context = MiddlewareContext(
+            message=CallToolRequestParams(name="zotero_add_by_doi", arguments=arguments),
+            method="tools/call",
+        )
+        with pytest.raises(ToolError, match="write-admin secret"):
+            asyncio.run(middleware.on_call_tool(context, unexpected))
+
+
+def test_write_gate_strips_valid_secret_before_tool_execution(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "full")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_MCP_WRITE_SECRET", "correct-secret")
+    middleware = ToolProfileMiddleware()
+    seen = {}
+
+    async def execute(context):
+        seen.update(context.message.arguments)
+        return "ok"
+
+    context = MiddlewareContext(
+        message=CallToolRequestParams(
+            name="zotero_add_by_doi",
+            arguments={"doi": "10.1/test", "write_secret": "correct-secret"},
+        ),
+        method="tools/call",
+    )
+
+    assert asyncio.run(middleware.on_call_tool(context, execute)) == "ok"
+    assert seen == {"doi": "10.1/test"}
