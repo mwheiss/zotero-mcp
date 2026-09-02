@@ -43,6 +43,9 @@ export ZOTERO_REMOTE_LOCAL_URL=http://127.0.0.1:23120/api
 export ZOTERO_MCP_WRITE_SECRET='choose-a-private-admin-secret'
 # Required only for externally usable signed attachment transfer URLs:
 export ZOTERO_MCP_PUBLIC_BASE_URL='https://example.net/your-zotero-mcp-path'
+# Optional: raise only when your MCP client accepts larger in-memory messages.
+export ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES=1048576
+export ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES=8388608
 ```
 
 Write tools probe that endpoint first and perform both their reads and writes
@@ -53,6 +56,11 @@ error rather than repeated against another instance. LAN HTTP
 endpoints are accepted when explicitly configured, but their local
 authorization key travels unencrypted. An SSH tunnel or HTTPS reverse proxy is
 preferable whenever the network is not fully trusted.
+
+The inline limit is not a Zotero attachment-size limit. Inline payloads are
+base64-encoded inside MCP messages (about 33% larger than the binary) and are
+held in memory by both server and client. Files above the inline/resource
+limits should use the signed streaming URL returned by `zotero_get_attachment`.
 
 ### Option 2: Zotero Web API
 
@@ -208,7 +216,7 @@ zotero-mcp serve --transport sse --host localhost --port 8000
 
 ## Available Tools
 
-When connected to Claude Desktop or another MCP client, you'll have access to these tools:
+When connected to Claude Desktop or another MCP client, common tools include the following. The complete profile-aware inventory is in the README and is reported at runtime by `zotero_get_capabilities` plus MCP `tools/list`:
 
 - **zotero_search_items**: Search your library by title, creator, or content
 - **zotero_get_item_metadata**: Get detailed information about a specific item, including complete raw metadata via `format="json"`

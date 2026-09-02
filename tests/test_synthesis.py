@@ -98,6 +98,36 @@ def test_synthesize_annotations_empty(monkeypatch):
     assert "No annotations or notes found" in out
 
 
+def test_synthesize_annotations_reports_total_fetch_failure(monkeypatch):
+    class BrokenZotero(FakeZotero):
+        def items(self, **_kwargs):
+            raise TimeoutError("digest backend down")
+
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: BrokenZotero())
+
+    out = synthesis.synthesize_annotations(ctx=DummyContext())
+
+    assert out.startswith("Error: Could not gather annotations or notes:")
+
+
+def test_synthesize_annotations_reports_partial_fetch_failure(monkeypatch):
+    fake = _DigestZotero()
+    original_items = fake.items
+
+    def items(**kwargs):
+        if kwargs.get("itemType") == "note":
+            raise TimeoutError("notes unavailable")
+        return original_items(**kwargs)
+
+    fake.items = items
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
+
+    out = synthesis.synthesize_annotations(ctx=DummyContext())
+
+    assert out.startswith("Partial failure: notes: notes unavailable")
+    assert "Self-attention scales" in out
+
+
 def test_synthesize_annotations_keeps_same_title_papers_separate(monkeypatch):
     fake = _DigestZotero()
     fake._title_map["PAPER002"] = "Attention Is All You Need"

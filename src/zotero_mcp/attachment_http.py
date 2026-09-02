@@ -28,6 +28,17 @@ async def download_attachment(request: Request) -> Response:
         claims = service.verify_token(request.path_params["token"], "download")
         attachment_key = str(claims["attachment_key"])
         filename = service.safe_filename(str(claims.get("filename") or f"{attachment_key}.bin"))
+        library = claims.get("library")
+        if not isinstance(library, dict):
+            raise ValueError("Attachment capability token has no library scope")
+        library_id = str(library.get("library_id") or "")
+        library_type = str(library.get("library_type") or "").lower()
+        if not library_id or library_type not in {"user", "group", "feed"}:
+            raise ValueError("Attachment capability token has an invalid library scope")
+        scoped_library = {
+            "library_id": library_id,
+            "library_type": library_type,
+        }
     except (ValueError, KeyError) as exc:
         return _error(str(exc), 403)
 
@@ -38,8 +49,8 @@ async def download_attachment(request: Request) -> Response:
             attachment_key,
             temporary,
             filename,
-            local_client=_client.get_local_zotero_client(),
-            web_client=_client.get_web_zotero_client(),
+            local_client=_client.get_local_zotero_client(library=scoped_library),
+            web_client=_client.get_web_zotero_client(library=scoped_library),
         )
         if not result.path or not result.path.exists():
             shutil.rmtree(temporary, ignore_errors=True)

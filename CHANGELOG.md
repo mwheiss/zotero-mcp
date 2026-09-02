@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-03
+
+### Fixed
+- ChatGPT connector `search` and `fetch` now return their required typed structured outputs while retaining matching JSON text content.
+- Backend outages, aggregate write failures, duplicate-merge failures, and attachment JSON errors now produce truthful error or partial statuses instead of successful empty results.
+- Signed attachment downloads retain their originating library scope, and attachment idempotency/confirmation records are serialized across processes.
+- Every advertised tool now carries explicit read-only, destructive, idempotency, and open-world behavior annotations.
+- Inline and MCP-resource attachment delivery have configurable bounded memory limits; large binaries are directed to signed streaming URLs.
+
+## [1.3.0] - 2026-09-02
+
+### Added
+- Complete attachment discovery, binary download/upload, replacement, metadata, reparenting, and trash/restore interface with signed transfer capabilities.
+- Per-call MCP write-administration secret and local-first Zotero 10 write authorization, including remote-local write routing.
+
+### Changed
+- Semantic rebuilds are resumable and partitioned by Zotero server/library identity.
+- Local and cloud attachment fallback behavior is consistent across document, PDF, and annotation tools.
+
 ## [0.7.4] - 2026-08-06
 
 ### Fixed

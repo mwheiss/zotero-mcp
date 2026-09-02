@@ -390,7 +390,10 @@ def get_zotero_client() -> zotero.Zotero:
     return _SerializedCallProxy(raw_client)
 
 
-def get_local_zotero_client() -> zotero.Zotero | None:
+def get_local_zotero_client(
+    *,
+    library: dict[str, str] | None = None,
+) -> zotero.Zotero | None:
     """
     Get a local Zotero client for file access (WebDAV/local storage).
 
@@ -402,7 +405,7 @@ def get_local_zotero_client() -> zotero.Zotero | None:
         A local Zotero client instance, or None if local Zotero is not available.
     """
     try:
-        current = get_current_library()
+        current = library or get_current_library()
         library_id = current.get("library_id") or "0"
         library_type = current.get("library_type") or "user"
         # HTTP/1.1-only transport for compatibility with Zotero 8's local
@@ -492,7 +495,10 @@ def get_zotero_server_id(client: zotero.Zotero | None = None) -> str | None:
         return None
 
 
-def get_web_zotero_client() -> zotero.Zotero | None:
+def get_web_zotero_client(
+    *,
+    library: dict[str, str] | None = None,
+) -> zotero.Zotero | None:
     """
     Get a web API Zotero client for write operations.
 
@@ -502,7 +508,7 @@ def get_web_zotero_client() -> zotero.Zotero | None:
     Returns:
         A web API Zotero client instance, or None if credentials are not available.
     """
-    current = get_current_library()
+    current = library or get_current_library()
     library_type = current.get("library_type") or os.getenv("ZOTERO_LIBRARY_TYPE", "user")
     if _normalize_library_type(library_type) == "feed":
         return None

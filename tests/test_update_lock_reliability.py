@@ -16,6 +16,13 @@ from conftest import skip_on_ci
 from zotero_mcp import semantic_search
 
 
+def test_update_lock_path_honors_environment(monkeypatch, tmp_path):
+    configured = tmp_path / "custom-update.lock"
+    monkeypatch.setenv("ZOTERO_MCP_UPDATE_LOCK_PATH", str(configured))
+
+    assert semantic_search.update_lock_path() == configured
+
+
 @skip_on_ci
 def test_read_lock_holder_missing_file(tmp_path):
     pid, alive = semantic_search.read_lock_holder(tmp_path / "nope.lock")

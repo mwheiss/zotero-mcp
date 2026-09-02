@@ -23,6 +23,20 @@ _TIMEOUT = 15  # seconds
 _HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 
 
+class SciteAPIError(RuntimeError):
+    """The Scite service failed to answer a request."""
+
+
+def _json(response, endpoint: str) -> dict:
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise SciteAPIError(f"Scite {endpoint} returned invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SciteAPIError(f"Scite {endpoint} returned a non-object response")
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # Tallies
 # ---------------------------------------------------------------------------
@@ -33,7 +47,7 @@ def get_tally(doi: str) -> dict | None:
 
     Returns dict with keys: ``doi``, ``total``, ``supporting``,
     ``contradicting``, ``mentioning``, ``unclassified``,
-    ``citingPublications``.  Returns ``None`` on any failure.
+    ``citingPublications``. Returns ``None`` only when Scite has no record.
     """
     try:
         resp = requests.get(
@@ -42,17 +56,19 @@ def get_tally(doi: str) -> dict | None:
             timeout=_TIMEOUT,
         )
         if resp.status_code == 200:
-            return resp.json()
-        return None
+            return _json(resp, "tally endpoint")
+        if resp.status_code == 404:
+            return None
+        raise SciteAPIError(f"Scite tally endpoint returned HTTP {resp.status_code}")
     except requests.RequestException as exc:
         logger.debug("Scite tally request failed for %s: %s", doi, exc)
-        return None
+        raise SciteAPIError(f"Scite tally request failed: {exc}") from exc
 
 
 def get_tallies_batch(dois: list[str]) -> dict[str, dict]:
     """Fetch tallies for up to 500 DOIs.
 
-    Returns ``{doi: tally_dict}``; empty dict on failure.
+    Returns ``{doi: tally_dict}``; an empty dict means no DOI had tally data.
     """
     if not dois:
         return {}
@@ -64,11 +80,13 @@ def get_tallies_batch(dois: list[str]) -> dict[str, dict]:
             timeout=_TIMEOUT,
         )
         if resp.status_code == 200:
-            return resp.json().get("tallies", {})
-        return {}
+            return _json(resp, "batch tally endpoint").get("tallies", {})
+        raise SciteAPIError(
+            f"Scite batch tally endpoint returned HTTP {resp.status_code}"
+        )
     except requests.RequestException as exc:
         logger.debug("Scite batch tallies request failed: %s", exc)
-        return {}
+        raise SciteAPIError(f"Scite batch tally request failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +97,7 @@ def get_tallies_batch(dois: list[str]) -> dict[str, dict]:
 def get_paper(doi: str) -> dict | None:
     """Fetch paper metadata including ``editorialNotices``.
 
-    Returns the full paper dict or ``None`` on failure.
+    Returns the full paper dict or ``None`` when Scite has no record.
     """
     try:
         resp = requests.get(
@@ -88,17 +106,19 @@ def get_paper(doi: str) -> dict | None:
             timeout=_TIMEOUT,
         )
         if resp.status_code == 200:
-            return resp.json()
-        return None
+            return _json(resp, "paper endpoint")
+        if resp.status_code == 404:
+            return None
+        raise SciteAPIError(f"Scite paper endpoint returned HTTP {resp.status_code}")
     except requests.RequestException as exc:
         logger.debug("Scite paper request failed for %s: %s", doi, exc)
-        return None
+        raise SciteAPIError(f"Scite paper request failed: {exc}") from exc
 
 
 def get_papers_batch(dois: list[str]) -> dict[str, dict]:
     """Fetch paper metadata for up to 500 DOIs.
 
-    Returns ``{doi: paper_dict}``; empty dict on failure.
+    Returns ``{doi: paper_dict}``; an empty dict means no DOI had paper data.
     """
     if not dois:
         return {}
@@ -110,8 +130,10 @@ def get_papers_batch(dois: list[str]) -> dict[str, dict]:
             timeout=_TIMEOUT,
         )
         if resp.status_code == 200:
-            return resp.json().get("papers", {})
-        return {}
+            return _json(resp, "batch paper endpoint").get("papers", {})
+        raise SciteAPIError(
+            f"Scite batch paper endpoint returned HTTP {resp.status_code}"
+        )
     except requests.RequestException as exc:
         logger.debug("Scite batch papers request failed: %s", exc)
-        return {}
+        raise SciteAPIError(f"Scite batch paper request failed: {exc}") from exc

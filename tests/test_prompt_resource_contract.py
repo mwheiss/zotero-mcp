@@ -50,3 +50,16 @@ def test_resource_descriptions_state_scope_and_fulltext_limits(monkeypatch):
     assert "up to 200 items" in descriptions[
         "zotero://collections/{collection_key}/items"
     ]
+    assert "8 MiB" in descriptions[
+        "zotero://attachments/{attachment_key}/content"
+    ]
+
+
+def test_every_prompt_argument_has_a_description(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "research")
+
+    prompts = asyncio.run(mcp.list_prompts())
+
+    for prompt in prompts:
+        for argument in prompt.arguments or []:
+            assert argument.description, f"{prompt.name}.{argument.name}"

@@ -47,7 +47,7 @@
 ### 📝 Work with Annotations
 - Extract and search PDF annotations with page numbers
 - Access Zotero's native annotations
-- Create and update notes and annotations
+- Create and update notes; update stored annotations (new PDF/EPUB highlight creation requires `[pdf]`)
 - Extract PDF table of contents / outlines (requires `[pdf]` extra)
 
 ### ✏️ Write Operations
@@ -57,7 +57,7 @@
 - Find and merge duplicate items with dry-run preview
 - **Local-first writes**: Zotero desktop authorizes changes directly; no cloud API key required
 
-### 📊 Scite Citation Intelligence (optional `[scite]` extra)
+### 📊 Scite Citation Intelligence
 - **Citation tallies**: See how many papers support, contrast, or mention each item — the MCP version of the [Scite Zotero Plugin](https://github.com/scitedotai/scite-zotero-plugin)
 - **Retraction alerts**: Scan your library for retracted or corrected papers
 - No Scite account required — uses public API endpoints
@@ -78,7 +78,7 @@
 
 ### Default Installation (core tools only)
 
-The base install is lightweight — it includes search, metadata retrieval, annotations, and write operations. No ML/AI dependencies are pulled in.
+The base install is lightweight — it includes search, metadata retrieval, stored-annotation access, notes, and non-PDF write operations. No ML/AI dependencies are pulled in.
 
 #### Installing via uv (recommended)
 
@@ -108,8 +108,8 @@ Heavy ML/PDF dependencies are separated into optional extras so the base install
 | Extra | What it adds | Install command |
 |-------|-------------|-----------------|
 | `semantic` | Semantic search via ChromaDB, sentence-transformers, OpenAI/Gemini embeddings | `pip install "zotero-mcp-server[semantic]"` |
-| `pdf` | PDF outline extraction (PyMuPDF) and EPUB annotation support | `pip install "zotero-mcp-server[pdf]"` |
-| `scite` | [Scite](https://scite.ai) citation intelligence — tallies and retraction alerts (no account needed) | `pip install "zotero-mcp-server[scite]"` |
+| `pdf` | PDF pages/outlines/layout and PDF/EPUB annotation authoring | `pip install "zotero-mcp-server[pdf]"` |
+| `scite` | Compatibility alias; Scite uses the core HTTP dependency and is already available | `pip install "zotero-mcp-server[scite]"` |
 | `all` | Everything above | `pip install "zotero-mcp-server[all]"` |
 
 For example, with uv:
@@ -118,7 +118,7 @@ uv tool install "zotero-mcp-server[all]"    # Full install with all features
 uv tool install "zotero-mcp-server[semantic]" # Just semantic search
 ```
 
-If you only need basic library access (search, read, annotate, write), the default install with no extras is all you need.
+If you only need basic library access, metadata/full-text retrieval, stored annotations, notes, and ordinary item/collection writes, the default install with no extras is sufficient.
 
 #### Updating Your Installation
 
@@ -408,13 +408,18 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `ZOTERO_LIBRARY_TYPE`: The type of library (user or group, default: user)
 - `ZOTERO_MCP_LOCK_TIMEOUT`: Maximum seconds to wait for another Zotero API request across threads or processes (default: 45; `0` waits indefinitely)
 - `ZOTERO_MCP_API_LOCK_PATH`: Optional shared API lock-file path when MCP and CLI processes use different home/config directories
+- `ZOTERO_MCP_UPDATE_LOCK_PATH`: Optional shared semantic-update lock path (default: `~/.config/zotero-mcp/update.lock`)
 - `ZOTERO_MCP_WRITE_SECRET`: Required per-call admin secret for every MCP tool that mutates Zotero or the semantic index. The value is never exposed in tool descriptions
 - `ZOTERO_MCP_PUBLIC_BASE_URL`: Public MCP URL prefix used to create short-lived signed attachment upload/download URLs
 - `ZOTERO_MCP_ATTACHMENT_MAX_BYTES`: Maximum staged attachment upload size (default: 512 MiB)
+- `ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES`: Maximum binary embedded as base64 in a tool result (default: 1 MiB; hard cap: 32 MiB)
+- `ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES`: Maximum binary returned through an in-memory MCP resource (default: 8 MiB; hard cap: 64 MiB)
+- `ZOTERO_MCP_ATTACHMENT_LOCK_TIMEOUT`: Maximum seconds to wait for the same attachment idempotency key (default: 45)
 - `ZOTERO_MCP_ATTACHMENT_STATE_DIR`: Private staging/token state directory (default: `~/.cache/zotero-mcp/attachments`)
 - `ZOTERO_WEBDAV_URL`: Optional WebDAV folder URL for direct attachment downloads in remote mode
 - `ZOTERO_WEBDAV_USERNAME`: Optional WebDAV username
 - `ZOTERO_WEBDAV_PASSWORD`: Optional WebDAV password
+- `OPENALEX_API_KEY`: Optional free OpenAlex key for a larger daily citation-graph query budget
 
 **Semantic Search:**
 - `ZOTERO_EMBEDDING_MODEL`: Embedding model to use (default, openai, gemini, ollama)
@@ -621,11 +626,11 @@ zotero_remove_item_relation(
 - `zotero_get_capabilities`: Show the active tool profile, library, credentials, and optional features
 
 Tool profiles keep the advertised surface aligned with the deployment. `auto`
-selects `full` when a web API key is available and `research` otherwise;
+selects `full` in local mode or when a web API key is available, and `research` otherwise;
 `connector` exposes only the standard `search`/`fetch` pair plus capabilities;
 `admin` exposes semantic maintenance and health tools. `all` is intended for
-diagnosis because individual tools can still require credentials or optional
-dependencies.
+diagnosis but still applies credential, local-path, and optional-dependency
+capability gates.
 
 ### 🔍 Search Tools
 - `zotero_search_items`: Search your library by keywords
@@ -635,6 +640,13 @@ dependencies.
 - `zotero_get_tags`: List all tags
 - `zotero_get_recent`: Get recently added items
 - `zotero_search_by_tag`: Search your library using custom tag filters
+- `zotero_search_by_citation_key`: Look up an item by an exact Better BibTeX citation key
+
+### 🗂️ Library and Feed Tools
+- `zotero_list_libraries`: List My Library, accessible groups, and local feeds
+- `zotero_switch_library`: Change the active library for the current MCP session
+- `zotero_list_feeds`: List local Zotero RSS feeds
+- `zotero_get_feed_items`: Read items from one local RSS feed
 
 ### 📚 Content Tools
 - `zotero_get_item_metadata`: Get detailed metadata (supports `format="markdown"`, `format="json"` for complete raw Zotero metadata, and `format="bibtex"`)
@@ -648,15 +660,33 @@ dependencies.
 - `zotero_update_attachment`: Update attachment metadata, with confirmation for reparenting
 - `zotero_set_attachment_trashed`: Trash or restore an attachment; permanent deletion is unavailable
 - `zotero_get_item_children`: Get attachments and notes
+- `zotero_get_items_children`: Fetch direct children for multiple parent items
+- `zotero_get_attachment_path`: Return local attachment paths only when explicitly enabled
+- `zotero_read_pdf_pages`: Read a bounded page range from a selected PDF
+- `zotero_get_pdf_outline`: Extract a PDF's embedded outline/bookmarks
+
+Inline attachment data is intentionally conservative: base64 expands a binary
+by roughly one third, then both the MCP server and client hold encoded and
+decoded copies. The 1 MiB default is for small convenience payloads, not an
+attachment-size limit. Use the signed streaming URL for larger files, or raise
+the bounded inline/resource settings above when both server and client have
+adequate memory and message-size limits.
 
 ### 📝 Annotation & Notes Tools
 - `zotero_get_annotations`: Get annotations (including direct PDF extraction)
 - `zotero_get_notes`: Retrieve notes from your Zotero library
 - `zotero_search_notes`: Search in notes and annotations (including PDF-extracted)
 - `zotero_create_note`: Create a new note for an item (beta feature)
+- `zotero_update_note`: Replace or append to an existing note
+- `zotero_delete_note`: Move a note to Zotero Trash
+- `zotero_create_annotation`: Create a PDF or EPUB text highlight
+- `zotero_create_area_annotation`: Create a rectangular PDF image/area annotation
+- `zotero_update_annotation`: Update annotation text, comment, color, or tags
+- `zotero_delete_annotation`: Move an annotation to Zotero Trash
 - `zotero_get_page_layout`: Detect figure/table regions on a PDF page (with captions and normalized coordinates) for accurate area annotation placement
 
 ### 📊 Scite Citation Intelligence Tools
+Scite support uses the core HTTP dependency and is available in the default installation; the historical `[scite]` extra remains as a compatibility alias.
 - `scite_enrich_item`: Get Scite citation tallies and retraction alerts for a paper
 - `scite_enrich_search`: Search your Zotero library with Scite-enriched results (tallies + alerts inline)
 - `scite_check_retractions`: Scan items for retractions and editorial notices
@@ -667,22 +697,34 @@ dependencies.
 - `zotero_add_by_isbn`: Add a book by ISBN (Open Library + Google Books cascade)
 - `zotero_add_by_bibtex`: Add one or more items from BibTeX (inline or .bib file)
 - `zotero_add_by_csl_json`: Add one or more items from CSL JSON (inline or file)
-- `zotero_add_from_file`: Import a local PDF or EPUB file with automatic DOI extraction
+- `zotero_add_from_file`: Import a local PDF, EPUB, DjVu, DOC/DOCX, ODT, or RTF file (PDFs get automatic DOI extraction)
 
 All add tools take a `collections` parameter accepting collection keys, names, or `parent/child` paths — resolved and validated before the item is created, so unknown or ambiguous specs fail with suggestions instead of producing an unfiled item. They also take `if_exists` (`"reuse"` — default — returns an identifier match unchanged; `"merge"` adds missing collections and tags to the match; `"duplicate"` explicitly creates another item) and `create_missing_collections` (create unknown collection specs, including path chains, instead of failing). Legacy `skip`/`file` values remain aliases for `reuse`/`merge`. Attachment-aware import tools use `attach_mode="auto|none|linked_url|required"`; an unsatisfied `required` request is reported as partial because Zotero metadata creation cannot be rolled back reliably.
 - `zotero_create_collection`: Create a new collection (folder/project) in your library
 - `zotero_search_collections`: Search for collections by name to find their keys
 - `zotero_manage_collections`: Add or remove items from collections (accepts keys, names, or `parent/child` paths)
 - `zotero_update_item`: Update metadata for an existing item (title, tags, abstract, date, etc.)
+- `zotero_delete_item`: Move a non-note item to Zotero Trash
+- `zotero_delete_collection`: Permanently delete a collection after an explicit confirmation preview
+- `zotero_batch_update_tags`: Add/remove tags across a bounded item selection
+- `zotero_batch_update_extra`: Upsert/remove structured lines in multiple Extra fields
 - `zotero_find_duplicates`: Find duplicate items by title and/or DOI
 - `zotero_merge_duplicates`: Merge duplicate items with dry-run preview; consolidates all child items
-- `zotero_get_pdf_outline`: Extract the table of contents / outline from a PDF attachment
-- `zotero_search_by_citation_key`: Look up items by BetterBibTeX citation key (with Extra field fallback)
+
+### 🧭 Agentic Research Tools
+- `zotero_find_related_papers`: Traverse an OpenAlex citation neighborhood
+- `zotero_library_coverage`: Audit confirmed, missing, and unknown PDF coverage
+- `zotero_synthesize_annotations`: Build a per-paper digest of notes and highlights
+- `zotero_export_bibliography`: Render bibliography, citation, or BibTeX output through Zotero
 
 ### 🔗 Related Items Tools
 - `zotero_get_item_related`: Get all related items for a specific Zotero item
 - `zotero_add_item_relation`: Add a related item relationship (creates bidirectional link)
 - `zotero_remove_item_relation`: Remove a related item relationship
+
+### 🔌 ChatGPT Connector Compatibility Tools
+- `search`: Return typed `{results:[{id,title,url}]}` connector search data
+- `fetch`: Return typed `{id,title,text,url,metadata}` connector document data
 
 ## 🧪 Testing
 
@@ -692,7 +734,7 @@ uv run pytest tests/
 ```
 
 ### Integration Test Plan
-A 45-point live integration test plan is included at `docs/integration-test-plan.md`. It's designed to be given to Claude in Claude Desktop, which will execute each test against your real Zotero library. Tests cover all tools, PDF attachment cascade, attach_mode, BetterBibTeX lookups, and multi-step showcase prompts. See the file for full instructions.
+A representative live integration plan is included at `docs/integration-test-plan.md`. It's designed to be given to an MCP client against a disposable/test Zotero library. It covers the highest-risk read, write, PDF-cascade, attachment-mode, Better BibTeX, and multi-step workflows; the automated suite remains the exhaustive tool-contract regression check.
 
 ## 🔍 Troubleshooting
 

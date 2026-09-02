@@ -46,7 +46,7 @@ pdf = [
     "ebooklib>=0.18",
 ]
 scite = [
-    "requests>=2.28.0",
+    # Compatibility alias: Scite uses requests, which is already a core dependency.
 ]
 all = [
     "zotero-mcp-server[semantic,pdf,scite]",

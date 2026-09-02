@@ -429,3 +429,68 @@ def test_batch_update_tags_validates_json_array(monkeypatch):
     )
 
     assert "must be a list of strings" in result
+
+
+def test_batch_update_tags_reports_failed_writes_truthfully(monkeypatch):
+    item = {
+        "key": "ITEM0001",
+        "data": {"itemType": "journalArticle", "tags": []},
+    }
+    fake = FakeZoteroForTags([item])
+    fake.update_item = lambda _item: {"success": False}
+    monkeypatch.setattr("zotero_mcp.client.get_zotero_client", lambda: fake)
+
+    result = server.batch_update_tags(
+        query="anything",
+        add_tags=["new-tag"],
+        ctx=DummyContext(),
+    )
+
+    assert "Items updated: 0" in result
+    assert "Items failed: 1" in result
+    assert "Failed: writes failed for ITEM0001" in result
+    assert "`new-tag`: 0 items" in result
+
+
+def test_search_notes_reports_total_api_failure(monkeypatch):
+    class BrokenZotero:
+        def add_parameters(self, **_kwargs):
+            return None
+
+        def items(self, **_kwargs):
+            raise TimeoutError("notes backend down")
+
+    monkeypatch.setattr("zotero_mcp.tools.annotations._utils.is_local_mode", lambda: False)
+    monkeypatch.setattr(
+        "zotero_mcp.tools.annotations._client.get_zotero_client",
+        BrokenZotero,
+    )
+
+    result = server.search_notes(query="anything", ctx=DummyContext())
+
+    assert result.startswith("Error: Note and annotation search failed:")
+
+
+def test_search_notes_surfaces_partial_api_failure(monkeypatch):
+    class PartialZotero:
+        def __init__(self):
+            self.item_type = ""
+
+        def add_parameters(self, **kwargs):
+            self.item_type = kwargs.get("itemType", "")
+
+        def items(self, **kwargs):
+            item_type = kwargs.get("itemType") or self.item_type
+            if item_type == "note":
+                raise TimeoutError("note lookup down")
+            return []
+
+    monkeypatch.setattr("zotero_mcp.tools.annotations._utils.is_local_mode", lambda: False)
+    monkeypatch.setattr(
+        "zotero_mcp.tools.annotations._client.get_zotero_client",
+        PartialZotero,
+    )
+
+    result = server.search_notes(query="anything", ctx=DummyContext())
+
+    assert result.startswith("Partial failure: note search:")

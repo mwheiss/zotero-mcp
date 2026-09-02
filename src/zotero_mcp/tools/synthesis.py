@@ -118,7 +118,7 @@ def synthesize_annotations(
                 allowed_keys = {it.get("key") for it in coll_items if it.get("key")}
             except Exception as e:
                 context_warning(ctx, f"Could not load collection items: {e}")
-                allowed_keys = set()
+                return f"Error: Could not load collection {collection_key}: {e}"
 
         anno_params = {"itemType": "annotation"}
         note_params = {"itemType": "note"}
@@ -126,15 +126,18 @@ def synthesize_annotations(
             anno_params["tag"] = tags
             note_params["tag"] = tags
 
+        fetch_errors: list[str] = []
         try:
             annotations = _helpers._paginate(zot.items, max_items=limit, **anno_params)
         except Exception as e:
             context_warning(ctx, f"Annotation fetch failed: {e}")
+            fetch_errors.append(f"annotations: {e}")
             annotations = []
         try:
             notes = _helpers._paginate(zot.items, max_items=limit, **note_params)
         except Exception as e:
             context_warning(ctx, f"Note fetch failed: {e}")
+            fetch_errors.append(f"notes: {e}")
             notes = []
 
         combined = [("annotation", item) for item in annotations]
@@ -152,6 +155,8 @@ def synthesize_annotations(
         notes = [item for kind, item in combined if kind == "note"]
 
         if not annotations and not notes:
+            if fetch_errors:
+                return "Error: Could not gather annotations or notes: " + "; ".join(fetch_errors)
             scope = f" in collection {collection_key}" if collection_key else ""
             return f"No annotations or notes found{scope}."
 
@@ -164,6 +169,8 @@ def synthesize_annotations(
                 paper_key,
                 {"title": title, "highlights": [], "notes": []},
             )
+
+        scope_lookup_failures: set[str] = set()
 
         def _in_scope(parent_key: str) -> bool:
             if allowed_keys is None:
@@ -178,7 +185,7 @@ def synthesize_annotations(
                 if gp and gp in allowed_keys:
                     return True
             except Exception:
-                pass
+                scope_lookup_failures.add(parent_key)
             return False
 
         highlight_count = 0
@@ -220,6 +227,12 @@ def synthesize_annotations(
             note_count += 1
 
         if not papers:
+            if scope_lookup_failures or fetch_errors:
+                return (
+                    "Error: Could not resolve enough source data to build the digest. "
+                    f"Failed parent keys: {', '.join(sorted(scope_lookup_failures)) or 'none'}; "
+                    f"fetch errors: {'; '.join(fetch_errors) or 'none'}."
+                )
             scope = f" in collection {collection_key}" if collection_key else ""
             return f"No annotations or notes found{scope}."
 
@@ -252,6 +265,14 @@ def synthesize_annotations(
         )
 
         result = "\n".join(output)
+        partials = list(fetch_errors)
+        if scope_lookup_failures:
+            partials.append(
+                "parent lookup failed for "
+                + ", ".join(sorted(scope_lookup_failures))
+            )
+        if partials:
+            result = "Partial failure: " + "; ".join(partials) + "\n\n" + result
         return _helpers._prepend_size_warning(
             result,
             "Scope to a collection_key or narrow with tag to reduce size.",

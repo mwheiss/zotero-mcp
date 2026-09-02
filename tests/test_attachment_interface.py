@@ -3,6 +3,9 @@
 import hashlib
 import json
 import shutil
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +18,7 @@ from starlette.responses import FileResponse
 from starlette.routing import Route
 
 from zotero_mcp import attachment_service as service
+from zotero_mcp import resources
 from zotero_mcp.attachment_http import download_attachment, upload_attachment
 from zotero_mcp.client import AttachmentDownloadResult
 from zotero_mcp.server import (
@@ -50,6 +54,8 @@ def attachment_state(monkeypatch, tmp_path):
     monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.delenv("ZOTERO_MCP_ATTACHMENT_SECRET", raising=False)
     monkeypatch.delenv("ZOTERO_MCP_PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES", raising=False)
+    monkeypatch.delenv("ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES", raising=False)
     return tmp_path
 
 
@@ -232,12 +238,14 @@ async def test_staged_upload_rejects_hash_mismatch(attachment_state):
 @pytest.mark.asyncio
 async def test_signed_download_streams_exact_binary(monkeypatch, attachment_state):
     payload = b"exact binary attachment"
+    scoped_clients = []
     token = service.make_token(
         "download",
         {
             "attachment_key": "ATTACH01",
             "filename": "paper.bin",
             "content_type": "application/octet-stream",
+            "library": {"library_id": "5910265", "library_type": "group"},
         },
     )
 
@@ -250,10 +258,12 @@ async def test_signed_download_streams_exact_binary(monkeypatch, attachment_stat
         "zotero_mcp.attachment_http._client.download_attachment_file", download
     )
     monkeypatch.setattr(
-        "zotero_mcp.attachment_http._client.get_local_zotero_client", lambda: object()
+        "zotero_mcp.attachment_http._client.get_local_zotero_client",
+        lambda **kwargs: scoped_clients.append(("local", kwargs["library"])) or object(),
     )
     monkeypatch.setattr(
-        "zotero_mcp.attachment_http._client.get_web_zotero_client", lambda: object()
+        "zotero_mcp.attachment_http._client.get_web_zotero_client",
+        lambda **kwargs: scoped_clients.append(("web", kwargs["library"])) or object(),
     )
     request = Request(
         {
@@ -271,6 +281,10 @@ async def test_signed_download_streams_exact_binary(monkeypatch, attachment_stat
     assert response_path.read_bytes() == payload
     assert response.headers["content-disposition"].endswith('filename="paper.bin"')
     assert response.headers["cache-control"] == "private, no-store"
+    assert scoped_clients == [
+        ("local", {"library_id": "5910265", "library_type": "group"}),
+        ("web", {"library_id": "5910265", "library_type": "group"}),
+    ]
     shutil.rmtree(response_path.parent, ignore_errors=True)
 
 
@@ -296,6 +310,40 @@ def test_operation_confirmation_is_bound_and_one_use(attachment_state):
             action="trash",
             details=details,
         )
+
+
+def test_multiple_operations_can_share_the_state_directory(attachment_state):
+    first = service.prepare_operation("trash", {"attachment_key": "ATTACH01"})
+    second = service.prepare_operation("trash", {"attachment_key": "ATTACH02"})
+
+    assert first["operation_id"] != second["operation_id"]
+
+
+def test_operation_confirmation_is_atomic_under_concurrency(attachment_state):
+    details = {
+        "action": "trash",
+        "attachment_key": "ATTACH01",
+        "expected_version": 7,
+    }
+    prepared = service.prepare_operation("trash", details)
+
+    def consume():
+        try:
+            service.consume_operation(
+                prepared["operation_id"],
+                prepared["confirmation_token"],
+                action="trash",
+                details=details,
+            )
+            return "used"
+        except ValueError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _index: consume(), range(2)))
+
+    assert outcomes.count("used") == 1
+    assert sum("already been used" in value for value in outcomes) == 1
 
 
 def test_prepare_destructive_change_binds_live_version(monkeypatch, attachment_state):
@@ -349,6 +397,111 @@ def _ready_upload(payload: bytes, library: dict[str, str]):
         prepared["upload_id"], size=len(payload), sha256=hashlib.sha256(payload).hexdigest()
     )
     return prepared, manifest
+
+
+def test_put_attachment_idempotency_is_atomic_under_concurrency(
+    monkeypatch, attachment_state
+):
+    library = {"library_id": "0", "library_type": "user"}
+    prepared, _ = _ready_upload(b"new attachment", library)
+
+    class WriteZotero:
+        local_endpoint_role = "server-local"
+
+        def __init__(self):
+            self.created = []
+            self.lock = threading.Lock()
+
+        def item(self, key):
+            if key == "PARENT01":
+                return {"key": key, "data": {"itemType": "journalArticle"}}
+            if key in self.created:
+                return _attachment(key=key)
+            raise KeyError(key)
+
+        def attachment_both(self, _attachments, parentid=None):
+            with self.lock:
+                key = f"NEW{len(self.created) + 1:05d}"
+                time.sleep(0.05)
+                self.created.append(key)
+            return {"success": {"0": key}}
+
+    zot = WriteZotero()
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._helpers._get_write_client",
+        lambda _ctx: (zot, zot),
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_current_library",
+        lambda: library,
+    )
+
+    def create():
+        return json.loads(
+            put_attachment(
+                parent_item_key="PARENT01",
+                upload_id=prepared["upload_id"],
+                idempotency_key="stable-request-key",
+                ctx=DummyContext(),
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: create(), range(2)))
+
+    assert zot.created == ["NEW00001"]
+    assert {result["status"] for result in results} == {
+        "created",
+        "already-created",
+    }
+
+
+def test_inline_and_resource_limits_are_configurable_and_bounded(
+    monkeypatch, attachment_state
+):
+    assert service.max_inline_size() == 1024 * 1024
+    assert service.max_resource_size() == 8 * 1024 * 1024
+
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES", "2097152")
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES", "16777216")
+    assert service.max_inline_size() == 2 * 1024 * 1024
+    assert service.max_resource_size() == 16 * 1024 * 1024
+
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES", str(10**12))
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES", str(10**12))
+    assert service.max_inline_size() == service.HARD_MAX_INLINE_SIZE
+    assert service.max_resource_size() == service.HARD_MAX_RESOURCE_SIZE
+
+
+def test_binary_resource_rejects_large_in_memory_payload(
+    monkeypatch, attachment_state
+):
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES", "4")
+    monkeypatch.setattr(
+        "zotero_mcp.resources._client.get_zotero_client",
+        lambda: SimpleNamespace(item=lambda _key: _attachment()),
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.resources._client.get_local_zotero_client",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.resources._client.get_web_zotero_client",
+        lambda: object(),
+    )
+
+    def download(_key, destination, filename, **_kwargs):
+        path = Path(destination) / filename
+        path.write_bytes(b"12345")
+        return AttachmentDownloadResult(path=path, source="test", errors=[])
+
+    monkeypatch.setattr(
+        "zotero_mcp.resources._client.download_attachment_file",
+        download,
+    )
+
+    with pytest.raises(ValueError, match="in-memory MCP resource limit"):
+        resources.attachment_binary_resource("ATTACH01")
 
 
 def test_replace_attachment_requires_bound_confirmation(monkeypatch, attachment_state):

@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 from conftest import DummyContext, skip_on_ci
 
 from zotero_mcp import utils as _utils
@@ -150,6 +151,26 @@ class TestSearchWithVariants:
 
         assert captured["itemType"] == "-note"
         assert captured["tag"] == ["research"]
+
+    def test_raises_when_every_backend_request_fails(self):
+        zot = MagicMock()
+        zot.items.side_effect = TimeoutError("backend down")
+
+        with pytest.raises(RuntimeError, match="All .* search request"):
+            search_module._search_with_variants(
+                zot, "test", "titleCreatorYear", 10
+            )
+
+
+def test_search_items_reports_backend_outage_as_error(monkeypatch):
+    zot = MagicMock()
+    zot.items.side_effect = TimeoutError("backend down")
+    monkeypatch.setattr(search_module._client, "get_zotero_client", lambda: zot)
+
+    result = search_module.search_items(query="anything", ctx=DummyContext())
+
+    assert result.startswith("Error searching Zotero:")
+    assert "backend down" in result
 
 
 # ---------------------------------------------------------------------------

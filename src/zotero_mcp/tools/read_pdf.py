@@ -170,11 +170,11 @@ def read_pdf_pages(
         if start_page < 1 or start_page > total_pages:
             doc.close()
             _cleanup_path(pdf_path)
-            return f"Start page {start_page} is out of range. PDF has {total_pages} pages (1-{total_pages})."
+            return f"Error: Start page {start_page} is out of range. PDF has {total_pages} pages (1-{total_pages})."
         if end_page is not None and end_page > total_pages:
             doc.close()
             _cleanup_path(pdf_path)
-            return f"End page {end_page} is out of range. PDF has {total_pages} pages (1-{total_pages})."
+            return f"Error: End page {end_page} is out of range. PDF has {total_pages} pages (1-{total_pages})."
 
         # Zero-indexed page numbers for PyMuPDF
         zstart = start_page - 1
@@ -192,7 +192,7 @@ def read_pdf_pages(
         if page_count > 50:
             doc.close()
             _cleanup_path(pdf_path)
-            return f"Requested {page_count} pages (max 50). Please narrow your page range."
+            return f"Error: Requested {page_count} pages (max 50). Please narrow your page range."
 
         for page_num in range(zstart, zend + 1):
             page = doc[page_num]

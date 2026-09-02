@@ -139,6 +139,7 @@ def get_annotations(
             better_bibtex_annotations = []
             zotero_api_annotations = []
             pdf_annotations = []
+            source_errors: list[str] = []
 
             # Try Better BibTeX method (local Zotero only)
             if os.environ.get("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]:
@@ -275,6 +276,7 @@ def get_annotations(
                     context_info(ctx, f"Retrieved {len(zotero_api_annotations)} annotations via Zotero API")
                 except Exception as api_error:
                     context_warning(ctx, f"Error retrieving Zotero API annotations: {api_error}")
+                    source_errors.append(f"Zotero API annotations: {api_error}")
 
             # PDF Extraction fallback
             if use_pdf_extraction and not (better_bibtex_annotations or zotero_api_annotations):
@@ -333,8 +335,13 @@ def get_annotations(
                                         pdf_annotations.append(pdf_anno)
 
                         context_info(ctx, f"Retrieved {len(pdf_annotations)} annotations via PDF extraction")
+                    else:
+                        source_errors.append(
+                            "direct PDF extraction helper is unavailable"
+                        )
                 except Exception as pdf_error:
                     context_warning(ctx, f"Error during PDF annotation extraction: {pdf_error}")
+                    source_errors.append(f"direct PDF extraction: {pdf_error}")
 
             # Combine annotations from all sources
             annotations = better_bibtex_annotations + zotero_api_annotations + pdf_annotations
@@ -347,7 +354,14 @@ def get_annotations(
 
         # Handle no annotations found
         if not annotations:
-            return f"No annotations found{f' for item: {parent_title}' if item_key else ''}."
+            empty_result = (
+                f"No annotations found{f' for item: {parent_title}' if item_key else ''}."
+            )
+            if item_key and source_errors:
+                if not use_pdf_extraction:
+                    return "Error: Annotation retrieval failed: " + "; ".join(source_errors)
+                return "Partial failure: " + "; ".join(source_errors) + "\n\n" + empty_result
+            return empty_result
 
         # Batch-resolve parent titles for library-wide retrieval (Fix 2+5)
         parent_titles = {}
@@ -442,6 +456,8 @@ def get_annotations(
             output.append("")  # Empty line between annotations
 
         result = "\n".join(output)
+        if item_key and source_errors:
+            result = "Partial failure: " + "; ".join(source_errors) + "\n\n" + result
         # Warn about large responses for library-wide queries
         if not item_key:
             result = _helpers._prepend_size_warning(
@@ -797,26 +813,49 @@ def search_notes(
             from zotero_mcp.local_db import get_local_zotero_reader
             reader = get_local_zotero_reader()
             if reader:
+                local_errors: list[str] = []
                 try:
                     note_results = reader.search_notes_local(query, limit)
                     context_info(ctx, f"Local note search: {len(note_results)} results")
                 except Exception as e:
                     context_warning(ctx, f"Local note search failed: {e}")
+                    local_errors.append(f"note search: {e}")
 
                 try:
                     annotation_results = reader.search_annotations_local(query, limit)
                     context_info(ctx, f"Local annotation search: {len(annotation_results)} results")
                 except Exception as e:
                     context_warning(ctx, f"Local annotation search failed: {e}")
+                    local_errors.append(f"annotation search: {e}")
                 finally:
                     reader.close()
 
-                return _format_search_results(query, note_results, annotation_results, raw_html=raw_html)
+                if len(local_errors) < 2:
+                    result = _format_search_results(
+                        query,
+                        note_results,
+                        annotation_results,
+                        raw_html=raw_html,
+                    )
+                    if local_errors:
+                        result = (
+                            "Partial failure: local "
+                            + "; ".join(local_errors)
+                            + "\n\n"
+                            + result
+                        )
+                    return result
+                context_warning(
+                    ctx,
+                    "Both local note searches failed; falling back to the Zotero API",
+                )
         except Exception as e:
             context_warning(ctx, f"Local search unavailable, falling back to API: {e}")
 
     # ---------- API mode: separate try/except blocks ----------
     zot = _client.get_zotero_client()
+
+    api_errors: list[str] = []
 
     # Notes — always try (this works since upstream PR #136)
     try:
@@ -849,6 +888,7 @@ def search_notes(
         context_info(ctx, f"API note search: {len(note_results)} results")
     except Exception as e:
         context_warning(ctx, f"Note search failed: {e}")
+        api_errors.append(f"note search: {e}")
 
     # Annotations — separate block so note results survive if this crashes
     try:
@@ -885,8 +925,19 @@ def search_notes(
         context_info(ctx, f"API annotation search: {len(annotation_results)} results")
     except Exception as e:
         context_warning(ctx, f"Annotation search failed: {e}")
+        api_errors.append(f"annotation search: {e}")
 
-    return _format_search_results(query, note_results, annotation_results, raw_html=raw_html)
+    if len(api_errors) == 2:
+        return "Error: Note and annotation search failed: " + "; ".join(api_errors)
+    result = _format_search_results(
+        query,
+        note_results,
+        annotation_results,
+        raw_html=raw_html,
+    )
+    if api_errors:
+        return "Partial failure: " + "; ".join(api_errors) + "\n\n" + result
+    return result
 
 
 @mcp.tool(
@@ -1140,8 +1191,9 @@ def delete_note(
         "color: hex color (default '#ffd400' yellow). "
         "comment: optional note attached to the highlight. "
         "tags: optional list of tag strings to apply to the annotation. "
-        "Requires PyMuPDF (pip install zotero-mcp-server[pdf]) and Zotero "
-        "write authorization; local desktop writes are preferred. "
+        "PDF highlighting requires PyMuPDF; EPUB highlighting requires ebooklib "
+        "(both are installed by pip install zotero-mcp-server[pdf]). Requires "
+        "Zotero write authorization; local desktop writes are preferred. "
         "Example: zotero_create_annotation(attachment_key='NHZFE5A7', "
         "page=4, text='mindfulness-based therapy', comment='definition to "
         "cite')."
@@ -1384,7 +1436,7 @@ def create_annotation(
                     response.append(f"**Color:** {color}")
                     return "\n".join(response)
                 else:
-                    return f"Annotation creation response was successful but no key was returned: {result}"
+                    return f"Error: Annotation creation response was successful but no key was returned: {result}"
             else:
                 failed_info = result.get("failed", {})
                 return f"Failed to create annotation: {failed_info}"
@@ -1563,7 +1615,7 @@ def create_area_annotation(
                     if comment:
                         response.append(f"**Comment:** {comment}")
                     return "\n".join(response)
-                return f"Annotation creation response was successful but no key was returned: {result}"
+                return f"Error: Annotation creation response was successful but no key was returned: {result}"
 
             failed_info = result.get("failed", {})
             return f"Failed to create annotation: {failed_info}"

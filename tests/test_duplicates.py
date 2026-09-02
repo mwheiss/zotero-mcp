@@ -454,6 +454,37 @@ class TestMergeDuplicatesConfirm:
         # Duplicates should NOT be trashed because re-parenting failed
         assert len(fake.client.patch_calls) == 0
 
+    def test_trash_failure_is_reported_as_partial(self, monkeypatch, dummy_ctx):
+        fake = self._setup_merge(monkeypatch)
+        fake.client.patch = lambda **_kwargs: _FakeResponse(500, text="failed")
+
+        result = server.merge_duplicates(
+            keeper_key="KEEP",
+            duplicate_keys=["DUP1", "DUP2"],
+            confirm=True,
+            ctx=dummy_ctx,
+        )
+
+        assert result.startswith("Partial failure:")
+        assert "were not trashed" in result
+        assert "Merge complete" not in result
+
+    def test_collection_failure_is_reported_as_partial(
+        self, monkeypatch, dummy_ctx
+    ):
+        fake = self._setup_merge(monkeypatch)
+        fake.addto_collection = lambda *_args, **_kwargs: _FakeResponse(500)
+
+        result = server.merge_duplicates(
+            keeper_key="KEEP",
+            duplicate_keys=["DUP1", "DUP2"],
+            confirm=True,
+            ctx=dummy_ctx,
+        )
+
+        assert result.startswith("Partial failure:")
+        assert "not added to collection" in result
+
     def test_version_refetch_after_operations(self, monkeypatch, dummy_ctx):
         """Keeper is re-fetched after tag update and collection adds for fresh version."""
         fake = FakeZoteroForDuplicates()

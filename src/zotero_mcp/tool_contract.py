@@ -9,8 +9,9 @@ from typing import Any
 
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.tool import ToolResult
+from mcp.types import ToolAnnotations
 
-from zotero_mcp.tool_profiles import CONNECTOR_TOOLS, FEED_TOOLS
+from zotero_mcp.tool_profiles import CONNECTOR_TOOLS, FEED_TOOLS, WRITE_TOOLS
 
 CONTENT_BEARING_TOOLS = {
     *FEED_TOOLS,
@@ -49,6 +50,73 @@ CONTENT_BEARING_TOOLS = {
     "zotero_semantic_search",
     "zotero_synthesize_annotations",
 }
+
+STRUCTURED_JSON_TEXT_TOOLS = {
+    "zotero_get_attachment",
+    "zotero_list_attachments",
+}
+
+DESTRUCTIVE_TOOLS = {
+    "zotero_batch_update_extra",
+    "zotero_batch_update_tags",
+    "zotero_delete_annotation",
+    "zotero_delete_collection",
+    "zotero_delete_item",
+    "zotero_delete_note",
+    "zotero_manage_collections",
+    "zotero_merge_duplicates",
+    "zotero_put_attachment",
+    "zotero_remove_item_relation",
+    "zotero_set_attachment_trashed",
+    "zotero_update_annotation",
+    "zotero_update_attachment",
+    "zotero_update_item",
+    "zotero_update_note",
+    "zotero_update_search_database",
+}
+
+NON_IDEMPOTENT_TOOLS = {
+    "zotero_add_by_bibtex",
+    "zotero_add_by_csl_json",
+    "zotero_add_by_doi",
+    "zotero_add_by_isbn",
+    "zotero_add_by_url",
+    "zotero_add_from_file",
+    "zotero_create_annotation",
+    "zotero_create_area_annotation",
+    "zotero_create_collection",
+    "zotero_create_note",
+    "zotero_merge_duplicates",
+    "zotero_prepare_attachment_change",
+    "zotero_prepare_attachment_upload",
+}
+
+OPEN_WORLD_TOOLS = {
+    "scite_check_retractions",
+    "scite_enrich_item",
+    "scite_enrich_search",
+    "zotero_add_by_bibtex",
+    "zotero_add_by_csl_json",
+    "zotero_add_by_doi",
+    "zotero_add_by_isbn",
+    "zotero_add_by_url",
+    "zotero_add_from_file",
+    "zotero_find_related_papers",
+    "zotero_search_items",
+    "zotero_semantic_search",
+    "zotero_update_search_database",
+}
+
+
+def _tool_annotations(name: str) -> ToolAnnotations:
+    """Return complete, conservative MCP behavior hints for one tool."""
+    read_only = name not in WRITE_TOOLS and name != "zotero_switch_library"
+    return ToolAnnotations(
+        readOnlyHint=read_only,
+        destructiveHint=name in DESTRUCTIVE_TOOLS,
+        idempotentHint=name not in NON_IDEMPOTENT_TOOLS,
+        openWorldHint=name in OPEN_WORLD_TOOLS,
+    )
 
 RESULT_SCHEMA = {
     "type": "object",
@@ -103,7 +171,7 @@ PARAMETER_DESCRIPTIONS = {
     "color": "Replacement annotation color as a hexadecimal value such as #ffd400.",
     "comment": "Replacement annotation comment; an empty string clears it.",
     "compare_zotero": "Compare indexed coverage with the current local Zotero library snapshot.",
-    "confirm": "Set true only after the user has explicitly approved the destructive merge.",
+    "confirm": "Set true only after the user has explicitly approved the destructive operation.",
     "confirmation_token": "Short-lived operation-bound token returned by the attachment change preview.",
     "content_type": "IANA MIME type for the attachment binary.",
     "create_missing_collections": "Create unresolved collection paths instead of rejecting the operation.",
@@ -122,7 +190,7 @@ PARAMETER_DESCRIPTIONS = {
     "filename": "Safe filename for the attachment binary.",
     "identifier": "Seed paper as an 8-character Zotero item key, DOI, or DOI URL.",
     "include_trashed": "Include collections currently in Zotero Trash.",
-    "inline": "Embed base64 only when the attachment is no larger than 1 MiB.",
+    "inline": "Embed base64 only within the configured inline limit (1 MiB by default).",
     "idempotency_key": "Caller-generated stable key that makes attachment creation safe to retry.",
     "isbn": "ISBN-10 or ISBN-13, with optional hyphens or URL/isbn prefix.",
     "issn": "Replacement ISSN for the Zotero item.",
@@ -240,7 +308,7 @@ def _is_empty_marker(line: str) -> bool:
         re.match(
             r"^(?:no\s+(?:matching\s+)?(?:annotations?|attachments?|"
             r"bibliography entries|changes|child items|collections?|duplicates?|"
-            r"feed|full[- ]?text|items?|notes?|pdf attachment|related items|"
+            r"feed|full[- ]?text|items?|notes?|pdf attachment|pdf outline|related items|"
             r"results?|rss feeds?|scite data|suitable attachment|tags?)\b|"
             r"none of\b|doi\b.*\bnot found\b|isbn\b.*\bnot found\b|"
             r"relation\b.*\bnot found\b|openalex has no record\b)",
@@ -340,6 +408,10 @@ def classify_result(
         for line in control_lines
         if _is_warning_marker(line)
     ]
+    if tool_name in STRUCTURED_JSON_TEXT_TOOLS and isinstance(data, dict):
+        data_error = data.get("error")
+        if data_error:
+            errors.append(f"Error: {data_error}")
     empty = [line.strip() for line in control_lines[:1] if _is_empty_marker(line)]
     has_partial_failure = any(
         _is_partial_marker(line)
@@ -358,6 +430,12 @@ def classify_result(
         status = "error"
     elif blocked:
         status = "blocked"
+    elif (
+        tool_name == "zotero_list_attachments"
+        and isinstance(data, dict)
+        and data.get("count") == 0
+    ):
+        status = "empty"
     elif empty:
         status = "empty"
     else:
@@ -378,6 +456,11 @@ def _result_data(result: ToolResult, text: str, *, tool_name: str | None = None)
     if not (isinstance(structured, dict) and structured == {"result": text}):
         if structured is not None:
             return copy.deepcopy(structured)
+    if tool_name in STRUCTURED_JSON_TEXT_TOOLS:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
     return _legacy_result_data(
         text,
         content_bearing=tool_name in CONTENT_BEARING_TOOLS,
@@ -519,8 +602,9 @@ class ToolContractMiddleware(Middleware):
         tools = await call_next(context)
         normalized = []
         for tool in tools:
+            annotations = _tool_annotations(tool.name)
             if tool.name in CONNECTOR_TOOLS:
-                normalized.append(tool)
+                normalized.append(tool.model_copy(update={"annotations": annotations}))
                 continue
             parameters = copy.deepcopy(tool.parameters)
             for name, schema in parameters.get("properties", {}).items():
@@ -534,6 +618,7 @@ class ToolContractMiddleware(Middleware):
                     update={
                         "parameters": parameters,
                         "output_schema": RESULT_SCHEMA,
+                        "annotations": annotations,
                     }
                 )
             )

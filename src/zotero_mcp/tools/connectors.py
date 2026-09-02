@@ -1,8 +1,10 @@
 """ChatGPT connector tool functions (search & fetch)."""
 
-import json
 import re
 from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, Field
 
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
@@ -17,11 +19,39 @@ from zotero_mcp.tools.retrieval import get_item_fulltext
 _ITEM_KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
 
 
-def _item_urls(item_key: str) -> tuple[str, str]:
+class ConnectorSearchResult(BaseModel):
+    """One result in the OpenAI MCP search compatibility contract."""
+
+    id: str
+    title: str
+    url: str
+
+
+class ConnectorSearchOutput(BaseModel):
+    """Structured output required by ChatGPT search integrations."""
+
+    results: list[ConnectorSearchResult]
+
+
+class ConnectorFetchOutput(BaseModel):
+    """Structured output required by ChatGPT fetch integrations."""
+
+    id: str
+    title: str
+    text: str
+    url: str
+    metadata: dict[str, Any] | None = None
+
+
+def _item_urls(
+    item_key: str,
+    item: dict[str, Any] | None = None,
+) -> tuple[str, str]:
     """Return active-library-aware ``(select_url, web_url)`` links."""
     library = _client.get_current_library()
     library_type = (library.get("library_type") or "user").lower()
     library_id = str(library.get("library_id") or "")
+    item_library_id = str(((item or {}).get("library") or {}).get("id") or "")
 
     if library_type == "group" and library_id:
         select_url = f"zotero://select/groups/{library_id}/items/{item_key}"
@@ -33,21 +63,23 @@ def _item_urls(item_key: str) -> tuple[str, str]:
         select_url = f"zotero://select/library/items/{item_key}"
         # The local Zotero API identifies My Library as user:0. It has no
         # corresponding web-library URL; a synced Web API client has a real ID.
+        web_library_id = library_id if library_id and library_id != "0" else item_library_id
         web_url = (
-            f"https://www.zotero.org/users/{library_id}/items/{item_key}"
-            if library_id and library_id != "0"
+            f"https://www.zotero.org/users/{web_library_id}/items/{item_key}"
+            if web_library_id
             else ""
         )
     return select_url, web_url
 
 
-def _citation_url(item_key: str) -> str:
+def _citation_url(item_key: str, item: dict[str, Any] | None = None) -> str:
     """Return the same preferred citation URL for connector search and fetch."""
-    select_url, web_url = _item_urls(item_key)
+    select_url, web_url = _item_urls(item_key, item)
     return web_url or select_url
 
 @mcp.tool(
     name="search",
+    output_schema=ConnectorSearchOutput.model_json_schema(),
     description=(
         "ChatGPT custom connector SEARCH endpoint — name is REQUIRED by "
         "the MCP-over-web spec (see platform.openai.com/docs/mcp); "
@@ -55,8 +87,8 @@ def _citation_url(item_key: str) -> str:
         "or other regular MCP contexts use zotero_semantic_search or "
         "zotero_search_items instead, which return richer markdown. "
         "Performs semantic search over the active Zotero library and "
-        "returns a JSON string {\"results\":[{\"id\",\"title\",\"url\"}, "
-        "...]} matching the ChatGPT connector citation UI. URLs are "
+        "returns structured {\"results\":[{\"id\",\"title\",\"url\"}, "
+        "...]} data matching the ChatGPT connector citation UI. URLs are "
         "web-library links when available, otherwise active-library-aware "
         "zotero://select deep-links. "
         "query: topic string; natural language works (embedding match). "
@@ -64,20 +96,22 @@ def _citation_url(item_key: str) -> str:
         "expected result-set size. "
         "Requires the semantic search DB populated — run "
         "zotero_update_search_database first if empty. "
-        "SILENT FALLBACK: any error returns {\"results\":[]} rather "
-        "than raising, to keep the ChatGPT connector stable. "
+        "Backend failures raise an MCP tool error; an empty results array means "
+        "the search completed successfully with no matches. "
         "Example (agent-invoked): search(query='mindfulness-based "
         "therapy')."
     )
 )
 def chatgpt_connector_search(
-    query: str,
+    query: str = Field(
+        description="Natural-language query for semantic search over the active Zotero library."
+    ),
     *,
     ctx: Context
-) -> str:
+) -> ConnectorSearchOutput:
     """
-    Returns a JSON-encoded string with shape {"results": [{"id","title","url"}, ...]}.
-    The MCP runtime wraps this string as a single text content item.
+    Return the structured search compatibility object. FastMCP mirrors the
+    same value into the text content block for legacy clients.
     """
     try:
         default_limit = 10
@@ -87,7 +121,7 @@ def chatgpt_connector_search(
         config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
         search = create_semantic_search(str(config_path))
 
-        result_list: list[dict[str, str]] = []
+        result_list: list[ConnectorSearchResult] = []
         results = search.search(query=query, limit=default_limit, filters=None) or {}
         for r in results.get("results", []):
             raw_item_key = r.get("item_key")
@@ -97,26 +131,26 @@ def chatgpt_connector_search(
             if not _ITEM_KEY_RE.fullmatch(item_key):
                 continue
             title = ""
-            if r.get("zotero_item"):
-                data = (r.get("zotero_item") or {}).get("data", {})
+            zotero_item = r.get("zotero_item") or {}
+            if zotero_item:
+                data = zotero_item.get("data", {})
                 title = data.get("title", "")
             if not title:
                 title = f"Zotero Item {item_key}" if item_key else "Zotero Item"
-            url = _citation_url(item_key)
-            result_list.append({
-                "id": item_key,
-                "title": title,
-                "url": url,
-            })
+            url = _citation_url(item_key, zotero_item)
+            result_list.append(
+                ConnectorSearchResult(id=item_key, title=title, url=url)
+            )
 
-        return json.dumps({"results": result_list}, separators=(",", ":"))
+        return ConnectorSearchOutput(results=result_list)
     except Exception as e:
         context_error(ctx, f"Error in search wrapper: {str(e)}")
-        return json.dumps({"results": []}, separators=(",", ":"))
+        raise RuntimeError(f"Connector search failed: {e}") from e
 
 
 @mcp.tool(
     name="fetch",
+    output_schema=ConnectorFetchOutput.model_json_schema(),
     description=(
         "ChatGPT custom connector FETCH endpoint — name is REQUIRED by "
         "the MCP-over-web spec (see platform.openai.com/docs/mcp); "
@@ -127,59 +161,48 @@ def chatgpt_connector_search(
         "{\"id\",\"title\",\"text\",\"url\",\"metadata\":{...}} matching "
         "the ChatGPT connector citation viewer. "
         "id: an 8-char Zotero item key — typically from a previous "
-        "`search` call. Blank/missing returns an empty envelope (no "
-        "error). "
-        "url field: Zotero web-library URL when ZOTERO_LIBRARY_ID is "
+        "`search` call. Blank, malformed, or missing IDs raise a tool error. "
+        "url field: Zotero web-library URL when a synced user/group identity is "
         "available; otherwise an active-library-aware zotero://select deep-link. "
         "text field: extracted fulltext via the same path as "
         "zotero_get_item_fulltext; if none can be extracted, falls back "
         "to title + authors + abstract so the connector isn't blank. "
         "metadata field: itemType, date, DOI, authors, tags, both URLs. "
-        "SILENT FALLBACK: errors return an envelope with "
-        "{\"metadata\":{\"error\":…}} rather than raising, to keep the "
-        "ChatGPT connector stable. "
+        "Invalid IDs and backend failures raise MCP tool errors rather than "
+        "returning a document-shaped false success. "
         "Example (agent-invoked): fetch(id='RTKZQI8E')."
     )
 )
 def connector_fetch(
-    id: str,
+    id: str = Field(
+        description="Exact 8-character Zotero item key returned by the connector search tool."
+    ),
     *,
     ctx: Context
-) -> str:
+) -> ConnectorFetchOutput:
     """
-    Returns a JSON-encoded string with shape {"id","title","text","url","metadata":{...}}.
-    The MCP runtime wraps this string as a single text content item.
+    Return the structured fetch compatibility object. FastMCP mirrors the
+    same value into the text content block for legacy clients.
     """
     try:
         item_key = (id or "").strip()
         if not item_key:
-            return json.dumps({
-                "id": id,
-                "title": "",
-                "text": "",
-                "url": "",
-                "metadata": {"error": "missing item key"}
-            }, separators=(",", ":"))
+            raise ValueError("missing item key")
         if not _ITEM_KEY_RE.fullmatch(item_key):
-            return json.dumps({
-                "id": id,
-                "title": "",
-                "text": "",
-                "url": "",
-                "metadata": {"error": "invalid Zotero item key"}
-            }, separators=(",", ":"))
+            raise ValueError("invalid Zotero item key")
 
         # Fetch item metadata for title and context
         zot = _client.get_zotero_client()
         try:
             item = zot.item(item_key)
             data = item.get("data", {}) if item else {}
-        except Exception:
-            item = None
-            data = {}
+        except Exception as exc:
+            raise LookupError(f"Zotero item {item_key} could not be retrieved: {exc}") from exc
+        if not item:
+            raise LookupError(f"Zotero item {item_key} was not found")
 
         title = data.get("title", f"Zotero Item {item_key}")
-        zotero_url, web_url = _item_urls(item_key)
+        zotero_url, web_url = _item_urls(item_key, item)
         # Prefer a shareable web URL; local-only and feed libraries use the
         # Zotero desktop deep-link instead.
         url = web_url or zotero_url
@@ -218,19 +241,13 @@ def connector_fetch(
             "source": "zotero-mcp"
         }
 
-        return json.dumps({
-            "id": item_key,
-            "title": title,
-            "text": text_clean,
-            "url": url,
-            "metadata": metadata
-        }, separators=(",", ":"))
+        return ConnectorFetchOutput(
+            id=item_key,
+            title=title,
+            text=text_clean,
+            url=url,
+            metadata=metadata,
+        )
     except Exception as e:
         context_error(ctx, f"Error in fetch wrapper: {str(e)}")
-        return json.dumps({
-            "id": id,
-            "title": "",
-            "text": "",
-            "url": "",
-            "metadata": {"error": str(e)}
-        }, separators=(",", ":"))
+        raise

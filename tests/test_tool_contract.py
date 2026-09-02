@@ -1,6 +1,7 @@
 """Tests for the MCP-visible Zotero tool contract."""
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 from fastmcp.tools.tool import ToolResult
@@ -8,6 +9,8 @@ from fastmcp.tools.tool import ToolResult
 from zotero_mcp.server import mcp
 from zotero_mcp.tool_contract import (
     CONTENT_BEARING_TOOLS,
+    DESTRUCTIVE_TOOLS,
+    NON_IDEMPOTENT_TOOLS,
     RESULT_SCHEMA,
     ToolContractMiddleware,
     _legacy_result_data,
@@ -54,12 +57,36 @@ def test_all_tools_advertise_specific_parameters_and_result_schema(monkeypatch):
             )
 
 
-def test_connector_tools_keep_the_connector_output_contract(monkeypatch):
+def test_connector_tools_advertise_the_openai_compatibility_contract(monkeypatch):
     monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "all")
     tools = {tool.name: tool for tool in _normalized_tools()}
 
-    assert tools["search"].output_schema != RESULT_SCHEMA
-    assert tools["fetch"].output_schema != RESULT_SCHEMA
+    search_schema = tools["search"].output_schema
+    fetch_schema = tools["fetch"].output_schema
+
+    assert search_schema["type"] == "object"
+    assert search_schema["required"] == ["results"]
+    result_schema = search_schema["properties"]["results"]["items"]
+    assert set(result_schema["required"]) == {"id", "title", "url"}
+    assert set(fetch_schema["required"]) == {"id", "title", "text", "url"}
+
+
+def test_every_tool_has_complete_behavior_annotations(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "all")
+    monkeypatch.setenv("ZOTERO_API_KEY", "test-key")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "1")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", "true")
+
+    for tool in _normalized_tools():
+        annotations = tool.annotations
+        assert annotations is not None, tool.name
+        assert annotations.readOnlyHint is not None, tool.name
+        assert annotations.destructiveHint is not None, tool.name
+        assert annotations.idempotentHint is not None, tool.name
+        assert annotations.openWorldHint is not None, tool.name
+        assert annotations.destructiveHint is (tool.name in DESTRUCTIVE_TOOLS)
+        assert annotations.idempotentHint is (tool.name not in NON_IDEMPOTENT_TOOLS)
 
 
 def test_every_non_content_tool_has_an_explicit_operational_role(monkeypatch):
@@ -88,6 +115,56 @@ def test_result_classification_distinguishes_empty_blocked_and_partial():
     assert classify_result("Created metadata.\nPartial failure: PDF unavailable.")[
         "status"
     ] == "partial"
+    assert classify_result(
+        "Partial failure: merge moved one child but another failed."
+    )["status"] == "partial"
+
+
+def test_attachment_json_results_preserve_data_and_truthful_status():
+    empty_data = {"item_key": "ABCD1234", "count": 0, "attachments": []}
+    empty = classify_result(
+        '{"item_key":"ABCD1234","count":0,"attachments":[]}',
+        data=empty_data,
+        tool_name="zotero_list_attachments",
+    )
+    assert empty["status"] == "empty"
+    assert empty["data"] == empty_data
+
+    unavailable_data = {
+        "attachment": {"attachment_key": "ATTACH1"},
+        "error": "Attachment has no stored binary",
+    }
+    unavailable = classify_result(
+        '{"attachment":{"attachment_key":"ATTACH1"},'
+        '"error":"Attachment has no stored binary"}',
+        data=unavailable_data,
+        tool_name="zotero_get_attachment",
+    )
+    assert unavailable["status"] == "error"
+    assert unavailable["ok"] is False
+
+
+def test_attachment_json_is_parsed_by_call_middleware():
+    async def run():
+        middleware = ToolContractMiddleware()
+        context = SimpleNamespace(
+            message=SimpleNamespace(name="zotero_list_attachments")
+        )
+
+        async def call_next(_context):
+            return ToolResult(
+                content='{"item_key":"ABCD1234","count":0,"attachments":[]}'
+            )
+
+        return await middleware.on_call_tool(context, call_next)
+
+    structured = asyncio.run(run()).structured_content
+    assert structured["status"] == "empty"
+    assert structured["data"] == {
+        "item_key": "ABCD1234",
+        "count": 0,
+        "attachments": [],
+    }
 
 
 def test_result_classification_recognizes_formatted_failures_and_warnings():
@@ -350,3 +427,28 @@ def test_content_data_ignores_arbitrary_paper_fields():
         "fields": {"item_key": ["ABCD1234"]},
         "identifiers": {"item_keys": ["ABCD1234"]},
     }
+
+
+def test_server_reexports_every_public_tool_implementation():
+    import zotero_mcp.server as server
+
+    expected = {
+        "find_related_papers",
+        "library_coverage",
+        "synthesize_annotations",
+        "export_bibliography",
+        "enrich_item",
+        "enrich_search",
+        "check_retractions",
+    }
+
+    assert all(hasattr(server, name) for name in expected)
+
+
+def test_readme_available_tools_inventory_covers_registered_tools(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "all")
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    tools = asyncio.run(mcp.list_tools(run_middleware=False))
+
+    missing = [tool.name for tool in tools if tool.name not in readme]
+    assert missing == []

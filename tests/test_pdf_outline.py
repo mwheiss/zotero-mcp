@@ -140,8 +140,7 @@ class TestEmptyToc:
 
         result = server.get_pdf_outline(item_key="ITEM01", ctx=dummy_ctx)
 
-        assert "does not contain a table of contents" in result.lower() or \
-               "does not contain a table of contents/outline" in result.lower()
+        assert "no pdf outline found" in result.lower()
 
 
 class TestNoPdfAttachment:

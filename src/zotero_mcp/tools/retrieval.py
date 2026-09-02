@@ -827,6 +827,7 @@ def get_items_children(item_keys: list[str] | str, *, ctx: Context) -> str:
 
         # Batch-resolve parent titles (50 per API call)
         parent_titles = {}
+        parent_lookup_failures: list[str] = []
         for batch_start in range(0, len(keys), 50):
             batch = keys[batch_start : batch_start + 50]
             try:
@@ -836,10 +837,12 @@ def get_items_children(item_keys: list[str] | str, *, ctx: Context) -> str:
                     parent_titles[k] = item.get("data", {}).get("title", "Untitled")
             except Exception as e:
                 context_warning(ctx, f"Batch parent lookup failed: {e}")
+                parent_lookup_failures.extend(batch)
                 for k in batch:
                     parent_titles.setdefault(k, f"(key: {k})")
 
         output = [f"# Children for {len(keys)} items", ""]
+        child_failures: list[str] = []
 
         for key in keys:
             title = parent_titles.get(key, f"(key: {key})")
@@ -850,6 +853,7 @@ def get_items_children(item_keys: list[str] | str, *, ctx: Context) -> str:
             except Exception as e:
                 output.append(f"  Error fetching children: {e}")
                 output.append("")
+                child_failures.append(key)
                 continue
 
             if not children:
@@ -882,7 +886,21 @@ def get_items_children(item_keys: list[str] | str, *, ctx: Context) -> str:
 
             output.append("")
 
-        return "\n".join(output)
+        result = "\n".join(output)
+        if child_failures:
+            marker = "Error" if len(child_failures) == len(keys) else "Partial failure"
+            return (
+                f"{marker}: could not fetch children for "
+                f"{', '.join(child_failures)}.\n\n{result}"
+            )
+        if parent_lookup_failures:
+            return (
+                "[WARN] Parent titles could not be resolved for: "
+                + ", ".join(parent_lookup_failures)
+                + ".\n\n"
+                + result
+            )
+        return result
 
     except ValueError as e:
         return f"Input error: {e}"
@@ -1004,6 +1022,7 @@ def list_libraries(*, ctx: Context) -> str:
         active = _client.get_current_library()
 
         output = ["# Zotero Libraries", ""]
+        partial_errors: list[str] = []
 
         # Show active library context
         output.append(f"> **Active library:** {active['library_type']}:{active['library_id']}")
@@ -1070,15 +1089,19 @@ def list_libraries(*, ctx: Context) -> str:
                             f"(`library_id={group.get('id', '?')}`, `library_type=group`)"
                         )
                     output.append("")
-            except Exception:
+            except Exception as exc:
                 output.append("*Could not retrieve group libraries.*\n")
+                partial_errors.append(f"group library lookup: {exc}")
 
             output.append("*Note: RSS feeds are only accessible in local mode.*")
 
         output.append("")
         output.append("Use `zotero_switch_library` only to select a different library.")
 
-        return "\n".join(output)
+        result = "\n".join(output)
+        if partial_errors:
+            result = "Partial failure: " + "; ".join(partial_errors) + "\n\n" + result
+        return result
 
     except Exception as e:
         context_error(ctx, f"Error listing libraries: {str(e)}")
@@ -1440,7 +1463,15 @@ def get_recent(limit: int | str = 10, collection_key: str | None = None, *, ctx:
 
 @mcp.tool(
     name="zotero_get_item_related",
-    description="Get all related items for a specific Zotero item. Returns items that are linked via the relations field.",
+    description=(
+        "Retrieve items linked from one Zotero item's relations field and group "
+        "them by relation type. item_key must be the exact 8-character key of "
+        "an item in the active library. Same-library targets are resolved to "
+        "title, type, date, creator, and DOI; cross-library relation URIs remain "
+        "identified by key and are reported as unresolved rather than fetched "
+        "from the wrong library. Use zotero_add_item_relation or "
+        "zotero_remove_item_relation to change links."
+    ),
 )
 def get_item_related(item_key: str, *, ctx: Context) -> str:
     """
@@ -1466,6 +1497,20 @@ def get_item_related(item_key: str, *, ctx: Context) -> str:
         data = item.get("data", {})
         item_title = data.get("title", "Untitled")
         relations = data.get("relations", {})
+        active_library = _client.get_current_library()
+        active_type = str(
+            getattr(zot, "library_type", None)
+            or active_library.get("library_type", "user")
+        ).lower()
+        active_type = {"users": "user", "groups": "group", "feeds": "feed"}.get(
+            active_type,
+            active_type,
+        )
+        active_id = str(
+            getattr(zot, "library_id", None)
+            or active_library.get("library_id", "")
+        )
+        source_library_id = str((item.get("library") or {}).get("id") or "")
 
         if not isinstance(relations, dict) or not relations:
             return f"No related items found for: **{item_title}** (Key: `{item_key}`)"
@@ -1483,14 +1528,26 @@ def get_item_related(item_key: str, *, ctx: Context) -> str:
                 if not isinstance(uri, str):
                     continue
                 # Extract item key from URI
-                match = re.search(r"/items/([A-Z0-9]{8})$", uri)
+                match = re.search(
+                    r"/(users|groups)/(\d+)/items/([A-Z0-9]{8})$",
+                    uri,
+                )
                 if match:
-                    key = match.group(1)
-                    # Deduplicate: same key may appear with both users/ and groups/ prefix
-                    dedup_id = (rel_type, key)
+                    uri_type = "user" if match.group(1) == "users" else "group"
+                    uri_library_id = match.group(2)
+                    key = match.group(3)
+                    same_scope = uri_type == active_type and (
+                        uri_library_id == active_id
+                        or (
+                            active_type == "user"
+                            and active_id == "0"
+                            and uri_library_id in {"0", source_library_id}
+                        )
+                    )
+                    dedup_id = (rel_type, uri_type, uri_library_id, key)
                     if dedup_id not in seen_keys:
                         seen_keys.add(dedup_id)
-                        related_keys.append((rel_type, key, uri))
+                        related_keys.append((rel_type, key, uri, same_scope))
 
         if not related_keys:
             return f"No related items found for: **{item_title}** (Key: `{item_key}`)"
@@ -1500,16 +1557,23 @@ def get_item_related(item_key: str, *, ctx: Context) -> str:
 
         # Group by relation type
         by_type = {}
-        for rel_type, key, uri in related_keys:
+        for rel_type, key, uri, same_scope in related_keys:
             if rel_type not in by_type:
                 by_type[rel_type] = []
-            by_type[rel_type].append((key, uri))
+            by_type[rel_type].append((key, uri, same_scope))
 
+        detail_failures: list[str] = []
         for rel_type, items in by_type.items():
             output.append(f"## Relation Type: `{rel_type}`")
             output.append("")
 
-            for rel_key, uri in items:
+            for rel_key, uri, same_scope in items:
+                if not same_scope:
+                    output.append(
+                        f"- `{rel_key}` — cross-library target (not fetched): {uri}"
+                    )
+                    output.append("")
+                    continue
                 try:
                     rel_item = zot.item(rel_key)
                     rel_data = rel_item.get("data", {})
@@ -1535,8 +1599,20 @@ def get_item_related(item_key: str, *, ctx: Context) -> str:
                 except Exception as e:
                     output.append(f"- `{rel_key}` — (Could not fetch details: {e})")
                     output.append("")
+                    detail_failures.append(rel_key)
 
-        return "\n".join(output)
+        result = "\n".join(output)
+        if detail_failures:
+            marker = (
+                "Error"
+                if len(detail_failures) == len(related_keys)
+                else "Partial failure"
+            )
+            return (
+                f"{marker}: could not fetch {len(detail_failures)} related item(s): "
+                f"{', '.join(detail_failures)}.\n\n{result}"
+            )
+        return result
 
     except Exception as e:
         context_error(ctx, f"Error fetching related items: {str(e)}")

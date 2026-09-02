@@ -137,6 +137,29 @@ class TestGetItemRelated:
         assert "ITEM0002" in result
         assert "dc:relation" in result
 
+    def test_cross_library_relation_is_not_fetched_from_active_library(
+        self, monkeypatch
+    ):
+        item1 = _make_item(key="ITEM0001", title="First Paper")
+        item1["data"]["relations"] = {
+            "dc:relation": ["http://zotero.org/groups/999/items/ITEM0002"]
+        }
+        colliding = _make_item(key="ITEM0002", title="Wrong Active-Library Item")
+        fake = FakeZoteroForRelations(items=[item1, colliding])
+        monkeypatch.setattr(
+            "zotero_mcp.tools.retrieval._client.get_zotero_client",
+            lambda: fake,
+        )
+        monkeypatch.setattr(
+            "zotero_mcp.tools.retrieval._client.get_current_library",
+            lambda: {"library_id": "12345", "library_type": "user"},
+        )
+
+        result = server.get_item_related("ITEM0001", ctx=DummyContext())
+
+        assert "cross-library target (not fetched)" in result
+        assert "Wrong Active-Library Item" not in result
+
     def test_nonexistent_item(self, monkeypatch):
         """Fetching relations for nonexistent item returns error."""
         fake = FakeZoteroForRelations(items=[])

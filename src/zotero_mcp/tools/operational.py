@@ -6,6 +6,7 @@ import importlib.util
 import os
 from pathlib import Path
 
+from zotero_mcp import attachment_service as _attachments
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
@@ -35,6 +36,7 @@ def get_capabilities(*, ctx: Context) -> str:
     api_key = bool(os.getenv("ZOTERO_API_KEY"))
     semantic_available = importlib.util.find_spec("chromadb") is not None
     pdf_available = importlib.util.find_spec("fitz") is not None
+    epub_available = importlib.util.find_spec("ebooklib") is not None
     requested = requested_tool_profile()
     effective = effective_tool_profile()
     local_paths = tool_visible("zotero_get_attachment_path", effective)
@@ -66,8 +68,11 @@ def get_capabilities(*, ctx: Context) -> str:
         f"**Per-call write secret required:** {'yes' if write_gate_configured else 'misconfigured'}",
         f"**Semantic search installed:** {'yes' if semantic_available else 'no'}",
         f"**PDF page/outline support:** {'yes' if pdf_available else 'no'}",
+        f"**EPUB annotation authoring:** {'yes' if epub_available else 'no'}",
         f"**Local full-text extraction:** {'yes' if local_mode else 'no'}",
         f"**Local paths exposed:** {'yes' if local_paths else 'no'}",
+        f"**Inline attachment limit:** {_attachments.max_inline_size()} bytes",
+        f"**MCP binary resource limit:** {_attachments.max_resource_size()} bytes",
         "",
         "Use metadata search for known titles/authors, semantic search for topics, "
         "semantic context for matched evidence, and whole-item full text only for "

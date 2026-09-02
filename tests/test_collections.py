@@ -527,13 +527,24 @@ class TestDeleteCollection:
     def test_deletes_existing_collection(self, monkeypatch, fake_zot, ctx):
         _patch_web_only(monkeypatch, fake_zot)
 
-        result = server.delete_collection(collection_key="ABC00001", ctx=ctx)
+        result = server.delete_collection(
+            collection_key="ABC00001", confirm=True, ctx=ctx
+        )
 
         assert len(fake_zot.deleted_collections) == 1
         assert fake_zot.deleted_collections[0]["key"] == "ABC00001"
         assert "Deleted" in result
         assert "Machine Learning" in result
         assert "ABC00001" in result
+
+    def test_requires_explicit_confirmation(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+
+        result = server.delete_collection(collection_key="ABC00001", ctx=ctx)
+
+        assert "Deletion Not Started" in result
+        assert "confirm=True" in result
+        assert fake_zot.deleted_collections == []
 
     def test_unknown_key_returns_error(self, monkeypatch, fake_zot, ctx):
         _patch_web_only(monkeypatch, fake_zot)

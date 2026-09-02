@@ -1,5 +1,6 @@
 """Discovery tools: find related papers via OpenAlex and assess library coverage."""
 
+import os
 import re
 from typing import Literal
 
@@ -12,15 +13,19 @@ from zotero_mcp._context import Context, context_error, context_info
 from zotero_mcp.tools import _helpers
 
 _OPENALEX_BASE = "https://api.openalex.org"
-_MAILTO = "zotero-mcp@users.noreply.github.com"
 _ITEM_KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
 _HTTP_TIMEOUT = 30
 
 
-def _doi_in_library(zot, doi: str) -> bool:
+class OpenAlexLookupError(RuntimeError):
+    """OpenAlex could not answer a request, distinct from a genuine 404."""
+
+
+def _doi_in_library(zot, doi: str) -> bool | None:
     """Best-effort membership check: is a paper with this DOI already in Zotero?
 
-    Tolerates any pyzotero error by returning False (treat as "not in library").
+    Returns None when Zotero cannot answer, so callers never mislabel an
+    unknown paper as absent from the library.
     """
     if not doi:
         return False
@@ -31,7 +36,7 @@ def _doi_in_library(zot, doi: str) -> bool:
         try:
             results = zot.items(q=doi, qmode="everything", itemType="-attachment", limit=5)
         except Exception:
-            return False
+            return None
     norm = doi.strip().lower()
     for item in results or []:
         item_doi = str(item.get("data", {}).get("DOI", "")).strip().lower()
@@ -72,21 +77,32 @@ def _work_summary(work: dict) -> dict:
     }
 
 
-def _openalex_get(url: str, params: dict | None = None) -> dict | None:
-    """GET an OpenAlex endpoint, returning parsed JSON or None on any failure."""
-    p = {"mailto": _MAILTO}
+def _openalex_get(
+    url: str,
+    params: dict | None = None,
+    *,
+    not_found_is_empty: bool = False,
+) -> dict | None:
+    """GET OpenAlex, returning None only for a genuine not-found response."""
+    p = {}
+    if api_key := os.getenv("OPENALEX_API_KEY", "").strip():
+        p["api_key"] = api_key
     if params:
         p.update(params)
     try:
         resp = requests.get(url, params=p, timeout=_HTTP_TIMEOUT)
-    except Exception:
+    except Exception as exc:
+        raise OpenAlexLookupError(f"OpenAlex request failed: {exc}") from exc
+    if getattr(resp, "status_code", None) == 404 and not_found_is_empty:
         return None
     if getattr(resp, "status_code", None) != 200:
-        return None
+        raise OpenAlexLookupError(
+            f"OpenAlex returned HTTP {getattr(resp, 'status_code', 'unknown')}"
+        )
     try:
         return resp.json()
-    except Exception:
-        return None
+    except Exception as exc:
+        raise OpenAlexLookupError(f"OpenAlex returned invalid JSON: {exc}") from exc
 
 
 def _resolve_doi(identifier: str, zot) -> str | None:
@@ -114,7 +130,14 @@ def _render_related(papers: list[dict], heading: str) -> list[str]:
     for i, p in enumerate(papers, 1):
         authors = ", ".join(p["authors"]) if p["authors"] else "Unknown authors"
         year = p["year"] if p["year"] else "n.d."
-        marker = "in library ✓" if p.get("in_library") else "not in library"
+        membership = p.get("in_library")
+        marker = (
+            "in library ✓"
+            if membership is True
+            else "not in library"
+            if membership is False
+            else "library membership unknown"
+        )
         lines.append(f"{i}. **{p['title']}** ({year})")
         lines.append(f"   - Authors: {authors}")
         if p["doi"]:
@@ -172,9 +195,12 @@ def find_related_papers(
             )
 
         context_info(ctx, f"Querying OpenAlex for DOI {doi}")
-        work = _openalex_get(f"{_OPENALEX_BASE}/works/https://doi.org/{doi}")
+        work = _openalex_get(
+            f"{_OPENALEX_BASE}/works/https://doi.org/{doi}",
+            not_found_is_empty=True,
+        )
         if not work:
-            return f"OpenAlex has no record for DOI '{doi}', or the lookup failed."
+            return f"OpenAlex has no record for DOI '{doi}'."
 
         want_refs = direction in {"references", "both"}
         want_cites = direction in {"citations", "both"}
@@ -224,6 +250,11 @@ def find_related_papers(
             summary_bits.append(f"{len(citations)} citations")
         in_lib = sum(1 for p in references + citations if p.get("in_library"))
         summary_bits.append(f"{in_lib} already in library")
+        unknown_membership = sum(
+            1 for p in references + citations if p.get("in_library") is None
+        )
+        if unknown_membership:
+            summary_bits.append(f"{unknown_membership} with unknown library membership")
         output.append("Found " + ", ".join(summary_bits) + ".")
         output.append("")
 
@@ -239,11 +270,12 @@ def find_related_papers(
         return f"Error finding related papers: {e}"
 
 
-def _item_has_pdf(zot, item: dict) -> bool:
+def _item_has_pdf(zot, item: dict) -> bool | None:
     """Return True if the item is/has a PDF attachment.
 
     A standalone PDF attachment counts directly; otherwise we inspect the
-    item's children for any PDF attachment. Tolerant of children() errors.
+    item's children for any PDF attachment. Returns None when child lookup
+    fails so coverage reports do not turn unknown state into a false gap.
     """
     data = item.get("data", {})
     if data.get("itemType") == "attachment" and data.get("contentType") == "application/pdf":
@@ -254,7 +286,7 @@ def _item_has_pdf(zot, item: dict) -> bool:
     try:
         children = zot.children(key)
     except Exception:
-        return False
+        return None
     for child in children or []:
         cdata = child.get("data", {})
         if cdata.get("itemType") == "attachment" and cdata.get("contentType") == "application/pdf":
@@ -266,8 +298,9 @@ def _item_has_pdf(zot, item: dict) -> bool:
     name="zotero_library_coverage",
     description=(
         "Audit PDF coverage across your Zotero library (or one collection): "
-        "which items have a downloaded PDF attachment and which are missing "
-        "one. Use this to find papers you can still fetch full text for — the "
+        "which items have a downloaded PDF attachment, which are confirmed "
+        "missing one, and which could not be checked. Use this to find papers "
+        "you can still fetch full text for — the "
         "missing list includes each item's DOI so you can pass it to "
         "zotero_add_by_doi's open-access download cascade. "
         "collection_key: optional 8-char key to scope the audit to one "
@@ -313,6 +346,7 @@ def library_coverage(
         scanned = 0
         with_pdf = 0
         missing: list[dict] = []
+        unknown: list[dict] = []
 
         for item in items or []:
             data = item.get("data", {})
@@ -324,8 +358,16 @@ def library_coverage(
                 continue
 
             scanned += 1
-            if _item_has_pdf(zot, item):
+            pdf_status = _item_has_pdf(zot, item)
+            if pdf_status is True:
                 with_pdf += 1
+            elif pdf_status is None:
+                unknown.append(
+                    {
+                        "title": data.get("title") or data.get("filename") or "Untitled",
+                        "key": item.get("key", ""),
+                    }
+                )
             else:
                 title = data.get("title") or data.get("filename") or "Untitled"
                 year = str(data.get("date", ""))[:4]
@@ -339,7 +381,8 @@ def library_coverage(
                 )
 
         missing_count = len(missing)
-        pct = (with_pdf / scanned * 100) if scanned else 0.0
+        known_count = with_pdf + missing_count
+        pct = (with_pdf / known_count * 100) if known_count else 0.0
 
         scope = f"collection {collection_key}" if collection_key else "entire library"
         output = [
@@ -348,7 +391,8 @@ def library_coverage(
             f"- Items scanned: {scanned}",
             f"- With PDF: {with_pdf}",
             f"- Missing PDF: {missing_count}",
-            f"- Coverage: {pct:.1f}%",
+            f"- Unknown PDF status: {len(unknown)}",
+            f"- Confirmed coverage: {pct:.1f}% of {known_count} item(s) with known status",
             "",
         ]
 
@@ -363,8 +407,24 @@ def library_coverage(
                     line += f" — DOI: {m['doi']}"
                 output.append(line)
             output.append("")
-        else:
+        elif not unknown:
             output.append("All scanned items have a PDF attachment. ✓")
+
+        if unknown:
+            output.append(
+                f"## PDF Status Unknown (showing {min(len(unknown), 50)} of {len(unknown)})"
+            )
+            output.append("")
+            for entry in unknown[:50]:
+                output.append(f"- `{entry['key']}` — {entry['title']}")
+            output.append("")
+
+        if unknown:
+            output.insert(
+                0,
+                "Partial failure: Zotero child lookup failed for one or more items; "
+                "their PDF status is unknown.",
+            )
 
         return "\n".join(output)
 

@@ -329,6 +329,14 @@ def read_lock_holder(lock_path: Path) -> tuple[int | None, bool]:
     return pid, _pid_is_alive(pid)
 
 
+def update_lock_path() -> Path:
+    """Return the configurable cross-process semantic update lock path."""
+    configured = os.getenv("ZOTERO_MCP_UPDATE_LOCK_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".config" / "zotero-mcp" / "update.lock"
+
+
 @contextlib.contextmanager
 def _acquire_update_lock(lock_path: Path):
     """Non-blocking exclusive flock over an update-database run.
@@ -2676,7 +2684,7 @@ class ZoteroSemanticSearch:
         # update_database on startup while the user may also run
         # `zotero-mcp update-db` manually. A cross-process flock avoids
         # double work and potential ChromaDB corruption.
-        lock_path = Path.home() / ".config" / "zotero-mcp" / "update.lock"
+        lock_path = update_lock_path()
         lock_cm = _acquire_update_lock(lock_path)
         acquired = lock_cm.__enter__()
         if not acquired:
@@ -4115,7 +4123,7 @@ class ZoteroSemanticSearch:
 
     def import_openai_batch(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
         """Import completed OpenAI Batch API embeddings into ChromaDB."""
-        lock_path = Path.home() / ".config" / "zotero-mcp" / "update.lock"
+        lock_path = update_lock_path()
         lock_cm = _acquire_update_lock(lock_path)
         acquired = lock_cm.__enter__()
         if not acquired:

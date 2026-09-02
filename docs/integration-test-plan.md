@@ -1,11 +1,18 @@
 # Zotero MCP Feature Test Plan
 
+This is a representative live workflow plan for the highest-risk integrations;
+it is not an exhaustive inventory of every registered MCP tool. The automated
+test suite and runtime contract tests cover the complete advertised surface.
+
 Use this document as instructions for Claude Co-Work. Copy/paste each section as a prompt, or give the whole document at once and ask Claude to work through it step by step.
 
 **Prerequisites:**
-- Zotero 8 is running on this computer
+- Zotero 10 or newer is running on this computer (required for authenticated Local API writes)
 - The local API is enabled in Zotero preferences ("Allow other applications on this computer to communicate with Zotero")
 - The modified zotero-mcp is installed (run `zotero-mcp version` in terminal to verify)
+- `ZOTERO_MCP_WRITE_SECRET` is configured. Every mutation advertises a required
+  `write_secret`; supply it through the MCP client without pasting it into logs
+  or committing it to this test plan.
 
 **Important:** After each write operation, open Zotero and verify the change appeared immediately. This confirms the authenticated Local API write path is active; no cloud sync round trip should be required.
 
@@ -188,9 +195,9 @@ Remove the arXiv paper from "MCP Test Collection".
 
 ### Test 6.1: Create Test Duplicates
 ```
-Add this DOI twice to create a deliberate duplicate:
-First: Add DOI 10.1016/j.cell.2015.11.015 with tag "copy-1"
-Then: Add the same DOI 10.1016/j.cell.2015.11.015 again with tag "copy-2"
+Add this DOI twice with `if_exists="duplicate"` to create a deliberate duplicate:
+First: Add DOI 10.1016/j.cell.2015.11.015 with tag "copy-1" and duplicate mode.
+Then: Add the same DOI again with tag "copy-2" and duplicate mode.
 ```
 **Verify:** Two separate items with the same title/DOI appear in Zotero, each with different tags.
 
@@ -317,7 +324,7 @@ Check if the arXiv PDF was automatically attached.
 ### Test 9.7: Merge Duplicates Actually Trashes
 ```
 Create two duplicates (add DOI 10.1038/s41586-020-2649-2 twice with
-tags "merge-test-1" and "merge-test-2").
+`if_exists="duplicate"` and tags "merge-test-1" and "merge-test-2").
 Find them, then merge with confirm=True.
 Check Zotero's Trash (View > Show Trash).
 ```

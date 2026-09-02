@@ -20,6 +20,7 @@ PDF_TOOLS = {
     "zotero_get_page_layout",
     "zotero_create_area_annotation",
 }
+DOCUMENT_ANNOTATION_TOOLS = {"zotero_create_annotation"}
 SEMANTIC_TOOLS = {
     "zotero_semantic_search",
     "zotero_get_semantic_context",
@@ -122,6 +123,11 @@ def tool_visible(name: str, profile: str | None = None) -> bool:
     if name in SEMANTIC_TOOLS and importlib.util.find_spec("chromadb") is None:
         return False
     if name in PDF_TOOLS and importlib.util.find_spec("fitz") is None:
+        return False
+    if name in DOCUMENT_ANNOTATION_TOOLS and not any(
+        importlib.util.find_spec(module) is not None
+        for module in ("fitz", "ebooklib")
+    ):
         return False
     if name in FEED_TOOLS and os.getenv("ZOTERO_LOCAL", "").lower() not in {
         "1",

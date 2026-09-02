@@ -6,19 +6,31 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import mimetypes
 import os
 import re
 import secrets
 import time
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 from zotero_mcp._atomic_io import atomic_write_json
+from zotero_mcp._file_lock import (
+    acquire_file_lock,
+    advisory_file_lock,
+    release_file_lock,
+)
 
 DEFAULT_MAX_UPLOAD_SIZE = 512 * 1024 * 1024
+DEFAULT_MAX_INLINE_SIZE = 1 * 1024 * 1024
+DEFAULT_MAX_RESOURCE_SIZE = 8 * 1024 * 1024
+HARD_MAX_INLINE_SIZE = 32 * 1024 * 1024
+HARD_MAX_RESOURCE_SIZE = 64 * 1024 * 1024
+DEFAULT_STATE_LOCK_TIMEOUT = 45.0
 DEFAULT_TOKEN_TTL = 3600
 
 
@@ -304,6 +316,33 @@ def max_upload_size() -> int:
     return max(1, value)
 
 
+def _bounded_size_setting(name: str, default: int, hard_max: int) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(1, min(value, hard_max))
+
+
+def max_inline_size() -> int:
+    """Maximum binary size encoded directly into a tool response."""
+    return _bounded_size_setting(
+        "ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES",
+        DEFAULT_MAX_INLINE_SIZE,
+        HARD_MAX_INLINE_SIZE,
+    )
+
+
+def max_resource_size() -> int:
+    """Maximum binary size returned through an in-memory MCP resource."""
+    return _bounded_size_setting(
+        "ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES",
+        DEFAULT_MAX_RESOURCE_SIZE,
+        HARD_MAX_RESOURCE_SIZE,
+    )
+
+
 def prepare_upload(
     filename: str,
     content_type: str,
@@ -399,10 +438,39 @@ def idempotency_record(key: str) -> dict[str, Any] | None:
         return None
 
 
+@contextmanager
+def idempotency_lock(key: str):
+    """Serialize one idempotency key across threads and server processes."""
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    path = _state_root() / "idempotency" / f"{digest}.lock"
+    raw_timeout = os.getenv("ZOTERO_MCP_ATTACHMENT_LOCK_TIMEOUT", "").strip()
+    try:
+        timeout = float(raw_timeout) if raw_timeout else DEFAULT_STATE_LOCK_TIMEOUT
+    except ValueError:
+        timeout = DEFAULT_STATE_LOCK_TIMEOUT
+    if not math.isfinite(timeout) or timeout <= 0:
+        timeout = DEFAULT_STATE_LOCK_TIMEOUT
+    deadline = time.monotonic() + timeout
+    lock_file = None
+    while lock_file is None:
+        lock_file = acquire_file_lock(path, exclusive=True, blocking=False)
+        if lock_file is not None:
+            break
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Attachment idempotency key remained busy for {timeout:.0f}s"
+            )
+        time.sleep(0.05)
+    try:
+        yield
+    finally:
+        release_file_lock(lock_file)
+
+
 def save_idempotency_record(key: str, value: dict[str, Any]) -> None:
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
     path = _state_root() / "idempotency" / f"{digest}.json"
-    path.parent.mkdir(parents=True, mode=0o700)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_write_json(path, value, indent=2)
     _private_file(path)
 
@@ -422,7 +490,7 @@ def prepare_operation(action: str, details: dict[str, Any], ttl: int = 900) -> d
         "used": False,
     }
     path = operation_path(operation_id)
-    path.parent.mkdir(parents=True, mode=0o700)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_write_json(path, record, indent=2)
     _private_file(path)
     confirmation_token = make_token(
@@ -441,23 +509,24 @@ def consume_operation(
     details: dict[str, Any],
 ) -> dict[str, Any]:
     path = operation_path(operation_id)
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("Unknown or expired attachment operation") from exc
-    token = verify_token(confirmation_token, "confirm")
-    digest = hashlib.sha256(
-        json.dumps(details, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    if record.get("used"):
-        raise ValueError("Attachment operation has already been used")
-    if int(record.get("expires_at", 0)) < int(time.time()):
-        raise ValueError("Attachment operation has expired")
-    if record.get("action") != action or record.get("digest") != digest:
-        raise ValueError("Attachment operation does not match the requested mutation")
-    if token.get("operation_id") != operation_id or token.get("digest") != digest:
-        raise ValueError("Confirmation token does not match the attachment operation")
-    record["used"] = True
-    atomic_write_json(path, record, indent=2)
-    _private_file(path)
-    return record
+    with advisory_file_lock(path.with_suffix(".lock"), exclusive=True):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("Unknown or expired attachment operation") from exc
+        token = verify_token(confirmation_token, "confirm")
+        digest = hashlib.sha256(
+            json.dumps(details, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if record.get("used"):
+            raise ValueError("Attachment operation has already been used")
+        if int(record.get("expires_at", 0)) < int(time.time()):
+            raise ValueError("Attachment operation has expired")
+        if record.get("action") != action or record.get("digest") != digest:
+            raise ValueError("Attachment operation does not match the requested mutation")
+        if token.get("operation_id") != operation_id or token.get("digest") != digest:
+            raise ValueError("Confirmation token does not match the attachment operation")
+        record["used"] = True
+        atomic_write_json(path, record, indent=2)
+        _private_file(path)
+        return record

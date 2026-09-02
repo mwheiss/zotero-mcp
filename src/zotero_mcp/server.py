@@ -78,6 +78,10 @@ from zotero_mcp.tools.connectors import (  # noqa: F401
     chatgpt_connector_search,
     connector_fetch,
 )
+from zotero_mcp.tools.discovery import (  # noqa: F401
+    find_related_papers,
+    library_coverage,
+)
 from zotero_mcp.tools.operational import (  # noqa: F401
     get_capabilities,
     get_search_database_health,
@@ -101,6 +105,11 @@ from zotero_mcp.tools.retrieval import (  # noqa: F401
     switch_library,
     validate_library_switch,
 )
+from zotero_mcp.tools.scite import (  # noqa: F401
+    check_retractions,
+    enrich_item,
+    enrich_search,
+)
 
 # -- Re-export tool functions (used by tests as server.func_name) -----------
 from zotero_mcp.tools.search import (  # noqa: F401
@@ -112,6 +121,10 @@ from zotero_mcp.tools.search import (  # noqa: F401
     search_items,
     semantic_search,
     update_search_database,
+)
+from zotero_mcp.tools.synthesis import (  # noqa: F401
+    export_bibliography,
+    synthesize_annotations,
 )
 from zotero_mcp.tools.write import (  # noqa: F401
     add_by_bibtex,

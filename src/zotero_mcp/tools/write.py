@@ -280,6 +280,7 @@ def batch_update_tags(
         # Initialize counters
         updated_count = 0
         skipped_count = 0
+        failed_keys: list[str] = []
         added_tag_counts = {tag: 0 for tag in (add_tags or [])}
         removed_tag_counts = {tag: 0 for tag in (remove_tags or [])}
 
@@ -296,6 +297,8 @@ def batch_update_tags(
 
             # Track if this item needs to be updated
             needs_update = False
+            added_for_item: list[str] = []
+            removed_for_item: list[str] = []
 
             # Process tags to remove
             if remove_tags:
@@ -303,7 +306,7 @@ def batch_update_tags(
                 for tag_obj in current_tags:
                     tag = tag_obj["tag"]
                     if tag in remove_tags:
-                        removed_tag_counts[tag] += 1
+                        removed_for_item.append(tag)
                         needs_update = True
                     else:
                         new_tags.append(tag_obj)
@@ -316,7 +319,7 @@ def batch_update_tags(
                 for tag in add_tags:
                     if tag and tag not in current_tag_values:
                         current_tags.append({"tag": tag})
-                        added_tag_counts[tag] += 1
+                        added_for_item.append(tag)
                         needs_update = True
 
             # Update the item if needed
@@ -334,7 +337,7 @@ def batch_update_tags(
                             result = write_zot.update_item(write_item)
                         except Exception as e:
                             context_error(ctx, f"Failed to fetch/update item {item_key}: {str(e)}")
-                            skipped_count += 1
+                            failed_keys.append(item_key)
                             continue
                     else:
                         item["data"]["tags"] = current_tags
@@ -343,13 +346,18 @@ def batch_update_tags(
 
                     if _helpers._handle_write_response(result, ctx):
                         updated_count += 1
+                        for changed_tag in added_for_item:
+                            added_tag_counts[changed_tag] += 1
+                        for changed_tag in removed_for_item:
+                            removed_tag_counts[changed_tag] += 1
                     else:
                         context_error(ctx, f"Update may have failed for item {item_key}: {result}")
-                        skipped_count += 1
+                        failed_keys.append(item_key)
                 except Exception as e:
-                    context_error(ctx, f"Failed to update item {item.get('key', 'unknown')}: {str(e)}")
+                    item_key = item.get("key", "unknown")
+                    context_error(ctx, f"Failed to update item {item_key}: {str(e)}")
                     # Continue with other items instead of failing completely
-                    skipped_count += 1
+                    failed_keys.append(item_key)
             else:
                 skipped_count += 1
 
@@ -359,6 +367,10 @@ def batch_update_tags(
         response.append(f"Items processed: {len(items)}")
         response.append(f"Items updated: {updated_count}")
         response.append(f"Items skipped: {skipped_count}")
+        response.append(f"Items failed: {len(failed_keys)}")
+        if failed_keys:
+            marker = "Failed" if len(failed_keys) == len(items) else "Partial failure"
+            response.append(f"{marker}: writes failed for {', '.join(failed_keys)}")
 
         if add_tags:
             response.append("\n## Tags Added")
@@ -516,16 +528,17 @@ def batch_update_extra(
 
         updated_count = 0
         skipped_count = 0
+        failed_keys: list[str] = []
 
         for item_key in item_keys:
             try:
                 item = zot.item(item_key)
             except Exception as e:
                 context_error(ctx, f"Failed to fetch item {item_key}: {str(e)}")
-                skipped_count += 1
+                failed_keys.append(item_key)
                 continue
             if not item:
-                skipped_count += 1
+                failed_keys.append(item_key)
                 continue
 
             if item["data"].get("itemType") in ("attachment", "note", "annotation"):
@@ -555,15 +568,23 @@ def batch_update_extra(
                     updated_count += 1
                 else:
                     context_error(ctx, f"Update may have failed for item {item_key}: {result}")
-                    skipped_count += 1
+                    failed_keys.append(item_key)
             except Exception as e:
                 context_error(ctx, f"Failed to update item {item_key}: {str(e)}")
-                skipped_count += 1
+                failed_keys.append(item_key)
 
         response = ["# Batch Extra Update Results", ""]
         response.append(f"Items processed: {len(item_keys)}")
         response.append(f"Items updated: {updated_count}")
         response.append(f"Items skipped: {skipped_count}")
+        response.append(f"Items failed: {len(failed_keys)}")
+        if failed_keys:
+            marker = (
+                "Failed"
+                if len(failed_keys) == len(item_keys)
+                else "Partial failure"
+            )
+            response.append(f"{marker}: writes failed for {', '.join(failed_keys)}")
 
         if set_keys:
             response.append("\n## Keys Set")
@@ -644,14 +665,16 @@ def create_collection(
         "8-character key. Items inside the collection are NOT deleted — they "
         "remain in the library (and in any other collections they belong to). "
         "Subcollections ARE deleted along with the parent. "
-        "This is a hard delete — Zotero's API does not trash collections, so "
-        "the operation cannot be undone via the API. Use "
+        "This is a destructive API deletion and Zotero MCP exposes no restore "
+        "operation, so treat it as irreversible. confirm=False returns a "
+        "preview; set confirm=True only after explicit user approval. Use "
         "zotero_search_collections to find the key first. "
         'Example: zotero_delete_collection(collection_key="KMMQDFQ4").'
     )
 )
 def delete_collection(
     collection_key: str,
+    confirm: bool = False,
     *,
     ctx: Context
 ) -> str:
@@ -669,6 +692,14 @@ def delete_collection(
             return f"Collection not found: `{collection_key}` ({e})"
 
         name = coll.get("data", {}).get("name", collection_key)
+        if not confirm:
+            return (
+                "# Collection Deletion Not Started\n\n"
+                f"Collection \"{name}\" (`{collection_key}`) would be permanently "
+                "deleted together with its subcollections. Items would remain in "
+                "the library. Call again with `confirm=True` only after explicit "
+                "user approval."
+            )
         resp = write_zot.delete_collection(coll)
         if _helpers._handle_write_response(resp, ctx):
             return f"Deleted collection \"{name}\" (`{collection_key}`)"
@@ -2343,10 +2374,12 @@ def merge_duplicates(
             keeper = write_zot.item(keeper_key)  # re-fetch for version
 
         # Step 4: Consolidate collections
+        collection_failures = []
         for coll_key in new_collections:
             resp = write_zot.addto_collection(coll_key, keeper)
             if not _helpers._handle_write_response(resp, ctx):
                 context_warning(ctx, f"Failed to add keeper to collection {coll_key}")
+                collection_failures.append(coll_key)
             keeper = write_zot.item(keeper_key)  # re-fetch for version
 
         # Step 5: Re-parent children (skip duplicate attachments)
@@ -2382,7 +2415,7 @@ def merge_duplicates(
 
         if failed:
             return (
-                f"Merge partially completed. Moved {len(moved)} children, "
+                f"Partial failure: merge moved {len(moved)} children, "
                 f"but {len(failed)} failed: {failed}\n\n"
                 "Duplicates were NOT trashed. Fix the failures and retry."
             )
@@ -2392,6 +2425,7 @@ def merge_duplicates(
         # destroys items. We send a direct PATCH with {"deleted": 1} which moves
         # items to Zotero's Trash — recoverable by the user.
         trashed = []
+        trash_failures = []
         for dup in duplicates:
             dup_key = dup["item"]["key"]
             try:
@@ -2412,18 +2446,35 @@ def merge_duplicates(
                     trashed.append(dup_key)
                 else:
                     context_warning(ctx, f"Failed to trash {dup_key}: HTTP {resp.status_code}")
+                    trash_failures.append(f"{dup_key} (HTTP {resp.status_code})")
             except Exception as e:
                 context_warning(ctx, f"Failed to trash {dup_key}: {e}")
+                trash_failures.append(f"{dup_key} ({e})")
 
         skip_info = f" ({len(skipped_dupes)} duplicate attachments skipped)" if skipped_dupes else ""
-        return (
-            f"Merge complete.\n\n"
+        result_lines = [
+            "Merge complete.",
+            "",
             f"- Tags merged: {len(new_tags)} new\n"
             f"- Collections added: {len(new_collections)} new\n"
             f"- Children re-parented: {len(moved)}{skip_info}\n"
-            f"- Duplicates trashed: {', '.join(f'`{k}`' for k in trashed)}\n\n"
-            "Trashed items can be restored from Zotero's Trash."
-        )
+            f"- Duplicates trashed: {', '.join(f'`{k}`' for k in trashed) or 'none'}",
+            "",
+            "Trashed items can be restored from Zotero's Trash.",
+        ]
+        partial_details = []
+        if collection_failures:
+            partial_details.append(
+                "keeper was not added to collection(s): "
+                + ", ".join(collection_failures)
+            )
+        if trash_failures:
+            partial_details.append(
+                "duplicate(s) were not trashed: " + ", ".join(trash_failures)
+            )
+        if partial_details:
+            result_lines[0] = "Partial failure: " + "; ".join(partial_details)
+        return "\n".join(result_lines)
 
     except ValueError as e:
         return f"Input error: {e}"
@@ -2481,8 +2532,7 @@ def get_pdf_outline(
 
         if not toc:
             return (
-                f"PDF attachment `{attachment_key}` ({title}) does not contain "
-                "a table of contents/outline."
+                f"No PDF outline found in attachment `{attachment_key}` ({title})."
             )
 
         lines = [
@@ -2505,8 +2555,9 @@ def get_pdf_outline(
 @mcp.tool(
     name="zotero_add_from_file",
     description=(
-        "Add an item to the active Zotero library from a LOCAL .pdf or "
-        ".epub file. Attempts to extract the DOI from the file content; "
+        "Add an item to the active Zotero library from a LOCAL PDF, EPUB, "
+        "DjVu, DOC/DOCX, ODT, or RTF file. PDF imports attempt to extract "
+        "a DOI from the file content; "
         "if found, enriches metadata via CrossRef (title, creators, "
         "journal, year, abstract). If no DOI is found, falls back to "
         "best-effort title/author guesses from the filename or document "
@@ -2558,6 +2609,7 @@ def add_from_file(
         if if_exists not in _IF_EXISTS_VALUES:
             return f"Error: if_exists must be one of {_IF_EXISTS_VALUES}."
         if_exists = _normalize_if_exists(if_exists)
+        missing: list[str] = []
         # Path validation — check symlink BEFORE resolving
         if os.path.islink(file_path):
             return "Error: Symlinks are not allowed for security reasons."
@@ -2616,16 +2668,23 @@ def add_from_file(
         # Create the metadata item. With if_exists='merge' and a known DOI,
         # add_by_doi reuses the existing item — the attachment below then
         # lands on it instead of on a fresh duplicate.
+        metadata_partial = False
         if extracted_doi:
             context_info(ctx, f"Found DOI: {extracted_doi}")
             result_msg = add_by_doi(doi=extracted_doi, collections=coll_keys,
                                     tags=tags, if_exists=if_exists, ctx=ctx)
+            metadata_partial = (
+                "Partial failure:" in result_msg or "FAILED" in result_msg
+            )
             # Extract item key from result
             key_match = re.search(r'Item key: `([^`]+)`', result_msg)
             if key_match:
                 parent_key = key_match.group(1)
             else:
-                return f"DOI lookup succeeded but couldn't extract item key.\n\n{result_msg}"
+                return (
+                    "Error: Could not obtain an item key after the DOI import.\n\n"
+                    + result_msg
+                )
         else:
             # Create a basic item
             template = write_zot.item_template(item_type)
@@ -2660,8 +2719,11 @@ def add_from_file(
             if item_reused:
                 try:
                     kids = write_zot.children(parent_key)
-                except Exception:
-                    kids = []
+                except Exception as exc:
+                    return (
+                        "Error: Could not verify existing attachments before a "
+                        f"retry-safe upload: {exc}"
+                    )
                 if any(
                     (k.get("data", {}) or {}).get("filename") == display_name
                     for k in kids
@@ -2677,6 +2739,8 @@ def add_from_file(
                 [(display_name, file_path)],
                 parentid=parent_key,
             )
+            if not _helpers._handle_write_response(attach_result, ctx):
+                raise RuntimeError(f"Zotero rejected the file attachment: {attach_result}")
             attach_info = (
                 f"File attached: {display_name}"
                 + _helpers._maybe_upload_to_webdav(
@@ -2689,13 +2753,23 @@ def add_from_file(
         except Exception as e:
             attach_info = f"Item created but file attachment failed: {e}"
 
-        return (
+        result = (
             f"Item key: `{parent_key}`\n"
             f"{'DOI: ' + extracted_doi + chr(10) if extracted_doi else ''}"
             f"{attach_info}\n\n"
             "_Note: To include this item in semantic search, run "
             "zotero_update_search_database._"
         )
+        partials = []
+        if metadata_partial:
+            partials.append("the DOI metadata import did not fully converge")
+        if missing:
+            partials.append(f"collection filing failed for {missing}")
+        if attach_info.startswith("Item created but file attachment failed:"):
+            partials.append(attach_info)
+        if partials:
+            result = "Partial failure: " + "; ".join(partials) + "\n\n" + result
+        return result
 
     except Exception as e:
         context_error(ctx, f"Error adding from file: {e}")
@@ -3283,6 +3357,15 @@ def _format_batch_result(header: str, results: list[dict]) -> str:
     ok_count = sum(1 for r in results if r["ok"])
     failed_count = len(results) - ok_count
     reused_count = sum(1 for r in results if r["ok"] and r.get("existed"))
+    partial_count = sum(
+        1
+        for r in results
+        if r["ok"]
+        and (
+            r.get("collections_failed")
+            or "Partial failure:" in str(r.get("pdf_status") or "")
+        )
+    )
     lines = [header, ""]
     if len(results) == 1:
         r = results[0]
@@ -3299,7 +3382,8 @@ def _format_batch_result(header: str, results: list[dict]) -> str:
                 lines.append(f"PDF: {r['pdf_status']}")
             if r.get("collections_failed"):
                 lines.append(
-                    f"WARNING: failed to file in {r['collections_failed']}"
+                    "Partial failure: item metadata was retained but collection "
+                    f"filing failed for {r['collections_failed']}"
                 )
         else:
             lines.append(f"Failed to add **{r['title']}**: {r['error']}")
@@ -3314,6 +3398,11 @@ def _format_batch_result(header: str, results: list[dict]) -> str:
             )
         elif failed_count:
             lines.append(f"Failed: {failed_count} item(s) were not created.")
+        if partial_count:
+            lines.append(
+                f"Partial failure: {partial_count} created/reused item(s) did not "
+                "fully satisfy attachment or collection requirements."
+            )
         lines.append("")
         for i, r in enumerate(results, 1):
             if r["ok"]:

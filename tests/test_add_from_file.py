@@ -245,6 +245,32 @@ class TestDoiFromMetadata:
 
         assert "10.5678/ml.2023.999" in doi_captured["doi"]
 
+    def test_reuse_does_not_attach_file_to_existing_item(
+        self, monkeypatch, dummy_ctx
+    ):
+        fake_zot = FakeZoteroForFile()
+        _patch_path_valid(monkeypatch)
+        _patch_hybrid_mode(monkeypatch, fake_zot)
+        _patch_fitz(
+            monkeypatch,
+            FakeFitzDocument(metadata={"subject": "10.1234/existing"}),
+        )
+        monkeypatch.setattr(
+            "zotero_mcp.tools.write.add_by_doi",
+            lambda **_kwargs: (
+                "Already in library: **Existing**\n\nItem key: `EXIST001`"
+            ),
+        )
+
+        result = server.add_from_file(
+            file_path="/Users/test/Documents/paper.pdf",
+            if_exists="reuse",
+            ctx=dummy_ctx,
+        )
+
+        assert "File NOT attached" in result
+        assert fake_zot.attachments == []
+
 
 # ---------------------------------------------------------------------------
 # DOI extraction from first page text

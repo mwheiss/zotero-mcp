@@ -385,6 +385,7 @@ class TestBatchChildrenEdgeCases:
 
         result = get_items_children(item_keys=["GOOD", "BAD"], ctx=dummy_ctx)
 
+        assert result.startswith("Partial failure:")
         assert "Paper GOOD" in result
         assert "Error fetching children" in result  # BAD key error
         assert "A note" in result  # GOOD key still processed

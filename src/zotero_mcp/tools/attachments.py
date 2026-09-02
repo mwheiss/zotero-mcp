@@ -137,8 +137,9 @@ def get_document_text(
     description=(
         "Get an exact attachment's binary-delivery descriptor. Returns metadata, "
         "an MCP resource URI, and a short-lived signed streaming download URL when "
-        "a public base URL is configured. inline=True embeds base64 only for files "
-        "at most 1 MiB. It never converts the binary to document text."
+        "a public base URL is configured. inline=True embeds base64 only within "
+        "the configured limit (1 MiB by default, adjustable up to 32 MiB). It "
+        "never converts the binary to document text."
     ),
 )
 def get_attachment(
@@ -180,8 +181,13 @@ def get_attachment(
                 )
                 if not downloaded.path:
                     raise ValueError("; ".join(downloaded.errors) or "binary unavailable")
-                if downloaded.path.stat().st_size > 1024 * 1024:
-                    raise ValueError("inline binary is limited to 1 MiB; use download_url")
+                inline_limit = service.max_inline_size()
+                if downloaded.path.stat().st_size > inline_limit:
+                    raise ValueError(
+                        f"inline binary is limited to {inline_limit} bytes; "
+                        "use download_url or raise "
+                        "ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES"
+                    )
                 result["data_base64"] = base64.b64encode(downloaded.path.read_bytes()).decode("ascii")
         return _json(result)
     except Exception as exc:
@@ -336,39 +342,40 @@ def put_attachment(
         else:
             if not idempotency_key:
                 raise ValueError("Creating an attachment requires idempotency_key")
-            prior = service.idempotency_record(idempotency_key)
-            request_identity = {
-                "library": current_library,
-                "parent_item_key": parent_item_key,
-                "sha256": manifest["sha256"],
-                "filename": manifest["filename"],
-            }
-            if prior:
-                if prior.get("request") != request_identity:
-                    raise ValueError("idempotency_key was already used for a different attachment")
-                prior_key = str(prior.get("attachment_key", ""))
-                refreshed = _attachment_item(write_zot, prior_key)
-                return _json(
-                    {
-                        "status": "already-created",
-                        "attachment": service.attachment_descriptor(refreshed),
-                        "sha256": manifest["sha256"],
-                    }
+            with service.idempotency_lock(idempotency_key):
+                prior = service.idempotency_record(idempotency_key)
+                request_identity = {
+                    "library": current_library,
+                    "parent_item_key": parent_item_key,
+                    "sha256": manifest["sha256"],
+                    "filename": manifest["filename"],
+                }
+                if prior:
+                    if prior.get("request") != request_identity:
+                        raise ValueError("idempotency_key was already used for a different attachment")
+                    prior_key = str(prior.get("attachment_key", ""))
+                    refreshed = _attachment_item(write_zot, prior_key)
+                    return _json(
+                        {
+                            "status": "already-created",
+                            "attachment": service.attachment_descriptor(refreshed),
+                            "sha256": manifest["sha256"],
+                        }
+                    )
+                parent = write_zot.item(parent_item_key)
+                if not parent or (parent.get("data", {}) or {}).get("itemType") == "attachment":
+                    raise ValueError("parent_item_key must identify a bibliographic item")
+                result = write_zot.attachment_both(
+                    [(title or manifest["filename"], str(path))],
+                    parentid=parent_item_key,
                 )
-            parent = write_zot.item(parent_item_key)
-            if not parent or (parent.get("data", {}) or {}).get("itemType") == "attachment":
-                raise ValueError("parent_item_key must identify a bibliographic item")
-            result = write_zot.attachment_both(
-                [(title or manifest["filename"], str(path))],
-                parentid=parent_item_key,
-            )
-            output_key = _created_attachment_key(result)
-            if not output_key:
-                raise RuntimeError(f"Zotero did not create the attachment: {result}")
-            service.save_idempotency_record(
-                idempotency_key,
-                {"request": request_identity, "attachment_key": output_key},
-            )
+                output_key = _created_attachment_key(result)
+                if not output_key:
+                    raise RuntimeError(f"Zotero did not create the attachment: {result}")
+                service.save_idempotency_record(
+                    idempotency_key,
+                    {"request": request_identity, "attachment_key": output_key},
+                )
             action = "created"
         refreshed = _attachment_item(write_zot, output_key)
         return _json(

@@ -193,3 +193,21 @@ def test_get_annotations_paginates_through_many_annotations(monkeypatch):
     assert "A00000" in result
     assert "A00099" in result
     assert "A00149" in result  # past first page
+
+
+def test_get_annotations_reports_api_failure_instead_of_empty(monkeypatch):
+    class BrokenZotero(FakeZoteroForAnnotations):
+        def children(self, *_args, **_kwargs):
+            raise TimeoutError("annotation backend down")
+
+    parents = {
+        "PAPER001": {"data": {"title": "A Paper", "itemType": "journalArticle"}},
+    }
+    fake = BrokenZotero(parents, {})
+    monkeypatch.setattr("zotero_mcp.client.get_zotero_client", lambda: fake)
+    monkeypatch.setenv("ZOTERO_LOCAL", "")
+
+    result = server.get_annotations(item_key="PAPER001", ctx=DummyContext())
+
+    assert result.startswith("Error: Annotation retrieval failed:")
+    assert "annotation backend down" in result

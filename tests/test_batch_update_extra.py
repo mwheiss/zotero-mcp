@@ -255,4 +255,21 @@ def test_batch_update_extra_continues_after_missing_item(monkeypatch):
 
     assert len(fake.updated) == 1
     assert "Items updated: 1" in result
-    assert "Items skipped: 1" in result
+    assert "Items failed: 1" in result
+    assert "Partial failure:" in result
+    assert "NOSUCHKEY" in result
+
+
+def test_batch_update_extra_reports_failed_write(monkeypatch):
+    fake = _setup(monkeypatch, _make_items())
+    fake.update_item = lambda _item: False
+
+    result = server.batch_update_extra(
+        item_keys=["ITEM0002"],
+        set_keys={"tex.otscore": "2"},
+        ctx=DummyContext(),
+    )
+
+    assert "Items updated: 0" in result
+    assert "Items failed: 1" in result
+    assert "Failed: writes failed for ITEM0002" in result

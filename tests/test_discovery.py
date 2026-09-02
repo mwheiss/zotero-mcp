@@ -230,6 +230,16 @@ def test_item_key_with_doi_resolves(monkeypatch):
     assert "Related Papers for: Source Paper" in out
 
 
+def test_openalex_outage_is_reported_as_error(monkeypatch):
+    _make_zot(monkeypatch)
+    _patch_requests(monkeypatch, lambda _url, _params: FakeResponse(503, {}))
+
+    out = discovery.find_related_papers("10.1234/x", ctx=DummyContext())
+
+    assert out.startswith("Error finding related papers:")
+    assert "HTTP 503" in out
+
+
 # --- library_coverage -----------------------------------------------------
 
 
@@ -270,7 +280,7 @@ def test_library_coverage_missing_and_present(monkeypatch):
     assert "Items scanned: 2" in out
     assert "With PDF: 1" in out
     assert "Missing PDF: 1" in out
-    assert "Coverage: 50.0%" in out
+    assert "Confirmed coverage: 50.0%" in out
     assert "No PDF" in out
     assert "10.1234/nopdf" in out
     # Item that has a PDF should not appear in the missing list.
@@ -288,7 +298,7 @@ def test_library_coverage_standalone_pdf_counts(monkeypatch):
     out = discovery.library_coverage(ctx=DummyContext())
     assert "Items scanned: 1" in out
     assert "With PDF: 1" in out
-    assert "Coverage: 100.0%" in out
+    assert "Confirmed coverage: 100.0%" in out
 
 
 def test_library_coverage_scoped_collection(monkeypatch):
@@ -305,7 +315,7 @@ def test_library_coverage_scoped_collection(monkeypatch):
     assert "Missing PDF: 1" in out
 
 
-def test_library_coverage_children_error_tolerated(monkeypatch):
+def test_library_coverage_children_error_is_unknown_not_missing(monkeypatch):
     zot = _make_coverage_zot(monkeypatch)
     zot._items = [
         {"key": "PAP3", "data": {"itemType": "journalArticle", "title": "Boom", "date": "2020"}},
@@ -316,6 +326,7 @@ def test_library_coverage_children_error_tolerated(monkeypatch):
 
     zot.children = boom
     out = discovery.library_coverage(ctx=DummyContext())
-    # Treated as missing, not an error.
-    assert "Missing PDF: 1" in out
+    assert "Partial failure:" in out
+    assert "Missing PDF: 0" in out
+    assert "Unknown PDF status: 1" in out
     assert "Boom" in out

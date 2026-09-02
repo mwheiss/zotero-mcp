@@ -12,6 +12,7 @@ resource holds the shared API lock while talking to Zotero.
 
 import tempfile
 
+from zotero_mcp import attachment_service as _attachments
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
@@ -108,8 +109,8 @@ def collection_items_resource(collection_key: str) -> str:
     name="Zotero attachment binary",
     description=(
         "Exact binary content for one Zotero attachment. Intended for MCP clients "
-        "that support binary resources; use zotero_get_attachment for a streaming "
-        "download URL when the file is large."
+        "that support binary resources. The in-memory limit is 8 MiB by default; "
+        "use zotero_get_attachment for a streaming download URL when the file is large."
     ),
     mime_type="application/octet-stream",
 )
@@ -130,4 +131,12 @@ def attachment_binary_resource(attachment_key: str) -> bytes:
         )
         if not result.path:
             raise ValueError("Attachment binary unavailable: " + "; ".join(result.errors))
+        size = result.path.stat().st_size
+        limit = _attachments.max_resource_size()
+        if size > limit:
+            raise ValueError(
+                f"Attachment is {size} bytes, above the {limit}-byte in-memory "
+                "MCP resource limit. Use zotero_get_attachment for a signed "
+                "streaming URL or raise ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES."
+            )
         return result.path.read_bytes()

@@ -6,8 +6,6 @@ the bibtex generator, and the connector fetch metadata dict. Reverification
 workflows could not determine whether users had populated place.
 """
 
-import json
-
 import pytest
 from conftest import DummyContext
 
@@ -149,7 +147,7 @@ class TestConnectorFetchMetadata:
         )
 
         result = _conn.connector_fetch(id="ABCD1234", ctx=DummyContext())
-        payload = json.loads(result)
+        payload = result.model_dump()
 
         assert payload["metadata"]["place"] == "Oxford"
         assert payload["metadata"]["publisher"] == "Oxford University Press"

@@ -370,6 +370,7 @@ def test_health_audit_refuses_snapshot_during_update(monkeypatch, tmp_path):
 
 def test_health_lock_is_created_and_blocks_first_updater(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("ZOTERO_MCP_UPDATE_LOCK_PATH", raising=False)
 
     lock_file, available = _REAL_ACQUIRE_SHARED_UPDATE_LOCK()
     try:

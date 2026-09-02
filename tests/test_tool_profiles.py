@@ -101,6 +101,28 @@ def test_all_profile_exposes_paths_only_with_explicit_local_opt_in(monkeypatch):
     assert "zotero_get_attachment_path" in _listed_tool_names()
 
 
+def test_annotation_authoring_requires_pdf_or_epub_dependency(monkeypatch):
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setattr(
+        "zotero_mcp.tool_profiles.importlib.util.find_spec",
+        lambda _name: None,
+    )
+
+    assert not tool_visible("zotero_create_annotation", "full")
+    assert not tool_visible("zotero_create_area_annotation", "full")
+
+
+def test_annotation_authoring_is_visible_with_epub_only(monkeypatch):
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setattr(
+        "zotero_mcp.tool_profiles.importlib.util.find_spec",
+        lambda name: object() if name == "ebooklib" else None,
+    )
+
+    assert tool_visible("zotero_create_annotation", "full")
+    assert not tool_visible("zotero_create_area_annotation", "full")
+
+
 def test_capabilities_reports_effective_contract(monkeypatch):
     monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "research")
     monkeypatch.setenv("ZOTERO_LOCAL", "true")

@@ -94,7 +94,11 @@ def synthesize_my_notes(scope: str) -> str:
     description="Stress-test a claim by finding supporting and contradicting papers.",
 )
 def find_contradicting_evidence(claim: str) -> str:
-    """Search the library for evidence for and against *claim*."""
+    """Search the library for evidence for and against *claim*.
+
+    Args:
+        claim: The concrete proposition to stress-test against library evidence.
+    """
     return "\n".join(
         [
             f"Stress-test this claim against my Zotero library: **{claim}**",

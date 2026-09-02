@@ -1,8 +1,12 @@
 """Connector links follow the effective request library."""
 
+import asyncio
 import json
 
+import pytest
+
 from zotero_mcp import client as zclient
+from zotero_mcp.server import mcp
 from zotero_mcp.tools import connectors
 
 
@@ -27,6 +31,10 @@ def test_item_urls_use_current_personal_and_group_library(monkeypatch):
     assert connectors._citation_url("ABCD1234") == (
         "zotero://select/library/items/ABCD1234"
     )
+    assert connectors._citation_url(
+        "ABCD1234",
+        {"library": {"type": "user", "id": 20765677}},
+    ) == "https://www.zotero.org/users/20765677/items/ABCD1234"
 
     zclient.set_active_library("5910265", "group")
     try:
@@ -51,7 +59,9 @@ def test_fetch_uses_runtime_library_in_citation_urls(monkeypatch):
 
     zclient.set_active_library("5910265", "group")
     try:
-        payload = json.loads(connectors.connector_fetch("ABCD1234", ctx=DummyContext()))
+        payload = connectors.connector_fetch(
+            "ABCD1234", ctx=DummyContext()
+        ).model_dump()
     finally:
         zclient.clear_active_library()
 
@@ -85,9 +95,9 @@ def test_search_uses_the_preferred_group_citation_url(monkeypatch):
 
     zclient.set_active_library("5910265", "group")
     try:
-        search_payload = json.loads(
-            connectors.chatgpt_connector_search("test", ctx=DummyContext())
-        )
+        search_payload = connectors.chatgpt_connector_search(
+            "test", ctx=DummyContext()
+        ).model_dump()
     finally:
         zclient.clear_active_library()
 
@@ -114,7 +124,9 @@ def test_search_omits_results_without_fetchable_item_keys(monkeypatch):
         lambda *_args, **_kwargs: FakeSearch(),
     )
 
-    payload = json.loads(connectors.chatgpt_connector_search("test", ctx=DummyContext()))
+    payload = connectors.chatgpt_connector_search(
+        "test", ctx=DummyContext()
+    ).model_dump()
 
     assert [result["id"] for result in payload["results"]] == ["ABCD1234"]
 
@@ -126,8 +138,37 @@ def test_fetch_rejects_malformed_item_key_before_zotero_access(monkeypatch):
         lambda: (_ for _ in ()).throw(AssertionError("Zotero must not be called")),
     )
 
-    payload = json.loads(connectors.connector_fetch("../INVALID", ctx=DummyContext()))
+    with pytest.raises(ValueError, match="invalid Zotero item key"):
+        connectors.connector_fetch("../INVALID", ctx=DummyContext())
 
-    assert payload["url"] == ""
-    assert payload["text"] == ""
-    assert payload["metadata"] == {"error": "invalid Zotero item key"}
+
+def test_connector_result_is_structured_and_mirrored_as_json_text():
+    payload = connectors.ConnectorFetchOutput(
+        id="ABCD1234",
+        title="Test",
+        text="Body",
+        url="https://example.test/item",
+        metadata={"source": "test"},
+    )
+    tools = asyncio.run(mcp.list_tools(run_middleware=False))
+    tool = next(value for value in tools if value.name == "fetch")
+
+    result = tool.convert_result(payload)
+
+    assert result.structured_content == payload.model_dump()
+    assert json.loads(result.content[0].text) == payload.model_dump()
+
+
+def test_connector_search_backend_failure_is_not_an_empty_success(monkeypatch):
+    from zotero_mcp import semantic_search
+
+    monkeypatch.setattr(
+        semantic_search,
+        "create_semantic_search",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("semantic backend down")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Connector search failed"):
+        connectors.chatgpt_connector_search("test", ctx=DummyContext())

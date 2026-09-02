@@ -14,6 +14,8 @@ Covers two API-contract bugs:
    was therefore missed, producing a false "all clear".
 """
 
+import pytest
+
 from zotero_mcp import scite_client
 from zotero_mcp.tools import scite as scite_tools
 
@@ -53,6 +55,17 @@ def test_get_papers_batch_posts_bare_doi_array(monkeypatch):
 
     assert captured["json"] == ["10.1162/tacl_a_00638"]
     assert result == {"10.1162/tacl_a_00638": {"title": "X"}}
+
+
+def test_get_papers_batch_raises_on_service_failure(monkeypatch):
+    monkeypatch.setattr(
+        scite_client.requests,
+        "post",
+        lambda *_args, **_kwargs: _FakeResp(503, {}),
+    )
+
+    with pytest.raises(scite_client.SciteAPIError, match="HTTP 503"):
+        scite_client.get_papers_batch(["10.1162/tacl_a_00638"])
 
 
 # ---------------------------------------------------------------------------
@@ -118,3 +131,31 @@ def test_check_retractions_flags_uppercase_doi(monkeypatch, dummy_ctx, fake_zot)
     assert "Editorial Notice Alerts" in result
     assert "Retraction" in result
     assert "All clear" not in result
+
+
+def test_enrich_search_surfaces_partial_scite_failure(
+    monkeypatch, dummy_ctx, fake_zot
+):
+    fake_zot._items = [
+        {"key": "ITEM0001", "data": {"DOI": UPPER_DOI, "title": "Paper"}}
+    ]
+    fake_zot.add_parameters = lambda **_kwargs: None
+    fake_zot.items = lambda **_kwargs: fake_zot._items
+    monkeypatch.setattr("zotero_mcp.client.get_zotero_client", lambda: fake_zot)
+    monkeypatch.setattr(
+        scite_tools._scite,
+        "get_tallies_batch",
+        lambda _dois: (_ for _ in ()).throw(
+            scite_client.SciteAPIError("tallies unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        scite_tools._scite,
+        "get_papers_batch",
+        lambda _dois: {},
+    )
+
+    result = scite_tools.enrich_search("Paper", ctx=dummy_ctx)
+
+    assert result.startswith("Partial failure: Scite enrichment was incomplete")
+    assert "Paper" in result

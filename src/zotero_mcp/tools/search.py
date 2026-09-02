@@ -92,6 +92,9 @@ def _search_with_variants(zot, query: str, qmode: str, limit: int,
 
     all_items: list[dict] = []
     seen_keys: set[str] = set()
+    attempted = 0
+    completed = 0
+    last_error: Exception | None = None
     for variant in variants:
         # Check cascade timeout before each API call
         if cascade_start is not None and cascade_timeout is not None:
@@ -105,9 +108,11 @@ def _search_with_variants(zot, query: str, qmode: str, limit: int,
         if tag:
             params["tag"] = tag
         zot.add_parameters(**params)
+        attempted += 1
         try:
             t0 = _time.monotonic()
             batch = zot.items()
+            completed += 1
             elapsed = _time.monotonic() - t0
             _search_logger.debug(f"[SEARCH] variant='{variant}' qmode={qmode}: {len(batch)} results in {elapsed:.2f}s")
             for item in batch:
@@ -116,9 +121,14 @@ def _search_with_variants(zot, query: str, qmode: str, limit: int,
                     seen_keys.add(key)
                     all_items.append(item)
         except Exception as e:
+            last_error = e
             _search_logger.debug(f"[SEARCH] variant='{variant}' failed: {e}")
             continue  # Skip failed variant, try next
 
+    if attempted and completed == 0 and last_error is not None:
+        raise RuntimeError(
+            f"All {attempted} Zotero search request(s) failed; last error: {last_error}"
+        ) from last_error
     return all_items
 
 
@@ -1445,6 +1455,7 @@ def get_search_database_status(*, ctx: Context) -> str:
                 load_update_config,
                 read_lock_holder,
                 should_update,
+                update_lock_path,
             )
         except ImportError:
             return (
@@ -1485,7 +1496,7 @@ def get_search_database_status(*, ctx: Context) -> str:
                 return library_state[name]
             return semantic_config.get(name) if uses_legacy_state else None
 
-        lock_path = config_path.parent / "update.lock"
+        lock_path = update_lock_path()
         lock_file = acquire_file_lock(
             lock_path,
             exclusive=False,

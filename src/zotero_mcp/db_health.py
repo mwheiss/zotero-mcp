@@ -13,6 +13,7 @@ from typing import Any
 
 from ._file_lock import acquire_file_lock, release_file_lock
 from .chroma_client import index_lifecycle_lock, scoped_collection_name
+from .semantic_search import update_lock_path
 
 
 @dataclass
@@ -79,7 +80,7 @@ def _read_only_connection(path: Path) -> sqlite3.Connection:
 
 def _acquire_shared_update_lock() -> tuple[Any, bool]:
     """Hold a shared flock so an update cannot mutate the audited snapshot."""
-    lock_path = Path.home() / ".config" / "zotero-mcp" / "update.lock"
+    lock_path = update_lock_path()
     lock_file = acquire_file_lock(
         lock_path,
         exclusive=False,

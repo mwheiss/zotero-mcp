@@ -65,7 +65,11 @@ def _format_editorial_notices(notices: list[dict]) -> list[str]:
     return lines
 
 
-def enrich_items(items: list[dict]) -> dict[str, dict[str, str]]:
+def enrich_items(
+    items: list[dict],
+    *,
+    errors: list[str] | None = None,
+) -> dict[str, dict[str, str]]:
     """Batch-enrich a list of Zotero items with Scite data.
 
     Returns ``{doi: extra_fields_dict}`` suitable for passing to
@@ -83,8 +87,21 @@ def enrich_items(items: list[dict]) -> dict[str, dict[str, str]]:
     dois = list(doi_map.keys())
     # Scite lowercases DOI keys in its responses; index by lowercase so
     # original-case DOIs (DOIs are case-insensitive) still match.
-    tallies = {k.lower(): v for k, v in _scite.get_tallies_batch(dois).items()}
-    papers = {k.lower(): v for k, v in _scite.get_papers_batch(dois).items()}
+    enrichment_errors: list[str] = []
+    try:
+        tallies = {k.lower(): v for k, v in _scite.get_tallies_batch(dois).items()}
+    except _scite.SciteAPIError as exc:
+        tallies = {}
+        enrichment_errors.append(str(exc))
+    try:
+        papers = {k.lower(): v for k, v in _scite.get_papers_batch(dois).items()}
+    except _scite.SciteAPIError as exc:
+        papers = {}
+        enrichment_errors.append(str(exc))
+    if errors is not None:
+        errors.extend(enrichment_errors)
+    elif enrichment_errors:
+        raise _scite.SciteAPIError("; ".join(enrichment_errors))
 
     result: dict[str, dict[str, str]] = {}
     for doi in dois:
@@ -128,9 +145,8 @@ def enrich_items(items: list[dict]) -> dict[str, dict[str, str]]:
         "item_key: 8-character Zotero item key; must have a DOI in "
         "metadata or the 'Extra' field to be resolvable. "
         "No Scite account or API key required — uses the free public "
-        "endpoints, so calls can fail transiently: expect 'Could not "
-        "reach Scite API — try again later' when Scite is slow or "
-        "unreachable (not a permanent error). "
+        "endpoints, so transient service failures are reported as tool errors "
+        "rather than as an empty Scite record. "
         "For batch enrichment across many items, use scite_enrich_search "
         "(search + enrich in one call); for a retraction scan across a "
         "collection/tag, use scite_check_retractions. "
@@ -163,11 +179,21 @@ def enrich_item(
         doi = _helpers._normalize_doi(doi) or doi
         context_info(ctx, f"Fetching Scite data for {doi}")
 
-        # Fetch tally + paper metadata in parallel-ish (same thread, two requests)
-        tally = _scite.get_tally(doi)
-        paper = _scite.get_paper(doi)
+        endpoint_errors: list[str] = []
+        try:
+            tally = _scite.get_tally(doi)
+        except _scite.SciteAPIError as exc:
+            tally = None
+            endpoint_errors.append(str(exc))
+        try:
+            paper = _scite.get_paper(doi)
+        except _scite.SciteAPIError as exc:
+            paper = None
+            endpoint_errors.append(str(exc))
 
         if tally is None and paper is None:
+            if endpoint_errors:
+                return "Error: Could not retrieve Scite data: " + "; ".join(endpoint_errors)
             return f"No Scite data found for DOI: {doi}"
 
         title = (paper or {}).get("title", doi)
@@ -203,7 +229,10 @@ def enrich_item(
             "[Scite MCP](https://scite.ai/mcp).*"
         )
 
-        return "\n".join(output)
+        result = "\n".join(output)
+        if endpoint_errors:
+            result = "Partial failure: " + "; ".join(endpoint_errors) + "\n\n" + result
+        return result
 
     except Exception as e:
         context_error(ctx, f"Error enriching item: {e}")
@@ -262,7 +291,8 @@ def enrich_search(
             return f"No items found matching query: '{query}'"
 
         # Batch-enrich with Scite
-        enrichment = enrich_items(results)
+        enrichment_errors: list[str] = []
+        enrichment = enrich_items(results, errors=enrichment_errors)
 
         output = [f"# Search Results for '{query}' (Scite-enriched)", ""]
 
@@ -281,7 +311,15 @@ def enrich_search(
             f"— powered by [scite.ai](https://scite.ai).*"
         )
 
-        return "\n".join(output)
+        result = "\n".join(output)
+        if enrichment_errors:
+            result = (
+                "Partial failure: Scite enrichment was incomplete: "
+                + "; ".join(enrichment_errors)
+                + "\n\n"
+                + result
+            )
+        return result
 
     except Exception as e:
         context_error(ctx, f"Error in enriched search: {e}")
@@ -306,9 +344,8 @@ def enrich_search(
         "limit: items to check per call — default 50, max 500. Items "
         "without a DOI are skipped silently (Scite needs DOIs). "
         "Scope: active library only. No Scite account or API key needed; "
-        "the public endpoints can fail transiently — on network errors "
-        "the tool returns 'Could not reach Scite API — try again later' "
-        "rather than partial results. "
+        "the public endpoints can fail transiently — network/service errors "
+        "are returned as errors rather than as a false all-clear result. "
         "For a single-paper check prefer scite_enrich_item (richer "
         "output, also includes notices). "
         "Example: scite_check_retractions(tag='to-cite', limit=100) or "
@@ -366,7 +403,7 @@ def check_retractions(
         papers = _scite.get_papers_batch(list(doi_items.keys()))
 
         if not papers:
-            return "Could not reach Scite API — try again later."
+            return f"No Scite data found for the {len(doi_items)} DOI(s) checked."
 
         # Scite lowercases DOI keys in its responses; index by lowercase so
         # original-case DOIs (DOIs are case-insensitive) still match.
