@@ -445,10 +445,12 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `ZOTERO_MCP_ATTACHMENT_STATE_DIR`: Private staging/token state directory (default: `~/.cache/zotero-mcp/attachments`)
 - `ZOTERO_MCP_ATTACHMENT_GC_SCAN_LIMIT` / `ZOTERO_MCP_ATTACHMENT_GC_DELETE_LIMIT`: Bound manifest checks and deletions per staged-upload cleanup pass (defaults: 128 checked / 32 deleted)
 - `ZOTERO_MCP_REMOTE_DOWNLOAD_MAX_BYTES`: Maximum remotely fetched PDF/WebDAV archive size (default: 512 MiB; hard cap: 2 GiB)
+- `ZOTERO_MCP_REMOTE_DOWNLOAD_DEADLINE_SECONDS`: Total wall-clock deadline for remote PDF/page/WebDAV retrieval (default: 300 seconds; hard cap: 3600)
 - `ZOTERO_WEBDAV_URL`: Optional WebDAV folder URL for direct attachment downloads in remote mode
 - `ZOTERO_WEBDAV_USERNAME`: Optional WebDAV username
 - `ZOTERO_WEBDAV_PASSWORD`: Optional WebDAV password
 - `ZOTERO_MCP_WEBDAV_MAX_DOWNLOAD_BYTES`: WebDAV compressed archive limit; defaults to `ZOTERO_MCP_REMOTE_DOWNLOAD_MAX_BYTES`
+- `ZOTERO_MCP_WEBDAV_DOWNLOAD_DEADLINE_SECONDS`: Optional WebDAV-specific total deadline; defaults to `ZOTERO_MCP_REMOTE_DOWNLOAD_DEADLINE_SECONDS`
 - `ZOTERO_MCP_WEBDAV_MAX_UNCOMPRESSED_BYTES`: Maximum aggregate extracted WebDAV archive size (default: 512 MiB; hard cap: 4 GiB)
 - `ZOTERO_MCP_WEBDAV_MAX_COMPRESSION_RATIO`: Maximum per-member archive compression ratio (default: 200; hard cap: 1000)
 - `ZOTERO_MCP_WEBDAV_MAX_ARCHIVE_MEMBERS`: Maximum archive members (default: 1024; hard cap: 4096)
@@ -466,6 +468,13 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `GEMINI_BASE_URL`: Custom Gemini endpoint URL (optional, for use with compatible APIs)
 - `OLLAMA_EMBEDDING_MODEL`: Ollama embedding model name (qwen3-embedding by default)
 - `OLLAMA_BASE_URL`: Ollama server URL (default: http://localhost:11434)
+
+In-process Hugging Face embeddings disable model-repository Python code by
+default. A model that genuinely requires custom code must opt in with
+`embedding_config.trust_remote_code=true` and pin
+`embedding_config.revision` to an exact 40-character commit hash. The deployed
+Qwen configuration uses the external OpenAI-compatible endpoint and does not
+load Hugging Face model code in this process.
 - `ZOTERO_DB_PATH`: Custom `zotero.sqlite` path (optional). When unset, the
   database is located automatically: a data directory configured in Zotero's
   preferences (read from the profile's `prefs.js`) is tried first, then the

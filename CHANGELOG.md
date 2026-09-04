@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-09-05
+
+### Changed
+- Hugging Face embedding models no longer execute repository code by default. Enabling `trust_remote_code` now also requires an exact 40-character commit revision.
+
+### Fixed
+- Remote PDF, arXiv, publisher-page, and WebDAV downloads now enforce a configurable total wall-clock deadline in addition to byte, redirect, connect, and read-inactivity limits.
+
 ## [1.4.3] - 2026-09-04
 
 ### Changed
