@@ -35,3 +35,13 @@ Rough implementation blueprint:
 Acceptance criteria: no duplicated business logic, generated documentation is
 current, read results agree with MCP, the skill is not loaded eagerly, and
 enabling the CLI route lets a local agent omit the full Zotero MCP surface.
+
+## Upload-GC queue or time-bucket index
+
+Status: permanently deferred. Current cleanup fairly rotates across the private
+staging directory, bounds manifest inspection and deletion per pass, consumes
+successful payloads, and expires abandoned uploads after one hour. Replacing
+the directory-name enumeration with a persistent queue, database, or time-bucket
+index would add another recovery-sensitive state contract for a scale this
+deployment does not approach. Reconsider only if staging grows to hundreds of
+thousands of directories despite the existing expiry and consumption rules.

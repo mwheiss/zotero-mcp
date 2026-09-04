@@ -432,9 +432,23 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
         self,
         model_name: str = "Qwen/Qwen3-Embedding-0.6B",
         query_instruction: str | None = None,
+        trust_remote_code: bool = False,
+        revision: str | None = None,
     ):
         self.model_name = model_name
         self.query_instruction = query_instruction
+        self.trust_remote_code = trust_remote_code is True or (
+            isinstance(trust_remote_code, str)
+            and trust_remote_code.strip().casefold() in {"1", "true", "yes"}
+        )
+        self.revision = revision.strip() if isinstance(revision, str) else None
+        if self.trust_remote_code and not (
+            self.revision and re.fullmatch(r"[0-9a-fA-F]{40}", self.revision)
+        ):
+            raise ValueError(
+                "Hugging Face trust_remote_code requires revision to be an "
+                "exact 40-character commit hash"
+            )
         if self.query_instruction is None and "qwen3" in model_name.casefold():
             self.query_instruction = DEFAULT_QWEN_QUERY_INSTRUCTION
 
@@ -442,7 +456,12 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
             from sentence_transformers import SentenceTransformer
 
             logger.info(f"Loading embedding model: {model_name}")
-            self.model = SentenceTransformer(model_name, trust_remote_code=True)
+            model_kwargs: dict[str, Any] = {
+                "trust_remote_code": self.trust_remote_code
+            }
+            if self.revision:
+                model_kwargs["revision"] = self.revision
+            self.model = SentenceTransformer(model_name, **model_kwargs)
         except ImportError:
             raise ImportError(
                 "sentence-transformers package is required for HuggingFace embeddings. Install with: pip install sentence-transformers"
@@ -456,12 +475,25 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
         return "huggingface"
 
     def get_config(self) -> dict[str, Any]:
-        return {"model_name": self.model_name}
+        return {
+            "model_name": self.model_name,
+            "query_instruction": self.query_instruction,
+            "trust_remote_code": self.trust_remote_code,
+            "revision": self.revision,
+        }
 
     @staticmethod
     def build_from_config(config: dict[str, Any]) -> "HuggingFaceEmbeddingFunction":
+        raw_trust = config.get("trust_remote_code", False)
+        trust_remote_code = raw_trust is True or (
+            isinstance(raw_trust, str)
+            and raw_trust.strip().casefold() in {"1", "true", "yes"}
+        )
         return HuggingFaceEmbeddingFunction(
             model_name=config.get("model_name", "Qwen/Qwen3-Embedding-0.6B"),
+            query_instruction=config.get("query_instruction"),
+            trust_remote_code=trust_remote_code,
+            revision=config.get("revision"),
         )
 
     def __call__(self, input: Documents) -> Embeddings:
@@ -833,6 +865,10 @@ class ChromaClient:
             return HuggingFaceEmbeddingFunction(
                 model_name=model_name,
                 query_instruction=query_instruction,
+                trust_remote_code=self.embedding_config.get(
+                    "trust_remote_code", False
+                ),
+                revision=self.embedding_config.get("revision"),
             )
 
         elif self.embedding_model == "embeddinggemma":
@@ -840,6 +876,10 @@ class ChromaClient:
             return HuggingFaceEmbeddingFunction(
                 model_name=model_name,
                 query_instruction=query_instruction,
+                trust_remote_code=self.embedding_config.get(
+                    "trust_remote_code", False
+                ),
+                revision=self.embedding_config.get("revision"),
             )
 
         elif self.embedding_model not in ["default", "openai", "gemini", "ollama"]:
@@ -847,6 +887,10 @@ class ChromaClient:
             return HuggingFaceEmbeddingFunction(
                 model_name=self.embedding_model,
                 query_instruction=query_instruction,
+                trust_remote_code=self.embedding_config.get(
+                    "trust_remote_code", False
+                ),
+                revision=self.embedding_config.get("revision"),
             )
 
         else:
