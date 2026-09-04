@@ -18,6 +18,7 @@ import pytest
 
 from zotero_mcp import better_bibtex_client
 from zotero_mcp.better_bibtex_client import (
+    BetterBibTexError,
     ZoteroBetterBibTexAPI,
     _inject_citekey,
 )
@@ -167,10 +168,11 @@ class TestExportBibtex:
         captured: list[dict] = []
         results = iter([{"result": {}}])  # no mapping for our key
         client = ZoteroBetterBibTexAPI()
-        with patch("requests.post", side_effect=_capture_post(captured, results)):
-            out = client.export_bibtex("UNKNOWN")
-        # Existing contract: the function prints the error and returns "".
-        assert out == ""
+        with (
+            patch("requests.post", side_effect=_capture_post(captured, results)),
+            pytest.raises(BetterBibTexError),
+        ):
+            client.export_bibtex("UNKNOWN")
         # And we did NOT proceed to item.export.
         assert len(captured) == 1
         assert captured[0]["method"] == "item.citationkey"

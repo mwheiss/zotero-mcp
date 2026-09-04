@@ -316,11 +316,10 @@ def _render_entries(rendered) -> list[str]:
         "association', 'chicago-note-bibliography', 'ieee'. Ignored for "
         "bibtex. "
         "export_format: 'bib' (formatted reference-list entries, default), "
-        "'citation' (in-text citation strings; requires Web API fallback when "
-        "the active transport is local), or 'bibtex' (raw BibTeX for .bib files). "
+        "'citation' (in-text citation strings), or 'bibtex' (raw BibTeX for .bib files). "
         "Output: markdown naming the style/format, then the rendered entries "
         "(a fenced block for bibtex, a numbered list otherwise). "
-        "Requires bibliography rendering support from the active Zotero API. "
+        "Works through Zotero's local or web API and is capped at 100 items. "
         "Example: zotero_export_bibliography(item_keys=['RTKZQI8E'], "
         "style='apa', export_format='bib')."
     ),
@@ -357,58 +356,52 @@ def export_bibliography(
         context_info(ctx, f"Exporting bibliography (format={export_format}, style={style})")
         zot = _client.get_zotero_client()
 
-        if not keys:
-            source_items = (
-                zot.collection_items(collection_key, limit=100)
-                if collection_key
-                else zot.items(limit=100)
-            )
-            keys = [
-                item.get("key", "")
-                for item in source_items
-                if item.get("key")
-                and item.get("data", {}).get("itemType")
-                not in {"attachment", "note", "annotation"}
-            ][:100]
-        else:
-            keys = keys[:100]
-        if not keys:
-            scope = (
-                f" for collection {collection_key}"
-                if collection_key
-                else " for the requested items"
-                if item_keys is not None
-                else ""
-            )
-            return f"No bibliography entries produced{scope}."
-
-        render_zot = zot
-        if export_format == "citation" and getattr(zot, "local", False):
-            render_zot = _client.get_web_zotero_client()
-            if render_zot is None:
-                return (
-                    "Error: Zotero's Local API does not support in-text citation "
-                    "rendering. Configure Web API credentials or request "
-                    "export_format='bib' instead."
-                )
-
-        content = "bibtex" if export_format == "bibtex" else export_format
-        api_parameter = "content" if export_format == "citation" else "format"
-
+        keys = keys[:100]
         try:
-            fetch_kwargs = {api_parameter: content}
-            if content != "bibtex":
-                fetch_kwargs["style"] = style
-            rendered = [
-                render_zot.item(item_key, **fetch_kwargs)
-                for item_key in keys
-            ]
+            if export_format == "bibtex":
+                if keys:
+                    rendered = zot.items(
+                        itemKey=",".join(keys), format="bibtex", limit=100
+                    )
+                elif collection_key:
+                    rendered = zot.collection_items(
+                        collection_key, format="bibtex", limit=100
+                    )
+                else:
+                    rendered = zot.top(format="bibtex", limit=100)
+            else:
+                include = "bib" if export_format == "bib" else "citation"
+                fetch_kwargs = {"include": include, "style": style}
+                if keys:
+                    rows = zot.items(
+                        itemKey=",".join(keys), limit=100, **fetch_kwargs
+                    )
+                    # Zotero's local endpoint can return unrelated rows for an
+                    # itemKey filter. Reapply it and preserve caller order.
+                    by_key = {
+                        row.get("key"): row
+                        for row in rows
+                        if isinstance(row, dict) and row.get("key")
+                    }
+                    rows = [by_key[key] for key in keys if key in by_key]
+                elif collection_key:
+                    rows = zot.collection_items(
+                        collection_key, limit=100, **fetch_kwargs
+                    )
+                else:
+                    rows = zot.top(limit=100, **fetch_kwargs)
+                rendered = [
+                    row.get(include)
+                    for row in rows
+                    if isinstance(row, dict) and row.get(include)
+                ]
         except Exception as api_error:
             context_error(ctx, f"Bibliography rendering failed: {api_error}")
             return (
                 f"Error rendering bibliography: {api_error}\n\n"
-                "The active Zotero API could not render this CSL output. "
-                "Check that Zotero is running and that the requested style is installed."
+                "The active Zotero API could not render this CSL output. In "
+                "local mode, check that Zotero is running; otherwise verify "
+                "web credentials and that the requested style is installed."
             )
 
         entries = _render_entries(rendered)

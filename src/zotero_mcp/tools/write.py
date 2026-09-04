@@ -9,6 +9,7 @@ import threading
 import time as _time
 import xml.etree.ElementTree as ET
 from typing import Annotated, Literal, NamedTuple
+from urllib.parse import urlparse
 
 import requests
 from pydantic import Field
@@ -30,21 +31,57 @@ _EMBEDDED_METADATA_MAX_BYTES = 512 * 1024
 _doi_batch_state = threading.local()
 
 
-def _split_batch_values(value, field: str) -> list[str]:
+def _looks_like_url(value: str) -> bool:
+    value = str(value or "").strip()
+    if not value or re.search(r"\s", value):
+        return False
+    parsed = urlparse(value if "://" in value else f"//{value}")
+    if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+        return False
+    host = parsed.hostname or ""
+    return bool(host and ("." in host or host == "localhost"))
+
+
+def _split_batch_values(value, field: str, validator) -> list[str]:
+    """Split newline/comma batches without corrupting a valid identifier.
+
+    Newlines are unambiguous separators. A comma-separated line is split only
+    when every token validates independently, or when the complete line is not
+    itself a valid identifier. This preserves commas inside URLs and DOI
+    suffixes while retaining partial-success behavior for malformed batches.
+    """
     if isinstance(value, list):
         values = [str(entry).strip() for entry in value]
     elif isinstance(value, str):
         raw = value.strip()
+        if raw[:1] in {"[", "{"}:
+            try:
+                decoded = json.loads(raw)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"{field} must be a string or list of strings") from exc
+            if not isinstance(decoded, list):
+                raise ValueError(f"{field} must be a string or list of strings")
+            values = [str(entry).strip() for entry in decoded]
+            return [entry for entry in values if entry]
         try:
             decoded = json.loads(raw)
         except (ValueError, TypeError):
             decoded = None
         if isinstance(decoded, list):
             values = [str(entry).strip() for entry in decoded]
-        elif "\n" in raw or "," in raw:
-            values = [entry.strip() for entry in re.split(r"[\n,]+", raw)]
         else:
-            values = [raw]
+            values = []
+            for line in raw.splitlines() or [raw]:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = [entry.strip() for entry in line.split(",") if entry.strip()]
+                if len(parts) > 1 and (
+                    all(validator(entry) for entry in parts) or not validator(line)
+                ):
+                    values.extend(parts)
+                else:
+                    values.append(line)
     else:
         raise ValueError(f"{field} must be a string or list of strings")
     return [entry for entry in values if entry]
@@ -567,6 +604,42 @@ def _duplicate_merge_plan_details(
             )
         },
     }
+
+
+_DUPLICATE_METADATA_EXCLUDED_FIELDS = {
+    "key",
+    "version",
+    "itemType",
+    "dateAdded",
+    "dateModified",
+    "collections",
+    "tags",
+    "relations",
+    "deleted",
+    "parentItem",
+}
+
+
+def _duplicate_metadata_fill(keeper: dict, duplicates: list[dict]) -> dict:
+    """Return empty keeper fields that can be filled without overwriting data."""
+    current = copy.deepcopy(keeper.get("data", {}) or {})
+    filled: dict[str, object] = {}
+    for entry in duplicates:
+        source = entry["item"].get("data", {}) or {}
+        for field, value in source.items():
+            if field in _DUPLICATE_METADATA_EXCLUDED_FIELDS:
+                continue
+            if field not in current:
+                # A field absent from the keeper's item-type schema must not be
+                # injected from a different Zotero item type.
+                continue
+            if current.get(field) not in (None, "", [], {}):
+                continue
+            if value in (None, "", [], {}):
+                continue
+            current[field] = copy.deepcopy(value)
+            filled[field] = copy.deepcopy(value)
+    return filled
 
 
 @mcp.tool(
@@ -1330,7 +1403,7 @@ def add_by_doi(
     ctx: Context
 ) -> str:
     try:
-        doi_values = _split_batch_values(doi, "doi")
+        doi_values = _split_batch_values(doi, "doi", _helpers._normalize_doi)
     except ValueError as exc:
         return f"Error: {exc}"
     if len(doi_values) > 1:
@@ -1644,7 +1717,7 @@ def add_by_url(
     ctx: Context
 ) -> str:
     try:
-        url_values = _split_batch_values(url, "url")
+        url_values = _split_batch_values(url, "url", _looks_like_url)
     except ValueError as exc:
         return f"Error: {exc}"
     if len(url_values) > 1:
@@ -2005,9 +2078,7 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
                 with tempfile.TemporaryDirectory() as tmpdir:
                     filename = f"arxiv_{arxiv_id.replace('/', '_')}.pdf"
                     filepath = os.path.join(tmpdir, filename)
-                    with open(filepath, "wb") as f:
-                        for chunk in pdf_resp.iter_content(chunk_size=8192):
-                            f.write(chunk)
+                    _helpers._stream_pdf_response(pdf_resp, filepath)
                     ok, detail, _ = _helpers._attach_and_verify(
                         write_zot,
                         filename,
@@ -2022,6 +2093,12 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
             except Exception as e:
                 context_info(ctx, f"arXiv PDF attachment failed (non-fatal): {e}")
                 pdf_status = f"no PDF attached ({e})"
+            finally:
+                if "pdf_resp" in locals():
+                    try:
+                        pdf_resp.close()
+                    except Exception:
+                        pass
 
         if attach_mode == "required" and not pdf_status.startswith("PDF attached"):
             pdf_status += (
@@ -2193,7 +2270,7 @@ def add_by_isbn(
     ctx: Context
 ) -> str:
     try:
-        isbn_values = _split_batch_values(isbn, "isbn")
+        isbn_values = _split_batch_values(isbn, "isbn", _helpers._normalize_isbn)
     except ValueError as exc:
         return f"Error: {exc}"
     if len(isbn_values) > 1:
@@ -2906,7 +2983,8 @@ def find_duplicates(
     name="zotero_merge_duplicates",
     description=(
         "Merge one or more duplicate items INTO a keeper: consolidates "
-        "tags, collections, notes, annotations, and all child items onto "
+        "bibliographic metadata gaps, tags, collections, notes, annotations, "
+        "and all child items onto "
         "the keeper, then moves the duplicates to Trash (recoverable "
         "from Zotero desktop's Trash view). "
         "SAFETY: dry-run by DEFAULT — prints what would happen without "
@@ -2981,34 +3059,7 @@ def merge_duplicates(
         all_tags.discard("")
         new_tags = all_tags - {t.get("tag", "") for t in keeper.get("data", {}).get("tags", [])}
         new_collections = all_collections - set(keeper.get("data", {}).get("collections", []))
-
-        # Build keeper's attachment signatures for deduplication
-        keeper_attachment_sigs = set()
-        for kc in keeper_children:
-            kd = kc.get("data", {})
-            if kd.get("itemType") == "attachment":
-                sig = (
-                    kd.get("contentType", ""),
-                    kd.get("filename", ""),
-                    kd.get("md5", ""),
-                    kd.get("url", ""),
-                )
-                keeper_attachment_sigs.add(sig)
-
-        # Count duplicate attachments that would be skipped
-        skipped_attachment_count = 0
-        for dup in duplicates:
-            for child in dup["children"]:
-                cd = child.get("data", {})
-                if cd.get("itemType") == "attachment":
-                    sig = (
-                        cd.get("contentType", ""),
-                        cd.get("filename", ""),
-                        cd.get("md5", ""),
-                        cd.get("url", ""),
-                    )
-                    if sig in keeper_attachment_sigs:
-                        skipped_attachment_count += 1
+        metadata_fill = _duplicate_metadata_fill(keeper, duplicates)
 
         plan_details = _duplicate_merge_plan_details(
             keeper, keeper_children, duplicates
@@ -3025,10 +3076,11 @@ def merge_duplicates(
                 f"**Keeper:** `{keeper_key}` — {keeper.get('data', {}).get('title', 'Untitled')}",
                 f"**Duplicates to merge:** {', '.join(f'`{k}`' for k in dup_keys)}",
                 "",
+                f"**Metadata gaps to fill:** {sorted(metadata_fill) if metadata_fill else 'none'}",
                 f"**Tags to add:** {sorted(new_tags) if new_tags else 'none'}",
                 f"**Collections to add:** {sorted(new_collections) if new_collections else 'none'}",
-                f"**Child items to re-parent:** {total_children_to_move - skipped_attachment_count}",
-                f"  ({skipped_attachment_count} duplicate attachment(s) will be skipped)" if skipped_attachment_count else "  (notes, PDFs, annotations, highlights, etc.)",
+                f"**Child items to re-parent:** {total_children_to_move}",
+                "  (all attachments are retained; uncertain duplicates are never discarded)",
                 "",
                 "Duplicates will be moved to **Trash** (recoverable in Zotero).",
                 "",
@@ -3059,15 +3111,20 @@ def merge_duplicates(
         # EXECUTE MERGE
         context_info(ctx, f"Merging {len(dup_keys)} duplicates into {keeper_key}")
 
-        # Step 3: Consolidate tags
-        if new_tags:
+        # Step 3: Fill keeper metadata gaps and consolidate tags in one
+        # version-checked update. Existing keeper values always win.
+        if metadata_fill or new_tags:
             keeper_data = keeper.get("data", {})
-            existing_tags = [t.get("tag", "") for t in keeper_data.get("tags", [])]
-            keeper_data["tags"] = [{"tag": t} for t in sorted(set(existing_tags) | all_tags)]
+            keeper_data.update(copy.deepcopy(metadata_fill))
+            if new_tags:
+                existing_tags = [t.get("tag", "") for t in keeper_data.get("tags", [])]
+                keeper_data["tags"] = [
+                    {"tag": t} for t in sorted(set(existing_tags) | all_tags)
+                ]
             _helpers._strip_unwritable_fields(keeper)
             resp = write_zot.update_item(keeper)
             if not _helpers._handle_write_response(resp, ctx):
-                return "Error: Failed to merge tags into keeper."
+                return "Error: Failed to merge metadata/tags into keeper."
             keeper = write_zot.item(keeper_key)  # re-fetch for version
 
         # Step 4: Consolidate collections
@@ -3079,27 +3136,24 @@ def merge_duplicates(
                 collection_failures.append(coll_key)
             keeper = write_zot.item(keeper_key)  # re-fetch for version
 
-        # Step 5: Re-parent children (skip duplicate attachments)
+        if collection_failures:
+            return (
+                "Partial failure: keeper metadata/tags were updated, but the "
+                "keeper was not added to collection(s): "
+                + ", ".join(collection_failures)
+                + ". Children were not moved and duplicates were NOT trashed."
+            )
+
+        # Step 5: Re-parent every child. File names and MIME types are not
+        # content identities, and skipping a same-named attachment can also
+        # strand its annotations under the soon-to-be-trashed parent.
         moved = []
         failed = []
-        skipped_dupes = []
         for dup in duplicates:
             for child in dup["children"]:
                 child_key = child.get("key", "?")
                 try:
                     fresh_child = write_zot.item(child_key)
-                    # Skip duplicate attachments — keeper already has this one
-                    child_data = fresh_child.get("data", {})
-                    if child_data.get("itemType") == "attachment":
-                        child_sig = (
-                            child_data.get("contentType", ""),
-                            child_data.get("filename", ""),
-                            child_data.get("md5", ""),
-                            child_data.get("url", ""),
-                        )
-                        if child_sig in keeper_attachment_sigs:
-                            skipped_dupes.append(child_key)
-                            continue  # Skip — keeper already has this attachment
                     fresh_child.get("data", {})["parentItem"] = keeper_key
                     _helpers._strip_unwritable_fields(fresh_child)
                     resp = write_zot.update_item(fresh_child)
@@ -3148,23 +3202,18 @@ def merge_duplicates(
                 context_warning(ctx, f"Failed to trash {dup_key}: {e}")
                 trash_failures.append(f"{dup_key} ({e})")
 
-        skip_info = f" ({len(skipped_dupes)} duplicate attachments skipped)" if skipped_dupes else ""
         result_lines = [
             "Merge complete.",
             "",
+            f"- Metadata gaps filled: {len(metadata_fill)}\n"
             f"- Tags merged: {len(new_tags)} new\n"
             f"- Collections added: {len(new_collections)} new\n"
-            f"- Children re-parented: {len(moved)}{skip_info}\n"
+            f"- Children re-parented: {len(moved)}\n"
             f"- Duplicates trashed: {', '.join(f'`{k}`' for k in trashed) or 'none'}",
             "",
             "Trashed items can be restored from Zotero's Trash.",
         ]
         partial_details = []
-        if collection_failures:
-            partial_details.append(
-                "keeper was not added to collection(s): "
-                + ", ".join(collection_failures)
-            )
         if trash_failures:
             partial_details.append(
                 "duplicate(s) were not trashed: " + ", ".join(trash_failures)

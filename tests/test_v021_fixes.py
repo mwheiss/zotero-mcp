@@ -205,8 +205,8 @@ class TestMergeAttachmentDedup:
         return write_zot
 
     @patch("zotero_mcp.tools.write._helpers._get_write_client")
-    def test_merge_skips_duplicate_pdf(self, mock_get_client, dummy_ctx):
-        """Identical attachment on keeper and duplicate is skipped."""
+    def test_merge_retains_duplicate_pdf(self, mock_get_client, dummy_ctx):
+        """Even byte-identical files are retained so annotations are not stranded."""
         keeper_att = {
             "key": "K_ATT",
             "version": 1,
@@ -241,14 +241,14 @@ class TestMergeAttachmentDedup:
             merge_duplicates, "KEEPER", ["DUP1"], dummy_ctx
         )
 
-        # The duplicate attachment should NOT have been re-parented
-        # update_item should not be called for the dup attachment
+        # The attachment is re-parented. Its child annotations (not visible in
+        # this direct-child fixture) therefore remain reachable after merge.
         reparent_calls = [
             c for c in write_zot.update_item.call_args_list
             if c[0][0].get("key") == "D_ATT"
         ]
-        assert len(reparent_calls) == 0
-        assert "D_ATT" not in result or "skipped" in result.lower() or "Merged" in result
+        assert len(reparent_calls) == 1
+        assert "Children re-parented: 1" in result
 
     @patch("zotero_mcp.tools.write._helpers._get_write_client")
     def test_merge_keeps_different_pdf(self, mock_get_client, dummy_ctx):
@@ -295,8 +295,8 @@ class TestMergeAttachmentDedup:
         assert len(reparent_calls) == 1
 
     @patch("zotero_mcp.tools.write._helpers._get_write_client")
-    def test_merge_dry_run_shows_skipped_count(self, mock_get_client, dummy_ctx):
-        """Dry run mentions skipped duplicate attachments."""
+    def test_merge_dry_run_promises_to_retain_attachments(self, mock_get_client, dummy_ctx):
+        """Dry run makes the no-data-loss attachment policy explicit."""
         keeper_att = {
             "key": "K_ATT",
             "version": 1,
@@ -329,8 +329,8 @@ class TestMergeAttachmentDedup:
 
         result = merge_duplicates("KEEPER", ["DUP1"], confirm=False, ctx=dummy_ctx)
 
-        assert "duplicate attachment" in result.lower()
-        assert "skipped" in result.lower() or "1" in result
+        assert "all attachments are retained" in result.lower()
+        assert "child items to re-parent:** 1" in result.lower()
 
 
 # -------------------------------------------------------------------------

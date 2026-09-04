@@ -146,7 +146,7 @@ def test_synthesize_annotations_keeps_same_title_papers_separate(monkeypatch):
 
 
 class _BibZotero(FakeZotero):
-    """FakeZotero honoring format/content kwargs for CSL/BibTeX rendering."""
+    """Fake Zotero honoring local/web JSON bibliography rendering."""
 
     def __init__(self):
         super().__init__()
@@ -161,34 +161,36 @@ class _BibZotero(FakeZotero):
             }
         ]
 
-    def _render(self, content, style):
-        if content == "bibtex":
-            return "@article{smith2020, title={Title}, author={Smith, J.}}"
-        # bib / citation -> list of HTML snippets
-        if content == "citation":
-            return ['<span class="citation">(Smith, 2020)</span>']
-        return ['<div class="csl-entry">Smith, J. (2020). Title. Journal.</div>']
+    def _render(self, kwargs):
+        if kwargs.get("content"):
+            raise AssertionError("content= requests Atom and is not local-compatible")
+        if kwargs.get("format") == "bibtex":
+            return b"@article{smith2020, title={Title}, author={Smith, J.}}"
+        if kwargs.get("include") == "citation":
+            return [{"key": "ABCD1234", "citation": '<span class="citation">(Smith, 2020)</span>'}]
+        if kwargs.get("include") == "bib":
+            return [{"key": "ABCD1234", "bib": '<div class="csl-entry">Smith, J. (2020). Title. Journal.</div>'}]
+        return None
 
     def items(self, **kwargs):
         self.last_kwargs = kwargs
-        content = kwargs.get("content") or kwargs.get("format")
-        if content:
-            return self._render(content, kwargs.get("style"))
-        return self._items
+        rendered = self._render(kwargs)
+        return self._items if rendered is None else rendered
 
     def item(self, item_key, **kwargs):
         self.last_kwargs = kwargs
-        content = kwargs.get("content") or kwargs.get("format")
-        if content:
-            return self._render(content, kwargs.get("style"))
-        return super().item(item_key)
+        rendered = self._render(kwargs)
+        return super().item(item_key) if rendered is None else rendered
+
+    def top(self, **kwargs):
+        self.last_kwargs = kwargs
+        rendered = self._render(kwargs)
+        return self._items if rendered is None else rendered
 
     def collection_items(self, key, **kwargs):
         self.last_kwargs = kwargs
-        content = kwargs.get("content") or kwargs.get("format")
-        if content:
-            return self._render(content, kwargs.get("style"))
-        return super().collection_items(key, **kwargs)
+        rendered = self._render(kwargs)
+        return super().collection_items(key, **kwargs) if rendered is None else rendered
 
 
 def test_render_entries_decodes_and_splits_local_bibliography_bytes():
@@ -217,7 +219,7 @@ def test_export_bibliography_bib_strips_html(monkeypatch):
     assert "Bibliography" in out
     # style passed through to the API.
     assert fake.last_kwargs.get("style") == "apa"
-    assert fake.last_kwargs.get("format") == "bib"
+    assert fake.last_kwargs.get("include") == "bib"
 
 
 def test_export_bibliography_style_passthrough(monkeypatch):
@@ -232,12 +234,12 @@ def test_export_bibliography_style_passthrough(monkeypatch):
     )
 
     assert fake.last_kwargs.get("style") == "ieee"
-    assert fake.last_kwargs.get("content") == "citation"
+    assert fake.last_kwargs.get("include") == "citation"
     assert "(Smith, 2020)" in out
     assert "ieee" in out
 
 
-def test_local_in_text_citation_requires_cloud_fallback(monkeypatch):
+def test_local_in_text_citation_needs_no_cloud_fallback(monkeypatch):
     fake = _BibZotero()
     fake.local = True
     monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
@@ -249,7 +251,8 @@ def test_local_in_text_citation_requires_cloud_fallback(monkeypatch):
         ctx=DummyContext(),
     )
 
-    assert "Local API does not support in-text citation" in out
+    assert "(Smith, 2020)" in out
+    assert "ZOTERO_API_KEY" not in out
 
 
 def test_export_bibliography_bibtex_fenced(monkeypatch):
@@ -279,7 +282,7 @@ def test_export_bibliography_collection(monkeypatch):
         ctx=DummyContext(),
     )
     assert "Smith, J. (2020). Title. Journal." in out
-    assert fake.last_kwargs.get("format") == "bib"
+    assert fake.last_kwargs.get("include") == "bib"
 
 
 def test_export_bibliography_api_error(monkeypatch):

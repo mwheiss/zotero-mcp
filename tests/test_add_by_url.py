@@ -710,7 +710,14 @@ class TestArxivAttachMode:
         fake_zot.attachment_both = MagicMock()
 
         mock_resp = _make_arxiv_response(ARXIV_ATOM_XML)
-        with patch("zotero_mcp.tools.write.requests.get", return_value=mock_resp), \
+        pdf_resp = MagicMock()
+        pdf_resp.headers = {"Content-Type": "application/pdf"}
+        pdf_resp.iter_content.return_value = [b"%PDF-1.7\n", b"x" * 1200]
+        pdf_resp.raise_for_status = MagicMock()
+        with patch(
+            "zotero_mcp.tools.write.requests.get",
+            side_effect=[mock_resp, pdf_resp],
+        ), \
              patch(
                  "zotero_mcp.tools._helpers._attach_pdf_linked_url",
              ) as mock_linked:

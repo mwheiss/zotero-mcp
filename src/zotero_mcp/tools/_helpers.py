@@ -1,6 +1,7 @@
 """Shared private helpers used across tool modules."""
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from pyzotero.zotero_errors import PreConditionFailedError
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._context import context_error, context_info, context_warning
+from zotero_mcp._file_lock import advisory_file_lock
 
 # ---------------------------------------------------------------------------
 # Config file
@@ -253,6 +255,22 @@ _identifier_locks: dict[str, list] = {}
 _identifier_locks_guard = threading.Lock()
 
 
+def _identifier_lock_path(key: str) -> Path:
+    """Return a stable cross-process lock path for one library identifier."""
+    configured = os.getenv("ZOTERO_MCP_IDENTIFIER_LOCK_DIR", "").strip()
+    if configured:
+        root = Path(configured).expanduser()
+    else:
+        api_lock = os.getenv("ZOTERO_MCP_API_LOCK_PATH", "").strip()
+        root = (
+            Path(api_lock).expanduser().parent / "identifier-locks"
+            if api_lock
+            else Path.home() / ".config" / "zotero-mcp" / "identifier-locks"
+        )
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return root / f"{digest}.lock"
+
+
 def identifier_lock_key(kind: str, raw) -> str | None:
     """Return the canonical in-process lock key for an identifier."""
     if raw is None:
@@ -272,25 +290,33 @@ def identifier_lock_key(kind: str, raw) -> str | None:
 
 @contextlib.contextmanager
 def identifier_lock(kind: str, raw):
-    """Serialize one identifier's check-then-create sequence in-process."""
+    """Serialize one identifier's check-then-create sequence across processes."""
     key = identifier_lock_key(kind, raw)
     if key is None:
         yield None
         return
+    library = _client.get_current_library()
+    scoped_key = (
+        f"{library.get('library_type', 'user')}:"
+        f"{library.get('library_id', '')}:{key}"
+    )
     with _identifier_locks_guard:
-        entry = _identifier_locks.get(key)
+        entry = _identifier_locks.get(scoped_key)
         if entry is None:
-            entry = _identifier_locks[key] = [threading.RLock(), 0]
+            entry = _identifier_locks[scoped_key] = [threading.RLock(), 0]
         entry[1] += 1
     entry[0].acquire()
     try:
-        yield key
+        with advisory_file_lock(
+            _identifier_lock_path(scoped_key), exclusive=True
+        ):
+            yield key
     finally:
         entry[0].release()
         with _identifier_locks_guard:
             entry[1] -= 1
-            if entry[1] == 0 and _identifier_locks.get(key) is entry:
-                del _identifier_locks[key]
+            if entry[1] == 0 and _identifier_locks.get(scoped_key) is entry:
+                del _identifier_locks[scoped_key]
 
 
 def ensure_collection_membership(write_zot, item_key: str, coll_keys: list[str], ctx=None) -> list[str]:
@@ -763,6 +789,20 @@ def _collection_not_found_message(zot, spec, paths) -> str:
     return msg
 
 
+_DOI_TRAILING_PUNCTUATION = ".,);]"
+_DOI_CLOSERS = {")": "(", "]": "["}
+
+
+def _strip_doi_trailing_punctuation(value: str) -> str:
+    """Drop prose punctuation while keeping balanced DOI suffix brackets."""
+    while value and value[-1] in _DOI_TRAILING_PUNCTUATION:
+        opener = _DOI_CLOSERS.get(value[-1])
+        if opener is not None and value.count(opener) >= value.count(value[-1]):
+            break
+        value = value[:-1]
+    return value
+
+
 def _normalize_doi(raw):
     """Normalize a DOI string from various input formats."""
     if not raw:
@@ -775,7 +815,7 @@ def _normalize_doi(raw):
         if not m:
             return None
         s = m.group(1)
-    s = s.rstrip(".,);]")
+    s = _strip_doi_trailing_punctuation(s)
     if re.match(r"^10\.\d{4,9}/\S+$", s):
         return s
     return None
@@ -867,6 +907,52 @@ def _normalize_arxiv_id(raw):
 
 _MAX_PDF_REDIRECTS = 5
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_DEFAULT_REMOTE_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024
+_HARD_REMOTE_DOWNLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _remote_download_max_bytes() -> int:
+    raw = os.getenv("ZOTERO_MCP_REMOTE_DOWNLOAD_MAX_BYTES", "").strip()
+    try:
+        value = int(raw) if raw else _DEFAULT_REMOTE_DOWNLOAD_MAX_BYTES
+    except ValueError:
+        value = _DEFAULT_REMOTE_DOWNLOAD_MAX_BYTES
+    return max(1, min(value, _HARD_REMOTE_DOWNLOAD_MAX_BYTES))
+
+
+def _stream_pdf_response(response, destination: str | Path) -> int:
+    """Write a remotely fetched PDF with a hard byte bound and magic check."""
+    maximum = _remote_download_max_bytes()
+    raw_length = response.headers.get("Content-Length")
+    if raw_length:
+        try:
+            content_length = int(raw_length)
+        except (TypeError, ValueError):
+            content_length = None
+        if content_length is not None and content_length > maximum:
+            raise ValueError(
+                f"Remote PDF exceeds the {maximum}-byte download limit"
+            )
+    written = 0
+    path = Path(destination)
+    try:
+        with path.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > maximum:
+                    raise ValueError(
+                        f"Remote PDF exceeds the {maximum}-byte download limit"
+                    )
+                handle.write(chunk)
+        with path.open("rb") as handle:
+            if b"%PDF-" not in handle.read(1024):
+                raise ValueError("Remote response is not a recognizable PDF")
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return written
 
 
 def _url_resolves_to_public_host(url: str) -> bool:
@@ -962,9 +1048,7 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
         with tempfile.TemporaryDirectory() as tmpdir:
             filename = f"{doi.replace('/', '_')}.pdf"
             filepath = os.path.join(tmpdir, filename)
-            with open(filepath, "wb") as f:
-                for chunk in pdf_resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
+            _stream_pdf_response(pdf_resp, filepath)
 
             if os.path.getsize(filepath) < 1000:
                 context_info(ctx, "Downloaded file too small, likely not a real PDF")
@@ -985,6 +1069,12 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
     except Exception as e:
         context_info(ctx, f"PDF download/attach failed: {e}")
         return None
+    finally:
+        if "pdf_resp" in locals() and pdf_resp is not None:
+            try:
+                pdf_resp.close()
+            except Exception:
+                pass
 
 
 def _maybe_upload_to_webdav(attach_result, file_path, ctx, write_zot=None):

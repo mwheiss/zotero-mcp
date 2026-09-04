@@ -381,6 +381,82 @@ class TestMergeDuplicatesConfirm:
         for child_update in reparented:
             assert child_update["data"]["parentItem"] == "KEEP"
 
+    def test_metadata_gaps_are_filled_without_overwriting_keeper(self, monkeypatch, dummy_ctx):
+        fake = FakeZoteroForDuplicates()
+        keeper = _make_item("KEEP", "Keeper", doi="10.1/keeper")
+        keeper["data"].update(abstractNote="", publicationTitle="")
+        duplicate = _make_item("DUP1", "Duplicate", doi="10.1/duplicate")
+        duplicate["data"].update(
+            abstractNote="Preserved abstract",
+            publicationTitle="Journal of Safety",
+        )
+        fake._items = [keeper, duplicate]
+        fake._children = {"KEEP": [], "DUP1": []}
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client", lambda ctx: (fake, fake)
+        )
+
+        result = _execute_merge(
+            keeper_key="KEEP", duplicate_keys=["DUP1"], ctx=dummy_ctx
+        )
+
+        assert result.startswith("Merge complete")
+        assert keeper["data"]["abstractNote"] == "Preserved abstract"
+        assert keeper["data"]["publicationTitle"] == "Journal of Safety"
+        assert keeper["data"]["DOI"] == "10.1/keeper"
+
+    def test_same_named_unhashed_attachments_are_both_retained(
+        self, monkeypatch, dummy_ctx
+    ):
+        fake = FakeZoteroForDuplicates()
+        keeper_attachment = {
+            "key": "ATTKEEP1",
+            "version": 3,
+            "data": {
+                "itemType": "attachment",
+                "parentItem": "KEEP",
+                "contentType": "application/pdf",
+                "filename": "paper.pdf",
+                "md5": "",
+                "url": "",
+            },
+        }
+        duplicate_attachment = {
+            "key": "ATTDUP01",
+            "version": 4,
+            "data": {
+                "itemType": "attachment",
+                "parentItem": "DUP1",
+                "contentType": "application/pdf",
+                "filename": "paper.pdf",
+                "md5": "",
+                "url": "",
+            },
+        }
+        fake._items = [
+            _make_item("KEEP", "Keeper"),
+            _make_item("DUP1", "Duplicate"),
+            keeper_attachment,
+            duplicate_attachment,
+        ]
+        fake._children = {
+            "KEEP": [keeper_attachment],
+            "DUP1": [duplicate_attachment],
+        }
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client", lambda ctx: (fake, fake)
+        )
+
+        result = _execute_merge(
+            keeper_key="KEEP", duplicate_keys=["DUP1"], ctx=dummy_ctx
+        )
+
+        assert result.startswith("Merge complete")
+        assert duplicate_attachment["data"]["parentItem"] == "KEEP"
+        assert any(
+            update.get("key") == "ATTDUP01" for update in fake.update_calls
+        )
+
     def test_duplicates_trashed_not_deleted(self, monkeypatch, dummy_ctx):
         """Duplicates are trashed via direct PATCH (deleted:1), NOT permanently deleted."""
         fake = self._setup_merge(monkeypatch)
@@ -538,6 +614,8 @@ class TestMergeDuplicatesConfirm:
 
         assert result.startswith("Partial failure:")
         assert "not added to collection" in result
+        assert "NOT trashed" in result
+        assert fake.client.patch_calls == []
 
     def test_version_refetch_after_operations(self, monkeypatch, dummy_ctx):
         """Keeper is re-fetched after tag update and collection adds for fresh version."""

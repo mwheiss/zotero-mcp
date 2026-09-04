@@ -4,11 +4,13 @@ import json
 import os
 import tempfile
 import uuid
+from typing import Literal
 
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context, context_error, context_info, context_warning
+from zotero_mcp.better_bibtex_client import get_color_category
 from zotero_mcp.tools import _helpers
 
 _WEB_API_ENV_VARS = (
@@ -16,6 +18,98 @@ _WEB_API_ENV_VARS = (
     "- ZOTERO_LIBRARY_ID: Your library ID\n"
     "- ZOTERO_LIBRARY_TYPE: 'user' or 'group'"
 )
+
+
+def _normalized_annotation_tags(tags) -> list[str]:
+    """Return stable tag strings from Zotero, BBT, or PDF extractor shapes."""
+    if not tags:
+        return []
+    if isinstance(tags, (str, dict)):
+        tags = [tags]
+    if not isinstance(tags, (list, tuple, set)):
+        return []
+
+    normalized: list[str] = []
+    for entry in tags:
+        value = entry.get("tag") if isinstance(entry, dict) else entry
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if value and value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def _page_index(data: dict) -> int | None:
+    """Return an annotation's zero-based page index for every source."""
+    pdf_page = data.get("_pdf_page")
+    if pdf_page is not None:
+        try:
+            return max(int(pdf_page) - 1, 0)
+        except (TypeError, ValueError):
+            return None
+
+    position = data.get("annotationPosition")
+    if isinstance(position, str):
+        try:
+            position = json.loads(position)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if isinstance(position, dict):
+        index = position.get("pageIndex")
+        return index if isinstance(index, int) and not isinstance(index, bool) else None
+    return None
+
+
+def _annotation_to_record(
+    annotation: dict,
+    parent_context: dict[str, str | None] | None = None,
+) -> dict:
+    """Normalize a Zotero, Better BibTeX, or PDF annotation into one record."""
+    data = annotation.get("data", {})
+    context = parent_context or {}
+
+    page_index = _page_index(data)
+    page = data.get("_pageLabel") or data.get("annotationPageLabel") or None
+    if page is None and page_index is not None:
+        page = str(page_index + 1)
+    elif page is not None:
+        page = str(page)
+
+    color = data.get("annotationColor") or ""
+    color_category = data.get("_color_category")
+    if not color_category and isinstance(color, str):
+        color_category = get_color_category(color)
+
+    if data.get("_from_better_bibtex"):
+        source = "better_bibtex"
+    elif data.get("_from_pdf_extraction"):
+        source = "pdf_extraction"
+    else:
+        source = "zotero"
+
+    return {
+        "annotation_key": annotation.get("key") or None,
+        "item_key": context.get("item_key"),
+        "attachment_key": context.get("attachment_key"),
+        "parent_title": context.get("parent_title"),
+        "attachment_title": (
+            context.get("attachment_title")
+            or data.get("_attachment_title")
+            or None
+        ),
+        "type": data.get("annotationType") or None,
+        "page": page,
+        "page_index": page_index,
+        "text": data.get("annotationText") or "",
+        "comment": data.get("annotationComment") or "",
+        "color": color or None,
+        "color_category": color_category or None,
+        "tags": _normalized_annotation_tags(data.get("tags")),
+        "created": data.get("dateAdded") or None,
+        "modified": data.get("dateModified") or None,
+        "source": source,
+    }
 
 
 def _download_attachment_for_processing(
@@ -77,8 +171,11 @@ def _get_note_write_client(op_description: str):
         "use_pdf_extraction=True falls back to direct PDF parsing when the "
         "Zotero API has no stored annotation record — useful for "
         "annotations made outside Zotero desktop. limit: cap on annotations "
-        "returned; None (default) returns all. Uses Better BibTeX when "
-        "Zotero desktop is running locally, otherwise the Zotero web API. "
+        "returned; None (default) returns all. format='markdown' (default) "
+        "returns a readable list; format='json' returns normalized records "
+        "with stable keys for downstream scripts and other MCP tools. Uses "
+        "Better BibTeX when Zotero desktop is running locally, otherwise the "
+        "Zotero web API. "
         "Example: zotero_get_annotations(item_key='ABC12345') → every "
         "highlight/note on that paper."
     )
@@ -87,6 +184,7 @@ def get_annotations(
     item_key: str | None = None,
     use_pdf_extraction: bool = False,
     limit: int | str | None = None,
+    format: Literal["markdown", "json"] = "markdown",
     *,
     ctx: Context
 ) -> str:
@@ -97,10 +195,11 @@ def get_annotations(
         item_key: Optional Zotero item key/ID to filter annotations by parent item
         use_pdf_extraction: Whether to attempt direct PDF extraction as a fallback
         limit: Maximum number of annotations to return
+        format: Markdown for human-readable output or JSON for normalized records
         ctx: MCP context
 
     Returns:
-        Markdown-formatted list of annotations
+        Markdown-formatted annotations or a JSON array of normalized records
     """
     try:
         # Initialize Zotero client
@@ -109,6 +208,7 @@ def get_annotations(
         # Prepare annotations list
         annotations = []
         parent_title = "Untitled Item"
+        source_errors: list[str] = []
 
         # If an item key is provided, use specialized retrieval
         if item_key:
@@ -139,7 +239,6 @@ def get_annotations(
             better_bibtex_annotations = []
             zotero_api_annotations = []
             pdf_annotations = []
-            source_errors: list[str] = []
 
             # Try Better BibTeX method (local Zotero only)
             if os.environ.get("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]:
@@ -147,7 +246,6 @@ def get_annotations(
                     # Import Better BibTeX dependencies
                     from zotero_mcp.better_bibtex_client import (
                         ZoteroBetterBibTexAPI,
-                        get_color_category,
                         process_annotation,
                     )
 
@@ -221,8 +319,20 @@ def get_annotations(
                                                     "annotationText": processed.get("annotatedText", ""),
                                                     "annotationComment": processed.get("comment", ""),
                                                     "annotationColor": processed.get("color", ""),
-                                                    "parentItem": item_key,
-                                                    "tags": [],
+                                                    "parentItem": (
+                                                        attachment.get("itemKey")
+                                                        or attachment.get("key")
+                                                        or item_key
+                                                    ),
+                                                    "tags": [
+                                                        {"tag": tag}
+                                                        for tag in _normalized_annotation_tags(
+                                                            processed.get("tags")
+                                                            or anno.get("tags")
+                                                        )
+                                                    ],
+                                                    "dateAdded": anno.get("dateAdded", ""),
+                                                    "dateModified": anno.get("dateModified", ""),
                                                     "_pdf_page": processed.get("page", 0),
                                                     "_pageLabel": processed.get("pageLabel", ""),
                                                     "_attachment_title": attachment.get("title", ""),
@@ -320,8 +430,14 @@ def get_annotations(
                                                 "annotationText": ext.get("annotatedText", ""),
                                                 "annotationComment": ext.get("comment", ""),
                                                 "annotationColor": ext.get("color", ""),
-                                                "parentItem": item_key,
-                                                "tags": [],
+                                                "parentItem": att_key,
+                                                "tags": [
+                                                    {"tag": tag}
+                                                    for tag in _normalized_annotation_tags(
+                                                        ext.get("tags")
+                                                    )
+                                                ],
+                                                "dateModified": ext.get("date", ""),
                                                 "_pdf_page": ext.get("page", 0),
                                                 "_from_pdf_extraction": True,
                                                 "_attachment_title": attachment.get("data", {}).get("title", "PDF")
@@ -357,22 +473,71 @@ def get_annotations(
             empty_result = (
                 f"No annotations found{f' for item: {parent_title}' if item_key else ''}."
             )
+            if format == "json":
+                if item_key and source_errors:
+                    prefix = (
+                        "Partial failure: "
+                        if use_pdf_extraction
+                        else "Error: Annotation retrieval failed: "
+                    )
+                    return prefix + "; ".join(source_errors) + "\n\n[]"
+                return "[]"
             if item_key and source_errors:
                 if not use_pdf_extraction:
                     return "Error: Annotation retrieval failed: " + "; ".join(source_errors)
                 return "Partial failure: " + "; ".join(source_errors) + "\n\n" + empty_result
             return empty_result
 
-        # Batch-resolve parent titles for library-wide retrieval (Fix 2+5)
-        parent_titles = {}
-        if not item_key:
-            parent_keys = set()
+        # JSON records and library-wide Markdown need attachment -> paper
+        # context. Item-scoped Markdown keeps its existing no-extra-lookup path.
+        parent_keys = set()
+        if format == "json" or not item_key:
+            parent_keys = {
+                parent_key
+                for anno in annotations
+                if (parent_key := anno.get("data", {}).get("parentItem"))
+            }
+        parent_contexts = (
+            _batch_resolve_annotation_contexts(zot, parent_keys, ctx)
+            if parent_keys
+            else {}
+        )
+        parent_titles = {
+            key: context["parent_title"] or f"(parent key: {key})"
+            for key, context in parent_contexts.items()
+        }
+
+        if format == "json":
+            def _fallback_context(parent_key: str | None) -> dict[str, str | None]:
+                """Use known caller context without mislabelling an attachment."""
+                return {
+                    "item_key": parent_item_key if item_key else None,
+                    "attachment_key": parent_key,
+                    "parent_title": (
+                        parent_title if item_key and not _is_attachment else None
+                    ),
+                    "attachment_title": (
+                        parent_title if item_key and _is_attachment else None
+                    ),
+                }
+
+            records = []
             for anno in annotations:
-                pk = anno.get("data", {}).get("parentItem")
-                if pk:
-                    parent_keys.add(pk)
-            if parent_keys:
-                parent_titles = _batch_resolve_grandparent_titles(zot, parent_keys, ctx)
+                annotation_parent = anno.get("data", {}).get("parentItem")
+                context = (
+                    parent_contexts.get(annotation_parent)
+                    or _fallback_context(annotation_parent)
+                )
+                records.append(_annotation_to_record(anno, context))
+            payload = json.dumps(records, ensure_ascii=False, indent=2)
+            if item_key and source_errors:
+                return (
+                    "Partial failure: "
+                    + "; ".join(source_errors)
+                    + "\n\n"
+                    + payload
+                )
+            return payload
 
         # Generate markdown output
         output = [f"# Annotations{f' for: {parent_title}' if item_key else ''}", ""]
@@ -627,14 +792,14 @@ def _batch_resolve_parent_titles(
     return titles
 
 
-def _batch_resolve_grandparent_titles(
+def _batch_resolve_annotation_contexts(
     zot, parent_keys: set[str], ctx: Context
-) -> dict[str, str]:
-    """Resolve annotation parent keys to their grandparent (paper) titles.
+) -> dict[str, dict[str, str | None]]:
+    """Resolve annotation parents to truthful paper and attachment metadata.
 
     Annotations are children of PDF attachments, which are children of papers.
-    This does a two-hop lookup: annotation → attachment → paper.
-    Returns a dict mapping the ATTACHMENT key to the PAPER title.
+    Unresolved keys are omitted so callers can use known request context rather
+    than accidentally presenting an attachment as its bibliographic parent.
     """
     BATCH_SIZE = 50
 
@@ -693,17 +858,39 @@ def _batch_resolve_grandparent_titles(
         except Exception:
             pass
 
-    # Step 3: Map attachment keys to paper titles
-    result: dict[str, str] = {}
-    for att_key, att_item in attachment_data.items():
-        gp_key = att_item.get("data", {}).get("parentItem")
-        if gp_key and gp_key in grandparent_titles:
-            result[att_key] = grandparent_titles[gp_key]
+    # Step 3: Map immediate parents to stable paper/attachment context.
+    result: dict[str, dict[str, str | None]] = {}
+    for parent_key, parent_item in attachment_data.items():
+        data = parent_item.get("data", {})
+        is_attachment = data.get("itemType") == "attachment"
+        paper_key = data.get("parentItem") if is_attachment else None
+        if paper_key:
+            result[parent_key] = {
+                "item_key": paper_key,
+                "attachment_key": parent_key,
+                "parent_title": grandparent_titles.get(paper_key),
+                "attachment_title": data.get("title") or None,
+            }
         else:
-            # Fallback to attachment title (e.g., "Full Text PDF")
-            result[att_key] = att_item.get("data", {}).get("title", f"(key: {att_key})")
+            result[parent_key] = {
+                "item_key": parent_key,
+                "attachment_key": parent_key if is_attachment else None,
+                "parent_title": data.get("title") or None,
+                "attachment_title": data.get("title") if is_attachment else None,
+            }
 
     return result
+
+
+def _batch_resolve_grandparent_titles(
+    zot, parent_keys: set[str], ctx: Context
+) -> dict[str, str]:
+    """Backward-compatible title-only view of annotation parent contexts."""
+    contexts = _batch_resolve_annotation_contexts(zot, parent_keys, ctx)
+    return {
+        key: context["parent_title"] or f"(parent key: {key})"
+        for key, context in contexts.items()
+    }
 
 
 def _format_search_results(

@@ -12,6 +12,10 @@ import requests
 
 from zotero_mcp.client import call_with_zotero_api_lock
 
+
+class BetterBibTexError(Exception):
+    """Better BibTeX could not produce a non-empty export."""
+
 # Matches the opening ``@type{`` line of a BibTeX entry where the citekey is
 # either absent or followed immediately by the comma + newline that a
 # missing-citekey entry produces. Used to inject the citekey when BBT's
@@ -260,12 +264,14 @@ class ZoteroBetterBibTexAPI:
             )
 
             if not citation_mapping:
-                raise Exception(f"No citation key found for item: {item_key}")
+                raise BetterBibTexError(f"No citation key found for item: {item_key}")
 
             citation_key = citation_mapping.get(item_key)
 
             if not citation_key:
-                raise Exception(f"Citation key not found for item: {item_key}")
+                raise BetterBibTexError(
+                    f"Better BibTeX has no citation key for item {item_key}"
+                )
 
             # Step 2: Export BibTeX using the citation key.
             export_result = self._make_request(
@@ -288,14 +294,22 @@ class ZoteroBetterBibTexAPI:
             else:
                 bibtex_str = str(export_result)
 
+            if not bibtex_str or not bibtex_str.strip():
+                raise BetterBibTexError(
+                    f"Better BibTeX returned an empty export for item: {item_key}"
+                )
+
             # BBT's ``item.export`` omits the citekey from the @-line in some
             # versions (#293 Bug 2) — entries come back as ``@article{`` with
             # an empty key. Inject the citekey we already resolved above.
             return _inject_citekey(bibtex_str, citation_key)
 
+        except BetterBibTexError:
+            raise
         except Exception as e:
-            print(f"Error exporting BibTeX: {e}")
-            return ""
+            raise BetterBibTexError(
+                f"Better BibTeX export failed for item {item_key}: {e}"
+            ) from e
 
 
 def process_annotation(annotation: dict[str, Any], attachment: dict[str, Any], format_type: str = 'markdown') -> dict[str, Any]:

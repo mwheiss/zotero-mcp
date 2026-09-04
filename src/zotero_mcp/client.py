@@ -3,6 +3,7 @@ Zotero client wrapper for MCP server.
 """
 
 import functools
+import logging
 import math
 import os
 import re
@@ -43,6 +44,8 @@ from zotero_mcp.webdav import (
 
 # Load environment variables
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # Serialize all Zotero API access. The local API (port 23119) is single-threaded;
 # concurrent requests from parallel MCP tool threads or a separate CLI process
@@ -706,20 +709,25 @@ def generate_bibtex(item: dict[str, Any]) -> str:
         BibTeX formatted string
     """
     data = item.get("data", {})
-    item_key = data.get("key")
+    item_key = data.get("key") or item.get("key")
+    trash_prefix = "% Status: in trash\n" if data.get("deleted") else ""
 
     # Try Better BibTeX first
     try:
         from zotero_mcp.better_bibtex_client import ZoteroBetterBibTexAPI
 
-        bibtex = ZoteroBetterBibTexAPI()
-
-        if bibtex.is_zotero_running():
-            return bibtex.export_bibtex(item_key)
-
-    except Exception:
-        # Continue to fallback method if Better BibTeX fails
-        pass
+        if item_key:
+            bibtex = ZoteroBetterBibTexAPI()
+            if bibtex.is_zotero_running():
+                exported = bibtex.export_bibtex(item_key)
+                if exported and exported.strip():
+                    return trash_prefix + exported
+    except Exception as exc:
+        logger.warning(
+            "Better BibTeX export failed for %s (%s); using local generation",
+            item_key,
+            exc,
+        )
 
     # Fallback to basic BibTeX generation
     item_type = data.get("itemType", "misc")
@@ -749,7 +757,9 @@ def generate_bibtex(item: dict[str, Any]) -> str:
     display_date = item_display_date(data)
     year_match = re.search(r"\b(\d{4})\b", display_date)
     year = year_match.group(1) if year_match else "nodate"
-    cite_key = f"{author}{year}_{item_key}"
+    cite_key = f"{author}{year}_{item_key}" if item_key else f"{author}{year}"
+    if not cite_key:
+        cite_key = "untitled"
 
     # Build BibTeX entry
     bib_type = type_map.get(item_type, "misc")
@@ -805,7 +815,7 @@ def generate_bibtex(item: dict[str, Any]) -> str:
         lines[-1] = lines[-1][:-1]
     lines.append("}")
 
-    return "\n".join(lines)
+    return trash_prefix + "\n".join(lines)
 
 
 def get_attachment_details(zot: zotero.Zotero, item: dict[str, Any]) -> AttachmentDetails | None:
@@ -989,7 +999,30 @@ def download_attachment_file(
                 except (OSError, ValueError, TypeError):
                     pass
             with LocalZoteroReader(db_path=db_path) as reader:
-                attachment = reader.get_attachment_by_key(attachment_key)
+                requested_library = get_current_library()
+                if local_client is not None:
+                    requested_library = {
+                        "library_id": str(
+                            getattr(local_client, "library_id", "")
+                            or requested_library.get("library_id", "")
+                        ),
+                        "library_type": str(
+                            getattr(local_client, "library_type", "")
+                            or requested_library.get("library_type", "user")
+                        ),
+                    }
+                sqlite_library_id = reader.resolve_library_id(
+                    requested_library.get("library_id", ""),
+                    requested_library.get("library_type", "user"),
+                )
+                if sqlite_library_id is None:
+                    errors.append(
+                        "Local storage: active library is absent from the SQLite snapshot"
+                    )
+                    return None
+                attachment = reader.get_attachment_by_key(
+                    attachment_key, library_id=sqlite_library_id
+                )
                 if attachment is None:
                     return None
                 resolved = reader._resolve_attachment_path(

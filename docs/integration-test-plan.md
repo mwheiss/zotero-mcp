@@ -476,7 +476,7 @@ Show me all my notes across my entire library.
 Add DOI 10.1371/journal.pone.0185809 twice (with tags "dedup-test-1"
 and "dedup-test-2"). Then merge them. Check the keeper item.
 ```
-**Verify:** The keeper should have BOTH tags but only ONE PDF attachment — not two copies of the same PDF. Previously merge would create duplicate attachments.
+**Verify:** The keeper should have BOTH tags and both attachment records. Even byte-identical attachments are retained because either attachment may own distinct annotations; discarding one could strand those annotations under the trashed duplicate.
 
 ---
 

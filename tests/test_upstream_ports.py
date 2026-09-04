@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import multiprocessing
+import os
 import sqlite3
 import subprocess
 import threading
 
+import pytest
 from pyzotero.zotero_errors import PreConditionFailedError
 
 from zotero_mcp import client as zotero_client
@@ -13,7 +16,7 @@ from zotero_mcp import updater
 from zotero_mcp.citation_import import csl_json_to_zotero
 from zotero_mcp.html_metadata import extract_embedded_metadata
 from zotero_mcp.local_db import LocalZoteroReader
-from zotero_mcp.tools import _helpers, annotations, search, write
+from zotero_mcp.tools import _helpers, annotations, scite, search, write
 from zotero_mcp.utils import (
     _paginate,
     get_search_backend,
@@ -21,6 +24,15 @@ from zotero_mcp.utils import (
     item_display_title,
     use_sqlite_search,
 )
+
+
+def _hold_identifier_lock(lock_path, entered, release):
+    os.environ["ZOTERO_MCP_API_LOCK_PATH"] = lock_path
+    os.environ["ZOTERO_LIBRARY_ID"] = "1"
+    os.environ["ZOTERO_LIBRARY_TYPE"] = "user"
+    with _helpers.identifier_lock("doi", "10.1234/cross-process"):
+        entered.set()
+        release.wait(timeout=5)
 
 
 def test_updater_never_offers_downgrade(monkeypatch):
@@ -90,6 +102,34 @@ def test_identifier_lock_serializes_same_identifier():
     one.join(timeout=2)
     two.join(timeout=2)
     assert second_entered.is_set()
+
+
+def test_identifier_lock_serializes_across_processes(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    first_entered = context.Event()
+    release_first = context.Event()
+    second_entered = context.Event()
+    release_second = context.Event()
+    release_second.set()
+    lock_path = str(tmp_path / "api.lock")
+    first = context.Process(
+        target=_hold_identifier_lock,
+        args=(lock_path, first_entered, release_first),
+    )
+    second = context.Process(
+        target=_hold_identifier_lock,
+        args=(lock_path, second_entered, release_second),
+    )
+    first.start()
+    assert first_entered.wait(timeout=5)
+    second.start()
+    assert not second_entered.wait(timeout=0.5)
+    release_first.set()
+    assert second_entered.wait(timeout=5)
+    first.join(timeout=5)
+    second.join(timeout=5)
+    assert first.exitcode == 0
+    assert second.exitcode == 0
 
 
 def test_update_retries_stale_versions():
@@ -255,6 +295,69 @@ def test_batch_inputs_are_deduplicated():
     assert results[1].startswith("Repeated input")
 
 
+def test_balanced_doi_suffix_brackets_are_preserved():
+    value = "10.3319/TAO.2009.05.25.02(IWNOP)"
+    assert _helpers._normalize_doi(value) == value
+    assert _helpers._normalize_doi(f"{value}.") == value
+
+
+def test_batch_split_preserves_commas_inside_identifiers():
+    url = "https://example.com/page?ids=1,2"
+    assert write._split_batch_values(url, "url", write._looks_like_url) == [url]
+    assert write._split_batch_values(
+        f"{url}\nhttps://example.com/other", "url", write._looks_like_url
+    ) == [url, "https://example.com/other"]
+
+
+def test_real_scite_editorial_notice_fields_are_rendered():
+    lines = scite._format_editorial_notices(
+        [
+            {
+                "status": "Retracted",
+                "date": "2021-02-03",
+                "noticeDoi": "10.1234/retraction",
+            }
+        ]
+    )
+    assert lines == [
+        "**Retracted** (2021-02-03): https://doi.org/10.1234/retraction"
+    ]
+
+
+def test_remote_pdf_stream_enforces_length_and_chunked_limits(monkeypatch, tmp_path):
+    class Response:
+        def __init__(self, chunks, length=None):
+            self.headers = {} if length is None else {"Content-Length": str(length)}
+            self._chunks = chunks
+
+        def iter_content(self, chunk_size):
+            assert chunk_size > 0
+            return iter(self._chunks)
+
+    monkeypatch.setenv("ZOTERO_MCP_REMOTE_DOWNLOAD_MAX_BYTES", "12")
+    with pytest.raises(ValueError, match="download limit"):
+        _helpers._stream_pdf_response(
+            Response([], length=13), tmp_path / "declared.pdf"
+        )
+    with pytest.raises(ValueError, match="download limit"):
+        _helpers._stream_pdf_response(
+            Response([b"%PDF-", b"12345678"]), tmp_path / "chunked.pdf"
+        )
+
+
+def test_remote_pdf_stream_rejects_non_pdf_bytes(monkeypatch, tmp_path):
+    class Response:
+        headers = {}
+
+        @staticmethod
+        def iter_content(chunk_size):
+            return iter([b"not actually a PDF"])
+
+    monkeypatch.setenv("ZOTERO_MCP_REMOTE_DOWNLOAD_MAX_BYTES", "100")
+    with pytest.raises(ValueError, match="recognizable PDF"):
+        _helpers._stream_pdf_response(Response(), tmp_path / "fake.pdf")
+
+
 def test_doi_batch_uses_one_crossref_request(monkeypatch):
     class Response:
         status_code = 200
@@ -375,7 +478,11 @@ def test_linked_attachment_is_copied_from_local_storage(monkeypatch, tmp_path):
         def __exit__(self, *_args):
             return False
 
-        def get_attachment_by_key(self, key):
+        def resolve_library_id(self, library_id, library_type):
+            return 1
+
+        def get_attachment_by_key(self, key, library_id=None):
+            assert library_id == 1
             return {"zotero_path": str(source), "content_type": "application/pdf"}
 
         def _resolve_attachment_path(self, _key, _path):
