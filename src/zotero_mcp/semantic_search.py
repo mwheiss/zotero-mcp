@@ -712,8 +712,8 @@ class ZoteroSemanticSearch:
         # filtered items and can be reconciled against ChromaDB.
         self._last_scan_indexable_keys: set[str] | None = None
         # Active attachment keys grouped by parent from the canonical API item
-        # listing. Local immutable SQLite reads can retain attachments that
-        # Zotero has already deleted from its live state.
+        # listing. Even a consistent SQLite/WAL snapshot can briefly retain
+        # attachments that Zotero has not yet committed as deleted.
         self._last_api_attachment_keys_by_parent: dict[str, set[str]] | None = None
         self._last_scan_attachment_snapshot_complete = True
 
@@ -2084,12 +2084,10 @@ class ZoteroSemanticSearch:
         """Decide whether the local sqlite snapshot supports promoting the
         API-derived sync watermark.
 
-        The local-extraction scan reads zotero.sqlite with `immutable=1`,
-        which cannot see rows still sitting in an un-checkpointed WAL file.
-        The API (served by the running Zotero) *does* see them, so its
-        library version may cover items the scan never returned. Promoting
-        `last_sync_version` in that state makes every later incremental
-        update skip those items forever (issue #292).
+        The local-extraction scan uses a consistent private SQLite/WAL
+        snapshot. The API can still briefly lead data that Zotero has not
+        committed to either file, so promoting `last_sync_version` remains
+        conditional on complete key coverage (issue #292).
 
         Returns:
             `target_sync_version` if every item key known to the API is
@@ -2140,8 +2138,8 @@ class ZoteroSemanticSearch:
         if missing:
             logger.warning(
                 f"{len(missing)} item(s) are visible via the Zotero API but "
-                "missing from the local sqlite snapshot (immutable reads "
-                "cannot see un-checkpointed WAL data); keeping previous sync "
+                "missing from the consistent local SQLite/WAL snapshot "
+                "(Zotero may not have committed them yet); keeping previous sync "
                 "watermark so the next update can pick them up."
             )
             return None
@@ -2898,9 +2896,8 @@ class ZoteroSemanticSearch:
                     ),
                     pre_extraction_callback=(run_local_prephase if use_local_source else None),
                 )
-                # The local-extraction scan may lag behind the API version
-                # captured above (immutable sqlite reads skip WAL contents);
-                # only promote the watermark if the snapshot was complete.
+                # The API may briefly lead even a consistent SQLite/WAL
+                # snapshot; only promote the watermark if key coverage agrees.
                 if use_local_source and target_sync_version is not None:
                     verified_sync_version = self._verify_local_snapshot_version(target_sync_version)
                     local_snapshot_complete = verified_sync_version is not None

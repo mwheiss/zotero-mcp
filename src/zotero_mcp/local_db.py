@@ -11,7 +11,9 @@ import logging
 import os
 import platform
 import re
+import shutil
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +44,51 @@ _BETTERISSA_ARTIFACT_TITLES = frozenset(
     }
 )
 _BETTERISSA_SELECTABLE_TITLES = _BETTERISSA_ARTIFACT_TITLES - {_BETTERISSA_REFERENCES_TITLE}
+
+_SNAPSHOT_CAPTURE_ATTEMPTS = 3
+
+
+def _file_fingerprint(path: Path) -> tuple[int, int, int, int] | None:
+    """Identity, size, and timestamp used to detect a changing SQLite file."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _capture_sqlite_snapshot(db_path: Path) -> tuple[tempfile.TemporaryDirectory, Path]:
+    """Copy a stable base database plus WAL into a private writable directory.
+
+    Zotero holds a lock that prevents a conventional read-only connection.
+    ``immutable=1`` bypasses that lock but also ignores the WAL, hiding recent
+    committed items indefinitely. Copying both files lets SQLite recover the
+    private copy normally. Fingerprints before and after the copy ensure a
+    checkpoint or WAL append cannot produce a mixed snapshot.
+    """
+    wal_path = Path(f"{db_path}-wal")
+    last_change = ""
+    for _attempt in range(_SNAPSHOT_CAPTURE_ATTEMPTS):
+        before = (_file_fingerprint(db_path), _file_fingerprint(wal_path))
+        directory = tempfile.TemporaryDirectory(prefix="zotero-mcp-sqlite-")
+        snapshot = Path(directory.name) / "zotero.sqlite"
+        try:
+            shutil.copy2(db_path, snapshot)
+            if before[1] is not None:
+                shutil.copy2(wal_path, Path(f"{snapshot}-wal"))
+        except (FileNotFoundError, OSError) as exc:
+            directory.cleanup()
+            last_change = str(exc)
+            continue
+        after = (_file_fingerprint(db_path), _file_fingerprint(wal_path))
+        if before == after:
+            return directory, snapshot
+        directory.cleanup()
+        last_change = "database or WAL changed during capture"
+    raise RuntimeError(
+        "Could not capture a stable Zotero SQLite/WAL snapshot after "
+        f"{_SNAPSHOT_CAPTURE_ATTEMPTS} attempts ({last_change})"
+    )
 
 
 def _extract_pdf_worker(file_path: str, maxpages: int, result_queue):
@@ -221,6 +268,7 @@ class LocalZoteroReader:
                 db_path = None
         self.db_path = db_path or self._find_zotero_db()
         self._connection: sqlite3.Connection | None = None
+        self._snapshot_directory: tempfile.TemporaryDirectory | None = None
         self.pdf_max_pages: int | None = pdf_max_pages
         self.pdf_timeout: int = pdf_timeout
         self._library_labels: dict[int, tuple[int, str]] | None = None
@@ -287,12 +335,18 @@ class LocalZoteroReader:
     def _get_connection(self) -> sqlite3.Connection:
         """Get database connection, creating if needed."""
         if self._connection is None:
-            # Use immutable=1 to bypass locking entirely. Zotero uses rollback
-            # journal mode and holds a write lock while running, which blocks
-            # even read-only connections. immutable=1 skips all lock checks —
-            # safe here since we only read and tolerate slightly stale data.
-            uri = f"file:{self.db_path}?immutable=1"
-            self._connection = sqlite3.connect(uri, uri=True)
+            source = Path(self.db_path)
+            wal_path = Path(f"{source}-wal")
+            if wal_path.exists():
+                self._snapshot_directory, snapshot = _capture_sqlite_snapshot(source)
+                self._connection = sqlite3.connect(snapshot)
+            else:
+                # With no WAL there is nothing for immutable mode to hide, and
+                # it remains the only lock-free path on older rollback-journal
+                # Zotero databases.
+                uri = f"file:{self.db_path}?immutable=1"
+                self._connection = sqlite3.connect(uri, uri=True)
+            self._connection.execute("PRAGMA query_only = ON")
             self._connection.row_factory = sqlite3.Row
         return self._connection
 
@@ -1172,6 +1226,10 @@ class LocalZoteroReader:
         if self._connection:
             self._connection.close()
             self._connection = None
+        snapshot_directory = getattr(self, "_snapshot_directory", None)
+        if snapshot_directory is not None:
+            snapshot_directory.cleanup()
+            self._snapshot_directory = None
 
     def __enter__(self):
         return self
@@ -1304,9 +1362,8 @@ class LocalZoteroReader:
         """
         Get the keys of every item in the database, regardless of type.
 
-        Used to verify that the sqlite snapshot is not lagging behind the
-        Zotero API (an `immutable=1` read cannot see rows that are still
-        in an un-checkpointed WAL file).
+        Used to verify that the consistent SQLite/WAL snapshot is not lagging
+        behind the live Zotero API.
         """
         conn = self._get_connection()
         if library_id is None:

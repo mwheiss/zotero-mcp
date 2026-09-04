@@ -638,37 +638,27 @@ def audit_semantic_database(
         if compare_zotero:
             configured_db_path = zotero_db_path or semantic_config.get("zotero_db_path")
             try:
-                zotero_keys, resolved_zotero_path = _read_zotero_keys(
+                zotero_keys, _resolved_zotero_path = _read_zotero_keys(
                     configured_db_path,
                     semantic_config.get("collection_keys"),
                     library,
                 )
                 report.metrics["zotero_items"] = len(zotero_keys)
-                zotero_wal = resolved_zotero_path.with_name(
-                    resolved_zotero_path.name + "-wal"
-                )
-                if zotero_wal.exists():
+                missing_items = zotero_keys - item_keys
+                extra_items = item_keys - zotero_keys
+                if missing_items or extra_items:
                     report.add(
-                        "warning",
+                        "error",
                         "zotero_coverage",
-                        "Zotero has a WAL; immutable coverage may omit its newest changes.",
+                        f"Index coverage differs from Zotero: {len(missing_items)} missing, "
+                        f"{len(extra_items)} extra item key(s).",
                     )
                 else:
-                    missing_items = zotero_keys - item_keys
-                    extra_items = item_keys - zotero_keys
-                    if missing_items or extra_items:
-                        report.add(
-                            "error",
-                            "zotero_coverage",
-                            f"Index coverage differs from Zotero: {len(missing_items)} missing, "
-                            f"{len(extra_items)} extra item key(s).",
-                        )
-                    else:
-                        report.add(
-                            "ok",
-                            "zotero_coverage",
-                            f"All {len(zotero_keys)} current Zotero item keys are represented.",
-                        )
+                    report.add(
+                        "ok",
+                        "zotero_coverage",
+                        "Index item coverage matches the consistent Zotero SQLite/WAL snapshot.",
+                    )
             except FileNotFoundError:
                 report.add("skipped", "zotero_coverage", "No local Zotero database was found.")
             except Exception as error:

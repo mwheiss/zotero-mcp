@@ -122,6 +122,34 @@ def test_attachment_signature_changes_with_zotero_fulltext_cache(tmp_path):
     assert new_signature != old_signature
 
 
+def test_reader_replays_committed_wal_rows_in_private_snapshot(tmp_path):
+    db_path = tmp_path / "zotero.sqlite"
+    writer = sqlite3.connect(db_path)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute(
+        "CREATE TABLE items (itemID INTEGER PRIMARY KEY, key TEXT, libraryID INTEGER)"
+    )
+    writer.execute("INSERT INTO items VALUES (1, 'BASE', 1)")
+    writer.commit()
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    writer.execute("INSERT INTO items VALUES (2, 'IN_WAL', 1)")
+    writer.commit()
+    assert Path(f"{db_path}-wal").stat().st_size > 0
+
+    immutable = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
+    assert {row[0] for row in immutable.execute("SELECT key FROM items")} == {"BASE"}
+    immutable.close()
+
+    reader = LocalZoteroReader(db_path=str(db_path))
+    assert reader.get_all_item_keys(library_id=1) == {"BASE", "IN_WAL"}
+    snapshot_root = Path(reader._snapshot_directory.name)
+    assert snapshot_root.exists()
+    reader.close()
+    assert not snapshot_root.exists()
+    writer.close()
+
+
 def test_betterissa_signature_tracks_in_place_enrichment(tmp_path):
     db_path = tmp_path / "zotero.sqlite"
     conn = sqlite3.connect(db_path)

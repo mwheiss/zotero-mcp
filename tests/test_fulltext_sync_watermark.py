@@ -1,11 +1,9 @@
 """Tests for issue #292: `update-db --fulltext` must not advance the sync
 watermark past items the local sqlite snapshot never saw.
 
-The local-extraction path reads zotero.sqlite with `immutable=1`, which
-cannot see rows that are still in Zotero's WAL. The API-derived
-`last_sync_version` watermark, however, *does* cover those rows, so
-promoting it unconditionally makes later incremental updates skip the
-missed items forever.
+The local-extraction path now captures a consistent SQLite/WAL snapshot, but
+the live API can still briefly lead data that Zotero has not committed. The
+API-derived `last_sync_version` must advance only when both key sets agree.
 """
 
 import json

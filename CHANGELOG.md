@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-09-04
+
+### Fixed
+- Local SQLite reads now capture and validate a private copy of both `zotero.sqlite` and its WAL, so committed items and attachments remain visible while Zotero is running without contending for Zotero's database locks.
+- Semantic sync-watermark and database-health checks continue to fail closed if the live API is genuinely ahead of the consistent local snapshot.
+
 ## [1.4.0] - 2026-09-04
 
 ### Added
