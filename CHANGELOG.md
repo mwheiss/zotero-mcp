@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-09-04
+
+### Added
+- Optional normalized JSON records for annotation retrieval, preserved as native data by the common MCP result envelope.
+- Configurable streamed download and WebDAV archive limits, including compressed size, expanded size, member count, compression ratio, path traversal, and symbolic-link checks.
+
+### Changed
+- Bibliography and citation rendering now uses Zotero's batched local-compatible JSON interface instead of requiring a Web API fallback.
+- Duplicate merging fills empty bibliographic fields and retains every attachment so annotations cannot be stranded beneath a discarded same-named file.
+- Identifier import locks now span MCP and CLI processes as well as threads.
+- Server-local file imports require the existing explicit local-path opt-in; inline BibTeX and CSL JSON remain available normally.
+
+### Fixed
+- Semantic collection allowlists fail closed on invalid, missing, or partially resolved keys instead of silently indexing the whole library.
+- PDF timeout circuit breaking defers untouched records and retains the previous sync watermark rather than replacing existing full text with metadata-only passages.
+- SQLite advanced search now shares field, numeric, negative multi-value, multipart-date, and unsupported-filter semantics with the API path; RSS dates render without Zotero's internal prefix.
+- Empty and partially covered semantic/advanced results expose truthful MCP statuses, and tag results explicitly identify their applied scope.
+- Attachment capability secrets are initialized atomically and never use short or empty HMAC keys; staged uploads are serialized, consumed after success, and garbage-collected after expiry.
+- Failed local attachment byte uploads compensate by removing their newly created empty shells, while reparent confirmations cannot authorize unrelated metadata changes.
+- DOI normalization retains balanced suffix brackets, batch imports preserve commas inside valid identifiers, and remote PDF downloads are bounded and validated.
+- Better BibTeX failures fall back to non-empty local output, and trashed-item BibTeX carries an explicit status marker.
+- Scite renders the current editorial-notice fields, `db-inspect` scans in bounded pages, and the health CLI compares the active library only.
+- Local attachment lookup is library-scoped, and the production dependency floor excludes the affected `cryptography` PKCS#7 implementation.
+
 ## [1.4.1] - 2026-09-04
 
 ### Fixed

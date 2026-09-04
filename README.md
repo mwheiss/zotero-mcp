@@ -408,17 +408,26 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `ZOTERO_LIBRARY_TYPE`: The type of library (user or group, default: user)
 - `ZOTERO_MCP_LOCK_TIMEOUT`: Maximum seconds to wait for another Zotero API request across threads or processes (default: 45; `0` waits indefinitely)
 - `ZOTERO_MCP_API_LOCK_PATH`: Optional shared API lock-file path when MCP and CLI processes use different home/config directories
+- `ZOTERO_MCP_IDENTIFIER_LOCK_DIR`: Optional directory for per-library, per-identifier import locks shared by MCP and CLI processes
 - `ZOTERO_MCP_UPDATE_LOCK_PATH`: Optional shared semantic-update lock path (default: `~/.config/zotero-mcp/update.lock`)
 - `ZOTERO_MCP_WRITE_SECRET`: Required per-call admin secret for every MCP tool that mutates Zotero or the semantic index. The value is never exposed in tool descriptions
+- `ZOTERO_MCP_EXPOSE_LOCAL_PATHS=true`: Explicitly expose server-local path tools in local Zotero mode; remote clients should use staged attachment uploads and inline citation data
 - `ZOTERO_MCP_PUBLIC_BASE_URL`: Public MCP URL prefix used to create short-lived signed attachment upload/download URLs
+- `ZOTERO_MCP_ATTACHMENT_SECRET`: Optional persistent capability-token secret; when set, it must contain at least 32 bytes
 - `ZOTERO_MCP_ATTACHMENT_MAX_BYTES`: Maximum staged attachment upload size (default: 512 MiB)
 - `ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES`: Maximum binary embedded as base64 in a tool result (default: 1 MiB; hard cap: 32 MiB)
 - `ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES`: Maximum binary returned through an in-memory MCP resource (default: 8 MiB; hard cap: 64 MiB)
 - `ZOTERO_MCP_ATTACHMENT_LOCK_TIMEOUT`: Maximum seconds to wait for the same attachment idempotency key (default: 45)
 - `ZOTERO_MCP_ATTACHMENT_STATE_DIR`: Private staging/token state directory (default: `~/.cache/zotero-mcp/attachments`)
+- `ZOTERO_MCP_ATTACHMENT_GC_SCAN_LIMIT` / `ZOTERO_MCP_ATTACHMENT_GC_DELETE_LIMIT`: Bound manifest checks and deletions per staged-upload cleanup pass (defaults: 128 checked / 32 deleted)
+- `ZOTERO_MCP_REMOTE_DOWNLOAD_MAX_BYTES`: Maximum remotely fetched PDF/WebDAV archive size (default: 512 MiB; hard cap: 2 GiB)
 - `ZOTERO_WEBDAV_URL`: Optional WebDAV folder URL for direct attachment downloads in remote mode
 - `ZOTERO_WEBDAV_USERNAME`: Optional WebDAV username
 - `ZOTERO_WEBDAV_PASSWORD`: Optional WebDAV password
+- `ZOTERO_MCP_WEBDAV_MAX_DOWNLOAD_BYTES`: WebDAV compressed archive limit; defaults to `ZOTERO_MCP_REMOTE_DOWNLOAD_MAX_BYTES`
+- `ZOTERO_MCP_WEBDAV_MAX_UNCOMPRESSED_BYTES`: Maximum aggregate extracted WebDAV archive size (default: 512 MiB; hard cap: 4 GiB)
+- `ZOTERO_MCP_WEBDAV_MAX_COMPRESSION_RATIO`: Maximum per-member archive compression ratio (default: 200; hard cap: 1000)
+- `ZOTERO_MCP_WEBDAV_MAX_ARCHIVE_MEMBERS`: Maximum archive members (default: 1024; hard cap: 4096)
 - `OPENALEX_API_KEY`: Optional free OpenAlex key for a larger daily citation-graph query budget
 
 **Semantic Search:**
@@ -680,7 +689,7 @@ the bounded inline/resource settings above when both server and client have
 adequate memory and message-size limits.
 
 ### 📝 Annotation & Notes Tools
-- `zotero_get_annotations`: Get annotations (including direct PDF extraction)
+- `zotero_get_annotations`: Get annotations as readable Markdown or normalized JSON records (including direct PDF extraction)
 - `zotero_get_notes`: Retrieve notes from your Zotero library
 - `zotero_search_notes`: Search in notes and annotations (including PDF-extracted)
 - `zotero_create_note`: Create a new note for an item (beta feature)
@@ -704,7 +713,7 @@ Scite support uses the core HTTP dependency and is available in the default inst
 - `zotero_add_by_isbn`: Add one or multiple ISBNs through the Open Library + Google Books cascade
 - `zotero_add_by_bibtex`: Add one or more items from BibTeX (inline or .bib file)
 - `zotero_add_by_csl_json`: Add one or more items from CSL JSON (inline or file)
-- `zotero_add_from_file`: Import a local PDF, EPUB, DjVu, DOC/DOCX, ODT, or RTF file (PDFs get automatic DOI extraction)
+- `zotero_add_from_file`: Import a server-local PDF, EPUB, DjVu, DOC/DOCX, ODT, or RTF file when local paths are explicitly exposed (PDFs get automatic DOI extraction)
 
 All add tools take a `collections` parameter accepting collection keys, names, or `parent/child` paths — resolved and validated before the item is created, so unknown or ambiguous specs fail with suggestions instead of producing an unfiled item. They also take `if_exists` (`"reuse"` — default — returns an identifier match unchanged; `"merge"` adds missing collections and tags to the match; `"duplicate"` explicitly creates another item) and `create_missing_collections` (create unknown collection specs, including path chains, instead of failing). Legacy `skip`/`file` values remain aliases for `reuse`/`merge`. Attachment-aware import tools use `attach_mode="auto|none|linked_url|required"`; an unsatisfied `required` request is reported as partial because Zotero metadata creation cannot be rolled back reliably.
 - `zotero_create_collection`: Create a new collection (folder/project) in your library
