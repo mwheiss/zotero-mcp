@@ -135,8 +135,9 @@ class _ConcurrentChroma:
 
 
 class _InterruptingChroma(_ConcurrentChroma):
-    def upsert_documents(self, documents, metadatas, ids):
-        super().upsert_documents(documents, metadatas, ids)
+    def upsert_embeddings(self, documents, metadatas, ids, embeddings):
+        self.sequential_upserts += 1
+        super().upsert_embeddings(documents, metadatas, ids, embeddings)
         if self.sequential_upserts == 1:
             signal.raise_signal(signal.SIGINT)
 
@@ -211,6 +212,20 @@ def test_default_update_path_writes_each_entry_immediately(
     assert "| ETA " in progress
     assert "2/2 finished" in progress
     assert "| Last: Item 1" in progress
+
+
+def test_sequential_incremental_embedding_happens_before_chroma_upsert(
+    monkeypatch,
+):
+    chroma = _ConcurrentChroma()
+    search = _search(monkeypatch, chroma, _items(1))
+
+    stats = search._process_item_batch(_items(1), force_rebuild=False)
+
+    assert stats["errors"] == 0
+    assert chroma.max_active_embeddings == 1
+    assert chroma.upserted_batches == [["ITEM0000"]]
+    assert chroma.sequential_upserts == 0
 
 
 def test_sequential_retry_restores_added_item_totals(monkeypatch):

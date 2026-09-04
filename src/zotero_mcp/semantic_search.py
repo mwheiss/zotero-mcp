@@ -3384,14 +3384,18 @@ class ZoteroSemanticSearch:
                     try:
                         added_before = prepared.stats["added"]
                         updated_before = prepared.stats["updated"]
+                        embed_documents = getattr(
+                            self.chroma_client, "embed_documents", None
+                        )
+                        embeddings = (
+                            embed_documents(prepared.documents)
+                            if prepared.documents and callable(embed_documents)
+                            else None
+                        )
                         self._commit_prepared_batch(
                             prepared,
                             force_rebuild=False,
-                            embeddings=(
-                                self.chroma_client.embed_documents(prepared.documents)
-                                if complete_rebuild and prepared.documents
-                                else None
-                            ),
+                            embeddings=embeddings,
                             replace_item_records=complete_rebuild,
                         )
                         stats["added_items"] += prepared.stats["added"] - added_before
@@ -3856,8 +3860,25 @@ class ZoteroSemanticSearch:
             item_atomic_rebuild=item_atomic_rebuild,
         )
         embeddings = None
-        if item_atomic_rebuild and prepared.documents:
-            embeddings = self.chroma_client.embed_documents(prepared.documents)
+        embed_documents = getattr(self.chroma_client, "embed_documents", None)
+        if prepared.documents and callable(embed_documents):
+            try:
+                # Keep encoder latency outside the short Chroma lifecycle
+                # lock. With a two-slot local backend and concurrency=1 this
+                # leaves both one encoder slot and the readable live index
+                # available to foreground semantic searches.
+                embeddings = embed_documents(prepared.documents)
+            except Exception as exc:
+                logger.warning(
+                    "Batch embedding failed (%s), saving for retry", exc
+                )
+                if _failed_docs is not None:
+                    _failed_docs.append(prepared)
+                    prepared.stats["errors"] += _prepared_work_item_count(
+                        prepared
+                    )
+                    return prepared.stats
+                raise
         return self._commit_prepared_batch(
             prepared,
             force_rebuild=force_rebuild,

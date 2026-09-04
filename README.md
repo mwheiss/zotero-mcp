@@ -251,7 +251,8 @@ Automatic updates use the same persisted content mode and a separately saved
 embedding concurrency. For example, the following runs a full-text incremental
 update in the background whenever the MCP server starts, while issuing only one
 embedding request at a time so another local encoder slot remains available for
-search:
+search. Embedding computation happens outside the short Chroma write lock, so
+the existing live index remains readable during that work:
 
 ```json
 {
