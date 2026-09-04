@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -21,6 +22,78 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     stream=sys.stderr,
 )
+
+
+def _bounded_number(
+    value: object,
+    *,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return max(minimum, min(parsed, maximum))
+
+
+def _sync_schema_refresh(config_path: Path | None = None) -> None:
+    """Run the opt-in logical metadata-schema refresh when it is due."""
+    config_path = config_path or (
+        Path.home() / ".config" / "zotero-mcp" / "config.json"
+    )
+    if not config_path.exists():
+        return
+
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            config = json.load(config_file)
+        refresh_config = config.get("schema_refresh", {})
+    except Exception:
+        return
+    if (
+        not isinstance(refresh_config, dict)
+        or refresh_config.get("auto_refresh") is not True
+    ):
+        return
+
+    source = refresh_config.get("source", "auto")
+    if source not in {"auto", "local", "web"}:
+        source = "auto"
+    interval_days = _bounded_number(
+        refresh_config.get("interval_days", 7),
+        default=7,
+        minimum=1 / 24,
+        maximum=365,
+    )
+    failure_backoff_hours = _bounded_number(
+        refresh_config.get("failure_backoff_hours", 24),
+        default=24,
+        minimum=1,
+        maximum=7 * 24,
+    )
+
+    from zotero_mcp import schema
+
+    result = schema.refresh_if_due(
+        source=source,
+        interval_seconds=interval_days * 24 * 60 * 60,
+        failure_backoff_seconds=failure_backoff_hours * 60 * 60,
+    )
+    version = result.get("schema_version")
+    version_text = f"schema {version}" if version else "built-in fallback"
+    message = (
+        "Automatic Zotero metadata schema refresh: "
+        f"{result['status']} ({result['source']}, {version_text})"
+    )
+    if result["status"] == "error":
+        message += f"; {result.get('error', 'unknown error')}"
+    sys.stderr.write(message + "\n")
 
 
 def _sync_semantic_update(config_path: Path | None = None) -> None:
@@ -70,8 +143,8 @@ def _sync_semantic_update(config_path: Path | None = None) -> None:
 async def server_lifespan(server: FastMCP):
     """Manage server startup and shutdown lifecycle.
 
-    Semantic search initialization (ChromaDB + embedding model) is
-    offloaded to a daemon thread so it cannot block the event loop.
+    Logical-schema and semantic-search maintenance are offloaded to a daemon
+    thread so they cannot block the event loop.
     The previous synchronous call prevented FastMCP from responding
     to the MCP ``initialize`` request within the 60-second client
     timeout.
@@ -85,13 +158,19 @@ async def server_lifespan(server: FastMCP):
 
     def _background_update():
         try:
+            _sync_schema_refresh()
+        except Exception as e:
+            sys.stderr.write(
+                f"Warning: Could not check Zotero metadata schema refresh: {e}\n"
+            )
+        try:
             _sync_semantic_update()
         except Exception as e:
             sys.stderr.write(f"Warning: Could not check semantic search auto-update: {e}\n")
 
     threading.Thread(
         target=_background_update,
-        name="zotero-mcp-semantic-auto-update",
+        name="zotero-mcp-background-maintenance",
         daemon=True,
     ).start()
 

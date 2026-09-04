@@ -8,12 +8,14 @@ import time
 from pathlib import Path
 from typing import Any, Literal
 
-from zotero_mcp._atomic_io import atomic_write_json
+from zotero_mcp._atomic_io import atomic_write_json, durable_unlink
 from zotero_mcp._file_lock import advisory_file_lock
 
 SchemaSource = Literal["auto", "local", "web"]
 
 WEB_SCHEMA_URL = "https://api.zotero.org/schema"
+DEFAULT_AUTO_REFRESH_INTERVAL_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_FAILED_REFRESH_BACKOFF_SECONDS = 24 * 60 * 60
 
 # Zotero's schema uses these type-specific fields for otherwise generic base
 # fields. Keeping this table local makes reads and writes correct offline; the
@@ -81,6 +83,11 @@ def _cache_directory() -> Path:
 def cache_path(source: SchemaSource = "auto") -> Path:
     resolved = resolve_source(source)
     return _cache_directory() / f"schema-{resolved}.json"
+
+
+def failed_attempt_path(source: SchemaSource = "auto") -> Path:
+    resolved = resolve_source(source)
+    return _cache_directory() / f"schema-{resolved}.last-attempt.json"
 
 
 def _valid_alias_table(value: Any, *, source: str | None = None) -> bool:
@@ -213,52 +220,119 @@ def _http_get(url: str, headers: dict[str, str]):
     )
 
 
+def _result(
+    status: str,
+    source: Literal["local", "web"],
+    table: dict[str, Any] | None,
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "source": source,
+        "schema_version": table.get("version") if table else None,
+        "zotero_version": table.get("zotero_version") if table else None,
+        "cache_path": str(cache_path(source)),
+        **extra,
+    }
+
+
+def _refresh_locked(
+    resolved: Literal["local", "web"],
+    existing: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Refresh one source while its cache lock is already held."""
+    global _table_cache
+    path = cache_path(resolved)
+    headers = {"Zotero-API-Version": "3", "Accept": "application/json"}
+    if resolved == "web" and existing and existing.get("etag"):
+        headers["If-None-Match"] = str(existing["etag"])
+    response = _http_get(_schema_url(resolved), headers)
+    if response.status_code == 304 and existing is not None:
+        existing["checked_at"] = time.time()
+        atomic_write_json(path, existing, indent=2, mode=0o600)
+        _table_cache.pop(resolved, None)
+        return _result("unchanged", resolved, existing)
+    response.raise_for_status()
+    table = _build_table(
+        response.json(),
+        source=resolved,
+        zotero_version=response.headers.get("X-Zotero-Version"),
+        etag=response.headers.get("ETag"),
+    )
+    status = (
+        "unchanged"
+        if existing
+        and existing.get("version") == table["version"]
+        and existing.get("aliases") == table["aliases"]
+        else "refreshed"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, table, indent=2, mode=0o600)
+    _table_cache.pop(resolved, None)
+    return _result(status, resolved, table)
+
+
 def refresh(source: SchemaSource = "auto") -> dict[str, Any]:
     """Manually refresh the local- or web-specific metadata schema cache."""
-    global _table_cache
     resolved = resolve_source(source)
     path = cache_path(resolved)
     with advisory_file_lock(path.with_suffix(".lock"), exclusive=True):
+        result = _refresh_locked(resolved, _read_cache(resolved))
+        durable_unlink(failed_attempt_path(resolved))
+        return result
+
+
+def _read_failed_attempt(source: Literal["local", "web"]) -> float | None:
+    try:
+        value = json.loads(failed_attempt_path(source).read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            return None
+        attempted_at = value.get("attempted_at")
+        return float(attempted_at)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def refresh_if_due(
+    source: SchemaSource = "auto",
+    *,
+    interval_seconds: float = DEFAULT_AUTO_REFRESH_INTERVAL_SECONDS,
+    failure_backoff_seconds: float = DEFAULT_FAILED_REFRESH_BACKOFF_SECONDS,
+) -> dict[str, Any]:
+    """Refresh a source when stale, retaining the last good cache on failure."""
+    resolved = resolve_source(source)
+    path = cache_path(resolved)
+    now = time.time()
+    interval = max(0.0, float(interval_seconds))
+    backoff = max(0.0, float(failure_backoff_seconds))
+
+    with advisory_file_lock(path.with_suffix(".lock"), exclusive=True):
         existing = _read_cache(resolved)
-        headers = {"Zotero-API-Version": "3", "Accept": "application/json"}
-        if resolved == "web" and existing and existing.get("etag"):
-            headers["If-None-Match"] = str(existing["etag"])
-        response = _http_get(_schema_url(resolved), headers)
-        if response.status_code == 304 and existing is not None:
-            existing["checked_at"] = time.time()
-            atomic_write_json(path, existing, indent=2, mode=0o600)
-            _table_cache.pop(resolved, None)
-            return {
-                "status": "unchanged",
-                "source": resolved,
-                "schema_version": existing.get("version"),
-                "zotero_version": existing.get("zotero_version"),
-                "cache_path": str(path),
-            }
-        response.raise_for_status()
-        table = _build_table(
-            response.json(),
-            source=resolved,
-            zotero_version=response.headers.get("X-Zotero-Version"),
-            etag=response.headers.get("ETag"),
-        )
-        status = (
-            "unchanged"
-            if existing
-            and existing.get("version") == table["version"]
-            and existing.get("aliases") == table["aliases"]
-            else "refreshed"
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(path, table, indent=2, mode=0o600)
-        _table_cache.pop(resolved, None)
-        return {
-            "status": status,
-            "source": resolved,
-            "schema_version": table["version"],
-            "zotero_version": table.get("zotero_version"),
-            "cache_path": str(path),
-        }
+        checked_at = existing.get("checked_at") if existing else None
+        if isinstance(checked_at, (int, float)) and now - checked_at < interval:
+            return _result("not_due", resolved, existing)
+
+        attempted_at = _read_failed_attempt(resolved)
+        if attempted_at is not None and now - attempted_at < backoff:
+            return _result(
+                "backoff",
+                resolved,
+                existing,
+                retry_after=max(0.0, attempted_at + backoff),
+            )
+
+        try:
+            result = _refresh_locked(resolved, existing)
+        except Exception as exc:
+            atomic_write_json(
+                failed_attempt_path(resolved),
+                {"attempted_at": now},
+                indent=2,
+                mode=0o600,
+            )
+            return _result("error", resolved, existing, error=str(exc))
+        durable_unlink(failed_attempt_path(resolved))
+        return result
 
 
 def resolve_field(item_type: str, field: str) -> str:

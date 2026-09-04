@@ -6,7 +6,13 @@ from unittest.mock import patch
 
 import pytest
 
+from zotero_mcp import _app
 from zotero_mcp._app import server_lifespan
+
+
+@pytest.fixture(autouse=True)
+def disable_live_schema_refresh(monkeypatch):
+    monkeypatch.setattr(_app, "_sync_schema_refresh", lambda: None)
 
 
 @pytest.mark.asyncio
@@ -55,3 +61,22 @@ async def test_lifespan_yields_when_config_missing():
     with patch("zotero_mcp._app._sync_semantic_update", noop_update):
         async with server_lifespan(None) as ctx:
             assert ctx == {}
+
+
+@pytest.mark.asyncio
+async def test_schema_refresh_failure_does_not_skip_semantic_update(monkeypatch):
+    semantic_started = threading.Event()
+
+    def exploding_refresh():
+        raise RuntimeError("Zotero is offline")
+
+    monkeypatch.setattr(_app, "_sync_schema_refresh", exploding_refresh)
+    monkeypatch.setattr(
+        _app,
+        "_sync_semantic_update",
+        semantic_started.set,
+    )
+
+    async with server_lifespan(None):
+        await asyncio.sleep(0.05)
+        assert semantic_started.is_set()

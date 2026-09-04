@@ -130,6 +130,118 @@ def test_invalid_refresh_never_replaces_last_good_cache(monkeypatch):
     assert cache.read_bytes() == original
 
 
+def test_automatic_refresh_skips_a_fresh_cache(monkeypatch):
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setattr(schema.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(
+        schema,
+        "_http_get",
+        lambda _url, _headers: _Response(_schema_document()),
+    )
+    schema.refresh(source="local")
+
+    def unexpected_request(_url, _headers):
+        raise AssertionError("fresh schemas must not be requested again")
+
+    monkeypatch.setattr(schema, "_http_get", unexpected_request)
+    result = schema.refresh_if_due(
+        source="local",
+        interval_seconds=60,
+    )
+
+    assert result["status"] == "not_due"
+    assert result["schema_version"] == 44
+
+
+def test_automatic_refresh_updates_a_stale_cache(monkeypatch):
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    now = {"value": 1000.0}
+    monkeypatch.setattr(schema.time, "time", lambda: now["value"])
+    monkeypatch.setattr(
+        schema,
+        "_http_get",
+        lambda _url, _headers: _Response(_schema_document()),
+    )
+    schema.refresh(source="local")
+    now["value"] = 1061.0
+    monkeypatch.setattr(
+        schema,
+        "_http_get",
+        lambda _url, _headers: _Response(_schema_document(version=45)),
+    )
+
+    result = schema.refresh_if_due(
+        source="local",
+        interval_seconds=60,
+    )
+
+    assert result["status"] == "refreshed"
+    assert result["schema_version"] == 45
+
+
+def test_automatic_refresh_failure_backs_off_without_replacing_cache(monkeypatch):
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    now = {"value": 1000.0}
+    monkeypatch.setattr(schema.time, "time", lambda: now["value"])
+    monkeypatch.setattr(
+        schema,
+        "_http_get",
+        lambda _url, _headers: _Response(_schema_document()),
+    )
+    schema.refresh(source="local")
+    cache = schema.cache_path("local")
+    original = cache.read_bytes()
+    now["value"] = 1061.0
+    calls = {"count": 0}
+
+    def failed_request(_url, _headers):
+        calls["count"] += 1
+        raise RuntimeError("Zotero is offline")
+
+    monkeypatch.setattr(schema, "_http_get", failed_request)
+    failed = schema.refresh_if_due(
+        source="local",
+        interval_seconds=60,
+        failure_backoff_seconds=300,
+    )
+    now["value"] = 1100.0
+    backed_off = schema.refresh_if_due(
+        source="local",
+        interval_seconds=60,
+        failure_backoff_seconds=300,
+    )
+
+    assert failed["status"] == "error"
+    assert failed["schema_version"] == 44
+    assert backed_off["status"] == "backoff"
+    assert calls["count"] == 1
+    assert cache.read_bytes() == original
+    assert schema.failed_attempt_path("local").exists()
+
+
+def test_manual_refresh_bypasses_and_clears_automatic_failure_backoff(monkeypatch):
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setattr(schema.time, "time", lambda: 1000.0)
+
+    def failed_request(_url, _headers):
+        raise RuntimeError("Zotero is offline")
+
+    monkeypatch.setattr(schema, "_http_get", failed_request)
+    failed = schema.refresh_if_due(source="local")
+    assert failed["status"] == "error"
+    assert schema.failed_attempt_path("local").exists()
+
+    monkeypatch.setattr(
+        schema,
+        "_http_get",
+        lambda _url, _headers: _Response(_schema_document()),
+    )
+    refreshed = schema.refresh(source="local")
+
+    assert refreshed["status"] == "refreshed"
+    assert not schema.failed_attempt_path("local").exists()
+
+
 def test_corrupt_source_cache_falls_back_to_static_floor(monkeypatch):
     monkeypatch.setenv("ZOTERO_LOCAL", "true")
     schema.cache_path("local").write_text('{"source":"local"}')
