@@ -298,6 +298,77 @@ def test_local_file_upload_uses_raw_bytes_and_two_authorized_stages(tmp_path):
     assert "upload=UPLOAD1" in authorized_requests[1].content.decode()
 
 
+def test_failed_local_upload_removes_new_attachment_shell(tmp_path, monkeypatch):
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"payload")
+    zot = LocalWriteZotero.__new__(LocalWriteZotero)
+    zot.client = None
+    deleted = []
+    monkeypatch.setattr(
+        zot,
+        "_attachment_template",
+        lambda _mode: {"itemType": "attachment", "linkMode": "imported_file"},
+    )
+    monkeypatch.setattr(zot, "create_items", lambda _items: {"success": {"0": "ATTACH01"}})
+    monkeypatch.setattr(
+        zot,
+        "_upload_local_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("upload broke")),
+    )
+    monkeypatch.setattr(
+        zot,
+        "item",
+        lambda key: {"key": key, "version": 1, "data": {"itemType": "attachment"}},
+    )
+    monkeypatch.setattr(zot, "delete_item", lambda item: deleted.append(item))
+
+    result = zot._create_and_upload_local_attachments(
+        [("Paper", str(source))], parentid="PARENT01"
+    )
+
+    assert result["success"] == []
+    assert result["failure"][0]["key"] == "ATTACH01"
+    assert result["failure"][0]["cleanup"] == "failed attachment shell removed"
+    assert "upload broke" in result["failure"][0]["error"]
+    assert deleted[0]["key"] == "ATTACH01"
+
+
+def test_failed_local_upload_reports_when_shell_cleanup_fails(tmp_path, monkeypatch):
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"payload")
+    zot = LocalWriteZotero.__new__(LocalWriteZotero)
+    zot.client = None
+    monkeypatch.setattr(
+        zot,
+        "_attachment_template",
+        lambda _mode: {"itemType": "attachment", "linkMode": "imported_file"},
+    )
+    monkeypatch.setattr(zot, "create_items", lambda _items: {"success": {"0": "ATTACH01"}})
+    monkeypatch.setattr(
+        zot,
+        "_upload_local_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("upload broke")),
+    )
+    monkeypatch.setattr(
+        zot,
+        "item",
+        lambda key: {"key": key, "version": 1, "data": {"itemType": "attachment"}},
+    )
+    monkeypatch.setattr(
+        zot,
+        "delete_item",
+        lambda _item: (_ for _ in ()).throw(RuntimeError("delete broke")),
+    )
+
+    result = zot._create_and_upload_local_attachments(
+        [("Paper", str(source))], parentid="PARENT01"
+    )
+
+    failure = result["failure"][0]
+    assert failure["cleanup"] == "failed attachment shell may remain"
+    assert failure["cleanup_error"] == "delete broke"
+
+
 def test_local_item_template_is_synthesized_from_supported_schema(monkeypatch):
     zot = LocalWriteZotero.__new__(LocalWriteZotero)
     zot.client = None

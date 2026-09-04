@@ -71,6 +71,18 @@ def _created_attachment_key(result) -> str | None:
     return None
 
 
+def _consume_staged_upload(upload_id: str) -> str | None:
+    """Best-effort cleanup after Zotero has durably accepted an upload."""
+    try:
+        service.consume_upload(upload_id, already_locked=True)
+    except Exception as exc:
+        return (
+            "Zotero accepted the attachment, but staged-upload cleanup failed: "
+            f"{exc}"
+        )
+    return None
+
+
 @mcp.tool(
     name="zotero_list_attachments",
     annotations=READ_ONLY,
@@ -301,91 +313,117 @@ def put_attachment(
     ctx: Context,
 ) -> str:
     try:
-        _, write_zot = _helpers._get_write_client(ctx)
-        manifest, path = service.read_upload(upload_id)
-        current_library = _client.get_current_library()
-        if manifest.get("library") != current_library:
-            raise ValueError("Upload belongs to a different Zotero library")
-        if attachment_key:
-            item = _attachment_item(write_zot, attachment_key)
-            descriptor = service.attachment_descriptor(item)
-            details = {
-                "action": "replace",
-                "attachment_key": attachment_key,
-                "expected_version": descriptor["version"],
-                "expected_md5": descriptor["md5"],
-                "upload_id": upload_id,
-                "parent_item_key": "",
-            }
-            if not operation_id or not confirmation_token:
-                raise ValueError("Replacement requires a prepared operation and confirmation token")
-            service.consume_operation(
-                operation_id,
-                confirmation_token,
-                action="replace",
-                details=details,
+        with service.upload_lock(upload_id):
+            _, write_zot = _helpers._get_write_client(ctx)
+            manifest, path = service.read_upload(
+                upload_id,
+                allow_consumed=not attachment_key and bool(idempotency_key),
             )
-            result = write_zot.upload_attachments(
-                [
-                    {
-                        "key": attachment_key,
-                        "filename": path.name,
-                        "md5": descriptor["md5"] or None,
-                    }
-                ],
-                basedir=str(path.parent),
-            )
-            if result.get("failure"):
-                raise RuntimeError(f"Zotero rejected replacement: {result['failure']}")
-            output_key = attachment_key
-            action = "replaced"
-        else:
-            if not idempotency_key:
-                raise ValueError("Creating an attachment requires idempotency_key")
-            with service.idempotency_lock(idempotency_key):
-                prior = service.idempotency_record(idempotency_key)
-                request_identity = {
-                    "library": current_library,
-                    "parent_item_key": parent_item_key,
-                    "sha256": manifest["sha256"],
-                    "filename": manifest["filename"],
+            current_library = _client.get_current_library()
+            if manifest.get("library") != current_library:
+                raise ValueError("Upload belongs to a different Zotero library")
+            if attachment_key:
+                item = _attachment_item(write_zot, attachment_key)
+                descriptor = service.attachment_descriptor(item)
+                details = {
+                    "action": "replace",
+                    "attachment_key": attachment_key,
+                    "expected_version": descriptor["version"],
+                    "expected_md5": descriptor["md5"],
+                    "upload_id": upload_id,
+                    "parent_item_key": "",
                 }
-                if prior:
-                    if prior.get("request") != request_identity:
-                        raise ValueError("idempotency_key was already used for a different attachment")
-                    prior_key = str(prior.get("attachment_key", ""))
-                    refreshed = _attachment_item(write_zot, prior_key)
-                    return _json(
+                if not operation_id or not confirmation_token:
+                    raise ValueError(
+                        "Replacement requires a prepared operation and confirmation token"
+                    )
+                service.consume_operation(
+                    operation_id,
+                    confirmation_token,
+                    action="replace",
+                    details=details,
+                )
+                result = write_zot.upload_attachments(
+                    [
                         {
+                            "key": attachment_key,
+                            "filename": path.name,
+                            "md5": descriptor["md5"] or None,
+                        }
+                    ],
+                    basedir=str(path.parent),
+                )
+                if result.get("failure"):
+                    raise RuntimeError(
+                        f"Zotero rejected replacement: {result['failure']}"
+                    )
+                output_key = attachment_key
+                action = "replaced"
+            else:
+                if not idempotency_key:
+                    raise ValueError("Creating an attachment requires idempotency_key")
+                with service.idempotency_lock(idempotency_key):
+                    prior = service.idempotency_record(idempotency_key)
+                    request_identity = {
+                        "library": current_library,
+                        "parent_item_key": parent_item_key,
+                        "sha256": manifest["sha256"],
+                        "filename": manifest["filename"],
+                    }
+                    if prior:
+                        if prior.get("request") != request_identity:
+                            raise ValueError(
+                                "idempotency_key was already used for a different attachment"
+                            )
+                        prior_key = str(prior.get("attachment_key", ""))
+                        refreshed = _attachment_item(write_zot, prior_key)
+                        cleanup_warning = _consume_staged_upload(upload_id)
+                        response = {
                             "status": "already-created",
                             "attachment": service.attachment_descriptor(refreshed),
                             "sha256": manifest["sha256"],
                         }
+                        if cleanup_warning:
+                            response["warnings"] = [cleanup_warning]
+                        return _json(response)
+                    if manifest.get("status") == "consumed":
+                        raise ValueError(
+                            "Attachment upload was already consumed by another operation"
+                        )
+                    parent = write_zot.item(parent_item_key)
+                    if not parent or (parent.get("data", {}) or {}).get(
+                        "itemType"
+                    ) == "attachment":
+                        raise ValueError(
+                            "parent_item_key must identify a bibliographic item"
+                        )
+                    result = write_zot.attachment_both(
+                        [(title or manifest["filename"], str(path))],
+                        parentid=parent_item_key,
                     )
-                parent = write_zot.item(parent_item_key)
-                if not parent or (parent.get("data", {}) or {}).get("itemType") == "attachment":
-                    raise ValueError("parent_item_key must identify a bibliographic item")
-                result = write_zot.attachment_both(
-                    [(title or manifest["filename"], str(path))],
-                    parentid=parent_item_key,
-                )
-                output_key = _created_attachment_key(result)
-                if not output_key:
-                    raise RuntimeError(f"Zotero did not create the attachment: {result}")
-                service.save_idempotency_record(
-                    idempotency_key,
-                    {"request": request_identity, "attachment_key": output_key},
-                )
-            action = "created"
-        refreshed = _attachment_item(write_zot, output_key)
-        return _json(
-            {
+                    output_key = _created_attachment_key(result)
+                    if not output_key:
+                        raise RuntimeError(
+                            f"Zotero did not create the attachment: {result}"
+                        )
+                    service.save_idempotency_record(
+                        idempotency_key,
+                        {"request": request_identity, "attachment_key": output_key},
+                    )
+                action = "created"
+            refreshed = _attachment_item(write_zot, output_key)
+            cleanup_warning = _consume_staged_upload(upload_id)
+            response = {
                 "status": action,
                 "attachment": service.attachment_descriptor(refreshed),
                 "sha256": manifest["sha256"],
-                "write_target": getattr(write_zot, "local_endpoint_role", "web-api"),
+                "write_target": getattr(
+                    write_zot, "local_endpoint_role", "web-api"
+                ),
             }
-        )
+            if cleanup_warning:
+                response["warnings"] = [cleanup_warning]
+            return _json(response)
     except Exception as exc:
         context_error(ctx, f"Could not put attachment: {exc}")
         return f"Error: Could not put attachment: {exc}"
@@ -415,7 +453,22 @@ def update_attachment(
         _, write_zot = _helpers._get_write_client(ctx)
         item = _attachment_item(write_zot, attachment_key)
         descriptor = service.attachment_descriptor(item)
+        data = item.get("data", {})
         if parent_item_key is not None and parent_item_key != descriptor["parent_item_key"]:
+            unconfirmed_metadata_changes = [
+                field
+                for field, value in {
+                    "title": title,
+                    "url": url,
+                    "contentType": content_type,
+                }.items()
+                if value is not None and data.get(field) != value
+            ]
+            if unconfirmed_metadata_changes:
+                raise ValueError(
+                    "Reparenting must be committed separately from title, URL, or "
+                    "content-type changes so the confirmation covers the complete mutation"
+                )
             details = {
                 "action": "reparent",
                 "attachment_key": attachment_key,
@@ -432,7 +485,6 @@ def update_attachment(
                 action="reparent",
                 details=details,
             )
-        data = item.get("data", {})
         changes = {
             "title": title,
             "url": url,

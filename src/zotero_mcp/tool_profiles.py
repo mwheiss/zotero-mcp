@@ -13,7 +13,14 @@ from fastmcp.server.middleware import Middleware, MiddlewareContext
 ToolProfile = Literal["auto", "research", "full", "admin", "connector", "all"]
 
 CONNECTOR_TOOLS = {"search", "fetch"}
-LOCAL_PATH_TOOLS = {"zotero_get_attachment_path"}
+LOCAL_PATH_TOOLS = {
+    "zotero_add_from_file",
+    "zotero_get_attachment_path",
+}
+LOCAL_PATH_ARGUMENT_TOOLS = {
+    "zotero_add_by_bibtex",
+    "zotero_add_by_csl_json",
+}
 PDF_TOOLS = {
     "zotero_read_pdf_pages",
     "zotero_get_pdf_outline",
@@ -89,6 +96,17 @@ def write_admin_authorized(presented: str | None) -> bool:
     return bool(expected and presented) and hmac.compare_digest(presented, expected)
 
 
+def local_paths_enabled() -> bool:
+    """Return whether MCP calls may exchange server-local filesystem paths."""
+    opted_in = os.getenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    local = os.getenv("ZOTERO_LOCAL", "").lower() in {"1", "true", "yes"}
+    return opted_in and local
+
+
 def _with_write_secret_parameter(tool):
     if tool.name not in WRITE_TOOLS:
         return tool
@@ -135,15 +153,7 @@ def tool_visible(name: str, profile: str | None = None) -> bool:
         "yes",
     }:
         return False
-    if name in LOCAL_PATH_TOOLS and os.getenv(
-        "ZOTERO_MCP_EXPOSE_LOCAL_PATHS", ""
-    ).lower() not in {"1", "true", "yes"}:
-        return False
-    if name in LOCAL_PATH_TOOLS and os.getenv("ZOTERO_LOCAL", "").lower() not in {
-        "1",
-        "true",
-        "yes",
-    }:
+    if name in LOCAL_PATH_TOOLS and not local_paths_enabled():
         return False
     local = os.getenv("ZOTERO_LOCAL", "").lower() in {"1", "true", "yes"}
     if name in WRITE_TOOLS and (
@@ -199,8 +209,17 @@ class ToolProfileMiddleware(Middleware):
                 f"Tool {name!r} is unavailable in the {profile!r} profile. "
                 "Call zotero_get_capabilities to inspect the active contract."
             )
+        arguments = dict(context.message.arguments or {})
+        if (
+            name in LOCAL_PATH_ARGUMENT_TOOLS
+            and arguments.get("file_path")
+            and not local_paths_enabled()
+        ):
+            raise ToolError(
+                "Server-local citation file paths require local Zotero mode and "
+                "ZOTERO_MCP_EXPOSE_LOCAL_PATHS=true; provide inline citation data instead."
+            )
         if name in WRITE_TOOLS:
-            arguments = dict(context.message.arguments or {})
             presented = arguments.pop("write_secret", None)
             if not write_admin_authorized(presented):
                 raise ToolError(

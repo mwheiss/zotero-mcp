@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import bisect
 import hashlib
 import hmac
 import json
@@ -11,13 +12,14 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from zotero_mcp._atomic_io import atomic_write_json
+from zotero_mcp._atomic_io import atomic_write_json, atomic_write_text
 from zotero_mcp._file_lock import (
     acquire_file_lock,
     advisory_file_lock,
@@ -31,6 +33,11 @@ HARD_MAX_INLINE_SIZE = 32 * 1024 * 1024
 HARD_MAX_RESOURCE_SIZE = 64 * 1024 * 1024
 DEFAULT_STATE_LOCK_TIMEOUT = 45.0
 DEFAULT_TOKEN_TTL = 3600
+DEFAULT_UPLOAD_GC_SCAN_LIMIT = 128
+DEFAULT_UPLOAD_GC_DELETE_LIMIT = 32
+HARD_UPLOAD_GC_SCAN_LIMIT = 4096
+HARD_UPLOAD_GC_DELETE_LIMIT = 512
+MIN_SECRET_BYTES = 32
 
 
 def _state_root() -> Path:
@@ -52,25 +59,33 @@ def _private_file(path: Path) -> None:
 def _secret() -> bytes:
     configured = os.getenv("ZOTERO_MCP_ATTACHMENT_SECRET", "").strip()
     if configured:
-        return configured.encode("utf-8")
+        value = configured.encode("utf-8")
+        if len(value) < MIN_SECRET_BYTES:
+            raise ValueError(
+                f"ZOTERO_MCP_ATTACHMENT_SECRET must be at least {MIN_SECRET_BYTES} bytes"
+            )
+        return value
     path = _state_root() / "secret"
-    try:
-        value = path.read_bytes()
-        if len(value) >= 32:
-            return value
-    except OSError:
-        pass
     path.parent.mkdir(parents=True, exist_ok=True)
-    value = secrets.token_bytes(32)
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return path.read_bytes()
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(value)
-        handle.flush()
-        os.fsync(handle.fileno())
-    return value
+    # Serializing initialization prevents a losing process from reading a file
+    # before the winning process has finished writing it. A short/corrupt
+    # persisted secret is replaced atomically rather than becoming a known HMAC
+    # key (including the empty key).
+    with advisory_file_lock(path.with_suffix(".lock"), exclusive=True):
+        try:
+            value = path.read_bytes()
+        except OSError:
+            value = b""
+        if len(value) >= MIN_SECRET_BYTES:
+            _private_file(path)
+            return value
+        generated = secrets.token_bytes(MIN_SECRET_BYTES).hex()
+        atomic_write_text(path, generated, mode=0o600)
+        _private_file(path)
+        value = path.read_bytes()
+        if len(value) < MIN_SECRET_BYTES:  # defensive fail-closed check
+            raise RuntimeError("Attachment capability secret initialization failed")
+        return value
 
 
 def _b64encode(value: bytes) -> str:
@@ -328,6 +343,7 @@ def prepare_upload(
     *,
     library: dict[str, str],
 ) -> dict[str, Any]:
+    garbage_collect_uploads()
     if size < 0 or size > max_upload_size():
         raise ValueError(f"Upload size must be between 0 and {max_upload_size()} bytes")
     digest = sha256.strip().lower()
@@ -372,15 +388,42 @@ def upload_directory(upload_id: str) -> Path:
     return _state_root() / "uploads" / upload_id
 
 
-def read_upload(upload_id: str, *, require_ready: bool = True) -> tuple[dict[str, Any], Path]:
+def upload_lock_path(upload_id: str) -> Path:
+    upload_directory(upload_id)  # validate the identifier
+    return _state_root() / "upload-locks" / f"{upload_id}.lock"
+
+
+@contextmanager
+def upload_lock(upload_id: str, *, blocking: bool = True):
+    """Serialize upload, consumption, and garbage collection for one upload."""
+    path = upload_lock_path(upload_id)
+    with advisory_file_lock(path, exclusive=True, blocking=blocking) as lock_file:
+        yield lock_file
+
+
+def read_upload(
+    upload_id: str,
+    *,
+    require_ready: bool = True,
+    allow_consumed: bool = False,
+) -> tuple[dict[str, Any], Path]:
     directory = upload_directory(upload_id)
     try:
         manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("Unknown or expired attachment upload") from exc
-    if int(manifest.get("expires_at", 0)) < int(time.time()):
+    if not isinstance(manifest, dict):
+        raise ValueError("Attachment upload manifest is invalid")
+    try:
+        expires_at = int(manifest.get("expires_at", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Attachment upload manifest has an invalid expiry") from exc
+    if expires_at < int(time.time()):
         raise ValueError("Attachment upload has expired")
-    if require_ready and manifest.get("status") != "ready":
+    status = manifest.get("status")
+    if require_ready and status != "ready" and not (
+        allow_consumed and status == "consumed"
+    ):
         raise ValueError("Attachment upload has not completed")
     return manifest, directory / safe_filename(manifest.get("filename", ""))
 
@@ -397,6 +440,130 @@ def mark_upload_ready(upload_id: str, *, size: int, sha256: str) -> dict[str, An
     atomic_write_json(path, manifest, indent=2)
     _private_file(path)
     return manifest
+
+
+def consume_upload(upload_id: str, *, already_locked: bool = False) -> dict[str, Any]:
+    """Remove staged bytes after a successful Zotero mutation.
+
+    A small consumed manifest is retained until its normal expiry so an
+    idempotent create retry can still resolve to the previously created item.
+    Failed Zotero operations never call this function, leaving their bytes
+    available for retry.
+    """
+
+    def _consume() -> dict[str, Any]:
+        manifest, payload = read_upload(
+            upload_id,
+            require_ready=True,
+            allow_consumed=True,
+        )
+        if manifest.get("status") == "consumed":
+            return manifest
+        manifest["status"] = "consumed"
+        manifest["consumed_at"] = int(time.time())
+        path = upload_directory(upload_id) / "manifest.json"
+        atomic_write_json(path, manifest, indent=2)
+        _private_file(path)
+        # Persist the tombstone before unlinking bytes. A crash can then leave
+        # an expired file for GC, but can never leave a ready manifest pointing
+        # at bytes that were already removed.
+        payload.unlink(missing_ok=True)
+        payload.with_suffix(payload.suffix + ".partial").unlink(missing_ok=True)
+        return manifest
+
+    if already_locked:
+        return _consume()
+    with upload_lock(upload_id):
+        return _consume()
+
+
+def _positive_bounded_int(name: str, default: int, hard_max: int) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(1, min(value, hard_max))
+
+
+def garbage_collect_uploads(*, now: int | None = None) -> dict[str, int]:
+    """Delete expired uploads with fair, bounded manifest/deletion work."""
+    root = _state_root() / "uploads"
+    scan_limit = _positive_bounded_int(
+        "ZOTERO_MCP_ATTACHMENT_GC_SCAN_LIMIT",
+        DEFAULT_UPLOAD_GC_SCAN_LIMIT,
+        HARD_UPLOAD_GC_SCAN_LIMIT,
+    )
+    delete_limit = _positive_bounded_int(
+        "ZOTERO_MCP_ATTACHMENT_GC_DELETE_LIMIT",
+        DEFAULT_UPLOAD_GC_DELETE_LIMIT,
+        HARD_UPLOAD_GC_DELETE_LIMIT,
+    )
+    current = int(time.time()) if now is None else int(now)
+    scanned = deleted = 0
+    try:
+        with os.scandir(root) as entries:
+            names = sorted(
+                entry.name
+                for entry in entries
+                if entry.is_dir(follow_symlinks=False)
+            )
+    except OSError:
+        return {"scanned": 0, "deleted": 0}
+    if not names:
+        return {"scanned": 0, "deleted": 0}
+
+    cursor_path = _state_root() / "upload-gc-cursor"
+    try:
+        previous = cursor_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        previous = ""
+    start = bisect.bisect_right(names, previous) if previous else 0
+    ordered = names[start:] + names[:start]
+    candidates = ordered[:scan_limit]
+
+    last_scanned = ""
+    for upload_id in candidates:
+        if deleted >= delete_limit:
+            break
+        scanned += 1
+        last_scanned = upload_id
+        remove_lock = False
+        try:
+            with upload_lock(upload_id, blocking=False) as lock_file:
+                if lock_file is None:
+                    continue
+                directory = upload_directory(upload_id)
+                try:
+                    manifest = json.loads(
+                        (directory / "manifest.json").read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    # Do not infer expiry for malformed state; an operator can
+                    # inspect it without a background call destroying evidence.
+                    continue
+                if not isinstance(manifest, dict):
+                    continue
+                try:
+                    expires_at = int(manifest.get("expires_at", 0))
+                except (TypeError, ValueError):
+                    continue
+                if expires_at >= current:
+                    continue
+                shutil.rmtree(directory, ignore_errors=False)
+                deleted += 1
+                remove_lock = True
+            if remove_lock:
+                upload_lock_path(upload_id).unlink(missing_ok=True)
+        except (OSError, ValueError):
+            continue
+
+    # Rotate the next bounded scan past the last candidate, so a stable set of
+    # live directories cannot permanently hide expired entries later in the
+    # directory. The cursor contains only a random upload identifier.
+    if last_scanned:
+        atomic_write_text(cursor_path, last_scanned, mode=0o600)
+    return {"scanned": scanned, "deleted": deleted}
 
 
 def operation_path(operation_id: str) -> Path:

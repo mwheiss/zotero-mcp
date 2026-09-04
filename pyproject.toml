@@ -31,6 +31,8 @@ dependencies = [
     "fastmcp>=2.14.0,<4",
     # Imported directly by client.py and local_api.py.
     "httpx>=0.27",
+    # Avoid the PKCS#7 decryption oracle fixed in cryptography 50.0.0.
+    "cryptography>=50.0.0",
     "unidecode>=1.3.0",
     "bibtexparser>=1.4,<2",
 ]

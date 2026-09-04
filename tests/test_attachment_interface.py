@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import shutil
 import threading
 import time
@@ -27,6 +28,7 @@ from zotero_mcp.server import (
     prepare_attachment_change,
     put_attachment,
     set_attachment_trashed,
+    update_attachment,
 )
 
 
@@ -177,6 +179,28 @@ def test_signed_tokens_reject_tampering_and_wrong_action(attachment_state):
         service.verify_token(token, "upload")
     with pytest.raises(ValueError, match="Invalid"):
         service.verify_token(token[:-1] + ("A" if token[-1] != "A" else "B"), "download")
+
+
+def test_capability_secret_rejects_short_configuration(monkeypatch, attachment_state):
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_SECRET", "known-short-key")
+
+    with pytest.raises(ValueError, match="at least 32 bytes"):
+        service.make_token("download", {"attachment_key": "ATTACH01"})
+
+
+def test_capability_secret_atomically_repairs_short_state(attachment_state):
+    secret_path = service._state_root() / "secret"
+    secret_path.parent.mkdir(parents=True)
+    secret_path.write_bytes(b"")
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        values = list(executor.map(lambda _index: service._secret(), range(4)))
+
+    assert len(set(values)) == 1
+    assert len(values[0]) >= service.MIN_SECRET_BYTES
+    assert secret_path.read_bytes() == values[0]
+    if os.name != "nt":
+        assert secret_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio
@@ -454,6 +478,123 @@ def test_put_attachment_idempotency_is_atomic_under_concurrency(
         "created",
         "already-created",
     }
+    manifest, path = service.read_upload(
+        prepared["upload_id"], allow_consumed=True
+    )
+    assert manifest["status"] == "consumed"
+    assert not path.exists()
+
+
+def test_failed_attachment_operation_preserves_staged_bytes(
+    monkeypatch, attachment_state
+):
+    library = {"library_id": "0", "library_type": "user"}
+    prepared, _ = _ready_upload(b"retry me", library)
+
+    class WriteZotero:
+        def item(self, key):
+            if key == "PARENT01":
+                return {"key": key, "data": {"itemType": "journalArticle"}}
+            raise KeyError(key)
+
+        def attachment_both(self, _attachments, parentid=None):
+            return {"failure": [{"error": "temporary Zotero failure"}]}
+
+    zot = WriteZotero()
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._helpers._get_write_client",
+        lambda _ctx: (zot, zot),
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_current_library",
+        lambda: library,
+    )
+
+    result = put_attachment(
+        parent_item_key="PARENT01",
+        upload_id=prepared["upload_id"],
+        idempotency_key="retryable-request",
+        ctx=DummyContext(),
+    )
+
+    assert result.startswith("Error:")
+    manifest, path = service.read_upload(prepared["upload_id"])
+    assert manifest["status"] == "ready"
+    assert path.read_bytes() == b"retry me"
+
+
+def test_expired_upload_gc_is_bounded_and_preserves_live_uploads(
+    monkeypatch, attachment_state
+):
+    library = {"library_id": "0", "library_type": "user"}
+    expired = []
+    for index in range(3):
+        prepared, _ = _ready_upload(f"expired-{index}".encode(), library)
+        expired.append(prepared["upload_id"])
+    live, _ = _ready_upload(b"live", library)
+    for upload_id in expired:
+        manifest_path = service.upload_directory(upload_id) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["expires_at"] = 10
+        manifest_path.write_text(json.dumps(manifest))
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_GC_DELETE_LIMIT", "2")
+
+    result = service.garbage_collect_uploads(now=20)
+
+    assert result["deleted"] == 2
+    remaining = [
+        value for value in expired if service.upload_directory(value).exists()
+    ]
+    assert len(remaining) == 1
+    for value in expired:
+        if value not in remaining:
+            assert not service.upload_lock_path(value).exists()
+    assert service.upload_directory(live["upload_id"]).exists()
+
+
+def test_expired_upload_gc_rotates_past_live_directories(
+    monkeypatch, attachment_state
+):
+    uploads = service._state_root() / "uploads"
+    for upload_id, expires_at in (("AAA", 100), ("BBB", 100), ("CCC", 10)):
+        directory = uploads / upload_id
+        directory.mkdir(parents=True)
+        (directory / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "upload_id": upload_id,
+                    "filename": "payload.bin",
+                    "expires_at": expires_at,
+                    "status": "ready",
+                }
+            )
+        )
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_GC_SCAN_LIMIT", "1")
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_GC_DELETE_LIMIT", "1")
+
+    assert service.garbage_collect_uploads(now=20)["deleted"] == 0
+    assert service.garbage_collect_uploads(now=20)["deleted"] == 0
+    assert service.garbage_collect_uploads(now=20)["deleted"] == 1
+    assert not (uploads / "CCC").exists()
+
+
+def test_upload_gc_skips_corrupt_expiry_without_blocking_new_uploads(
+    monkeypatch, attachment_state
+):
+    directory = service._state_root() / "uploads" / "BROKEN"
+    directory.mkdir(parents=True)
+    (directory / "manifest.json").write_text('{"expires_at": null}')
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_GC_SCAN_LIMIT", "1")
+
+    assert service.garbage_collect_uploads(now=20) == {"scanned": 1, "deleted": 0}
+    prepared = service.prepare_upload(
+        "paper.pdf",
+        "application/pdf",
+        3,
+        "0" * 64,
+        library={"library_id": "0", "library_type": "user"},
+    )
+    assert prepared["status"] == "prepared"
 
 
 def test_inline_and_resource_limits_are_configurable_and_bounded(
@@ -614,3 +755,37 @@ def test_trash_requires_confirmation_but_restore_does_not(monkeypatch, attachmen
     )
     assert restored["status"] == "restored"
     assert json.loads(patches[-1]["content"]) == {"deleted": 0}
+
+
+def test_reparent_confirmation_cannot_cover_unpreviewed_metadata_changes(
+    monkeypatch, attachment_state
+):
+    updates = []
+    zot = SimpleNamespace(
+        item=lambda _key: _attachment(version=7, md5="abc"),
+        update_item=lambda item: updates.append(item) or True,
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._helpers._get_write_client",
+        lambda _ctx: (zot, zot),
+    )
+    preview = json.loads(
+        prepare_attachment_change(
+            action="reparent",
+            attachment_key="ATTACH01",
+            parent_item_key="PARENT02",
+            ctx=DummyContext(),
+        )
+    )
+
+    result = update_attachment(
+        attachment_key="ATTACH01",
+        parent_item_key="PARENT02",
+        title="Unpreviewed title",
+        operation_id=preview["operation_id"],
+        confirmation_token=preview["confirmation_token"],
+        ctx=DummyContext(),
+    )
+
+    assert "must be committed separately" in result
+    assert updates == []

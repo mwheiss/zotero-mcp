@@ -78,47 +78,57 @@ async def download_attachment(request: Request) -> Response:
 async def upload_attachment(request: Request) -> Response:
     try:
         claims = service.verify_token(request.path_params["token"], "upload")
-        manifest, target = service.read_upload(
-            str(claims["upload_id"]), require_ready=False
-        )
     except (ValueError, KeyError) as exc:
         return _error(str(exc), 403)
-    if manifest.get("status") == "ready":
-        return _error("Attachment upload is already complete", 409)
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    partial = target.with_suffix(target.suffix + ".partial")
-    digest = hashlib.sha256()
-    received = 0
-    try:
-        with partial.open("wb") as handle:
-            async for chunk in request.stream():
-                received += len(chunk)
-                if received > service.max_upload_size() or received > int(manifest["size"]):
-                    raise ValueError("Attachment upload exceeds the declared size")
-                digest.update(chunk)
-                handle.write(chunk)
-            handle.flush()
-        partial.replace(target)
+    upload_id = str(claims["upload_id"])
+    with service.upload_lock(upload_id, blocking=False) as lock_file:
+        if lock_file is None:
+            return _error("Attachment upload is currently busy", 409)
         try:
-            service.mark_upload_ready(
-                str(manifest["upload_id"]), size=received, sha256=digest.hexdigest()
+            manifest, target = service.read_upload(
+                upload_id, require_ready=False
             )
-        except Exception:
-            target.unlink(missing_ok=True)
-            raise
-        return JSONResponse(
-            {
-                "upload_id": manifest["upload_id"],
-                "status": "ready",
-                "size": received,
-                "sha256": digest.hexdigest(),
-            },
-            status_code=201,
-        )
-    except ValueError as exc:
-        partial.unlink(missing_ok=True)
-        return _error(str(exc), 400)
-    except Exception as exc:
-        partial.unlink(missing_ok=True)
-        return _error(f"Attachment upload failed: {exc}", 500)
+        except ValueError as exc:
+            return _error(str(exc), 403)
+        if manifest.get("status") in {"ready", "consumed"}:
+            return _error("Attachment upload is already complete", 409)
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_suffix(target.suffix + ".partial")
+        digest = hashlib.sha256()
+        received = 0
+        try:
+            with partial.open("wb") as handle:
+                async for chunk in request.stream():
+                    received += len(chunk)
+                    if (
+                        received > service.max_upload_size()
+                        or received > int(manifest["size"])
+                    ):
+                        raise ValueError("Attachment upload exceeds the declared size")
+                    digest.update(chunk)
+                    handle.write(chunk)
+                handle.flush()
+            partial.replace(target)
+            try:
+                service.mark_upload_ready(
+                    upload_id, size=received, sha256=digest.hexdigest()
+                )
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
+            return JSONResponse(
+                {
+                    "upload_id": manifest["upload_id"],
+                    "status": "ready",
+                    "size": received,
+                    "sha256": digest.hexdigest(),
+                },
+                status_code=201,
+            )
+        except ValueError as exc:
+            partial.unlink(missing_ok=True)
+            return _error(str(exc), 400)
+        except Exception as exc:
+            partial.unlink(missing_ok=True)
+            return _error(f"Attachment upload failed: {exc}", 500)

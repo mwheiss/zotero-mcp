@@ -1,7 +1,9 @@
 """Tests for direct WebDAV attachment access."""
 
-from zipfile import ZIP_DEFLATED, ZipFile
+import io
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
+import pytest
 from conftest import skip_on_ci
 
 from zotero_mcp import client, webdav
@@ -13,9 +15,10 @@ class _FailingZotero:
 
 
 class _FakeResponse:
-    def __init__(self, content: bytes, status_code: int = 200):
+    def __init__(self, content: bytes, status_code: int = 200, headers=None):
         self.content = content
         self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -42,8 +45,6 @@ class _FakeSession:
 
 
 def _build_zip_bytes(name: str, content: bytes) -> bytes:
-    import io
-
     buf = io.BytesIO()
     with ZipFile(buf, "w", ZIP_DEFLATED) as zf:
         zf.writestr(name, content)
@@ -115,6 +116,98 @@ def test_extract_archive_rejects_backslash_path_traversal(tmp_path):
         assert "Unsafe path" in str(exc)
     else:
         raise AssertionError("Expected _extract_archive() to reject backslash traversal paths")
+
+
+def test_extract_archive_prevalidates_all_paths_before_writing(tmp_path):
+    buffer = io.BytesIO()
+    with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("safe.txt", b"must not be written")
+        archive.writestr("../escape.txt", b"unsafe")
+
+    with pytest.raises(ValueError, match="Unsafe path"):
+        webdav._extract_archive(buffer.getvalue(), tmp_path, expected_filename=None)
+
+    assert not (tmp_path / "safe.txt").exists()
+
+
+def test_extract_archive_cleans_up_file_directory_prefix_collision(tmp_path):
+    buffer = io.BytesIO()
+    with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("foo", b"first file")
+        archive.writestr("foo/bar.txt", b"cannot coexist")
+
+    with pytest.raises(ValueError, match="file/directory path collision"):
+        webdav._extract_archive(buffer.getvalue(), tmp_path, expected_filename=None)
+
+    assert not (tmp_path / "foo").exists()
+
+
+def test_extract_archive_cleanup_tolerates_preexisting_directory(tmp_path):
+    (tmp_path / "existingdir").mkdir()
+    buffer = io.BytesIO()
+    with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("safe.txt", b"must be cleaned")
+        archive.writestr("existingdir", b"cannot replace a directory")
+
+    with pytest.raises(IsADirectoryError):
+        webdav._extract_archive(buffer.getvalue(), tmp_path, expected_filename=None)
+
+    assert not (tmp_path / "safe.txt").exists()
+    assert (tmp_path / "existingdir").is_dir()
+
+
+def test_extract_archive_enforces_uncompressed_size_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_WEBDAV_MAX_UNCOMPRESSED_BYTES", "8")
+    zip_bytes = _build_zip_bytes("paper.txt", b"nine-byte!")
+
+    with pytest.raises(ValueError, match="uncompressed-size limit"):
+        webdav._extract_archive(zip_bytes, tmp_path, expected_filename="paper.txt")
+
+
+def test_extract_archive_enforces_compression_ratio_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_WEBDAV_MAX_COMPRESSION_RATIO", "2")
+    zip_bytes = _build_zip_bytes("paper.txt", b"A" * 4096)
+
+    with pytest.raises(ValueError, match="compression-ratio limit"):
+        webdav._extract_archive(zip_bytes, tmp_path, expected_filename="paper.txt")
+
+
+def test_extract_archive_enforces_member_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_WEBDAV_MAX_ARCHIVE_MEMBERS", "1")
+    buffer = io.BytesIO()
+    with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("one.txt", b"one")
+        archive.writestr("two.txt", b"two")
+
+    with pytest.raises(ValueError, match="member-count limit"):
+        webdav._extract_archive(buffer.getvalue(), tmp_path, expected_filename=None)
+
+
+def test_extract_archive_rejects_symbolic_links(tmp_path):
+    buffer = io.BytesIO()
+    link = ZipInfo("paper.txt")
+    link.create_system = 3
+    link.external_attr = 0o120777 << 16
+    with ZipFile(buffer, "w") as archive:
+        archive.writestr(link, "elsewhere")
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        webdav._extract_archive(buffer.getvalue(), tmp_path, expected_filename=None)
+
+
+def test_download_attachment_from_webdav_enforces_streamed_size_limit(
+    tmp_path, monkeypatch
+):
+    payload = _build_zip_bytes("paper.pdf", b"PDF")
+    session = _FakeSession(_FakeResponse(payload))
+    monkeypatch.setenv("ZOTERO_WEBDAV_URL", "https://dav.example.com/zotero")
+    monkeypatch.setenv("ZOTERO_WEBDAV_USERNAME", "alice")
+    monkeypatch.setenv("ZOTERO_WEBDAV_PASSWORD", "secret")
+    monkeypatch.setenv("ZOTERO_MCP_WEBDAV_MAX_DOWNLOAD_BYTES", "8")
+    monkeypatch.setattr("requests.Session", lambda: session)
+
+    with pytest.raises(ValueError, match="download-size limit"):
+        webdav.download_attachment_from_webdav("ABCD1234", tmp_path)
 
 
 # ---------------------------------------------------------------------------

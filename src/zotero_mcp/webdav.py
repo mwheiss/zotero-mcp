@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
-import shutil
+import stat
 import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -14,6 +14,14 @@ from urllib.parse import quote
 import requests
 
 _PLACEHOLDER_PREFIX = "REPLACE_WITH_YOUR_"
+DEFAULT_MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_COMPRESSION_RATIO = 200.0
+DEFAULT_MAX_ARCHIVE_MEMBERS = 1024
+HARD_MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
+HARD_MAX_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
+HARD_MAX_COMPRESSION_RATIO = 1000.0
+HARD_MAX_ARCHIVE_MEMBERS = 4096
 
 
 class WebDAVNotConfiguredError(RuntimeError):
@@ -43,6 +51,67 @@ def get_webdav_config() -> tuple[str, str, str] | None:
 def is_webdav_configured() -> bool:
     """Return True when direct WebDAV access is configured."""
     return get_webdav_config() is not None
+
+
+def _bounded_int_setting(
+    name: str,
+    default: int,
+    hard_max: int,
+    *,
+    fallback_name: str | None = None,
+) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw and fallback_name:
+        raw = os.getenv(fallback_name, "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(1, min(value, hard_max))
+
+
+def _bounded_float_setting(name: str, default: float, hard_max: float) -> float:
+    raw = os.getenv(name, "").strip()
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        value = default
+    if not value > 0:
+        value = default
+    return min(value, hard_max)
+
+
+def max_download_bytes() -> int:
+    return _bounded_int_setting(
+        "ZOTERO_MCP_WEBDAV_MAX_DOWNLOAD_BYTES",
+        DEFAULT_MAX_DOWNLOAD_BYTES,
+        HARD_MAX_DOWNLOAD_BYTES,
+        fallback_name="ZOTERO_MCP_REMOTE_DOWNLOAD_MAX_BYTES",
+    )
+
+
+def max_uncompressed_bytes() -> int:
+    return _bounded_int_setting(
+        "ZOTERO_MCP_WEBDAV_MAX_UNCOMPRESSED_BYTES",
+        DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        HARD_MAX_UNCOMPRESSED_BYTES,
+    )
+
+
+def max_compression_ratio() -> float:
+    return _bounded_float_setting(
+        "ZOTERO_MCP_WEBDAV_MAX_COMPRESSION_RATIO",
+        DEFAULT_MAX_COMPRESSION_RATIO,
+        HARD_MAX_COMPRESSION_RATIO,
+    )
+
+
+def max_archive_members() -> int:
+    return _bounded_int_setting(
+        "ZOTERO_MCP_WEBDAV_MAX_ARCHIVE_MEMBERS",
+        DEFAULT_MAX_ARCHIVE_MEMBERS,
+        HARD_MAX_ARCHIVE_MEMBERS,
+    )
 
 
 def _select_primary_member(
@@ -82,22 +151,81 @@ def _extract_archive(
         archive_file = archive_source
 
     with zipfile.ZipFile(archive_file) as zf:
-        members = [info for info in zf.infolist() if not info.is_dir()]
+        archive_members = zf.infolist()
+        if len(archive_members) > max_archive_members():
+            raise ValueError(
+                "WebDAV archive exceeds the configured member-count limit"
+            )
+        members = [info for info in archive_members if not info.is_dir()]
         if not members:
             raise ValueError("WebDAV archive contained no files")
 
-        extracted_paths: dict[str, Path] = {}
+        total_declared = sum(info.file_size for info in members)
+        if total_declared > max_uncompressed_bytes():
+            raise ValueError(
+                "WebDAV archive exceeds the configured uncompressed-size limit"
+            )
+        ratio_limit = max_compression_ratio()
+        validated_members: list[tuple[zipfile.ZipInfo, Path]] = []
+        destination_names: set[str] = set()
         for info in members:
+            ratio = info.file_size / max(1, info.compress_size)
+            if ratio > ratio_limit:
+                raise ValueError(
+                    "WebDAV archive member exceeds the configured compression-ratio limit"
+                )
+            unix_mode = info.external_attr >> 16
+            if stat.S_ISLNK(unix_mode):
+                raise ValueError(
+                    f"Unsafe symbolic link in WebDAV archive: {info.filename}"
+                )
             normalized_name = info.filename.replace("\\", "/")
             relative = Path(PurePosixPath(normalized_name))
             if relative.is_absolute() or ".." in relative.parts:
                 raise ValueError(f"Unsafe path in WebDAV archive: {info.filename}")
+            normalized_destination = relative.as_posix()
+            if normalized_destination in destination_names:
+                raise ValueError(
+                    f"Duplicate path in WebDAV archive: {info.filename}"
+                )
+            destination_names.add(normalized_destination)
+            validated_members.append((info, relative))
 
-            output_path = destination / relative
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info) as source, open(output_path, "wb") as target:
-                shutil.copyfileobj(source, target)
-            extracted_paths[info.filename] = output_path
+        destination_parts = {tuple(path.parts) for _, path in validated_members}
+        for parts in destination_parts:
+            if any(parts[:index] in destination_parts for index in range(1, len(parts))):
+                raise ValueError(
+                    "WebDAV archive contains a file/directory path collision"
+                )
+
+        extracted_paths: dict[str, Path] = {}
+        total_written = 0
+        output_path: Path | None = None
+        try:
+            for info, relative in validated_members:
+                output_path = destination / relative
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as source, open(output_path, "wb") as target:
+                    while chunk := source.read(64 * 1024):
+                        total_written += len(chunk)
+                        if total_written > max_uncompressed_bytes():
+                            raise ValueError(
+                                "WebDAV archive exceeded the configured "
+                                "uncompressed-size limit while extracting"
+                            )
+                        target.write(chunk)
+                extracted_paths[info.filename] = output_path
+        except Exception:
+            cleanup_paths = [*extracted_paths.values()]
+            if output_path is not None:
+                cleanup_paths.append(output_path)
+            for cleanup_path in cleanup_paths:
+                try:
+                    if cleanup_path.is_file() or cleanup_path.is_symlink():
+                        cleanup_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
 
         selected = _select_primary_member(members, expected_filename)
         return extracted_paths[selected.filename]
@@ -245,10 +373,26 @@ def download_attachment_from_webdav(
         if response.status_code == 404:
             raise FileNotFoundError(f"Attachment {attachment_key} was not found in WebDAV storage")
         response.raise_for_status()
+        content_length = getattr(response, "headers", {}).get("Content-Length")
+        if content_length:
+            try:
+                declared_size = int(content_length)
+            except (TypeError, ValueError):
+                declared_size = 0
+            if declared_size > max_download_bytes():
+                raise ValueError(
+                    "WebDAV archive exceeds the configured download-size limit"
+                )
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_zip:
             temp_zip_path = temp_zip.name
+            received = 0
             for chunk in response.iter_content(chunk_size=1024 * 64):
                 if chunk:
+                    received += len(chunk)
+                    if received > max_download_bytes():
+                        raise ValueError(
+                            "WebDAV archive exceeded the configured download-size limit"
+                        )
                     temp_zip.write(chunk)
         return _extract_archive(temp_zip_path, destination_dir, expected_filename)
     finally:

@@ -500,7 +500,29 @@ class LocalWriteZotero(zotero.Zotero):
                 result["failure"].append({**template, "error": failures.get(str(index), "creation failed")})
                 continue
             attached = {**template, "key": key}
-            uploaded = self._upload_local_file(key, source_paths[index])
+            try:
+                uploaded = self._upload_local_file(key, source_paths[index])
+            except Exception as upload_error:
+                failure = {
+                    **attached,
+                    "error": f"file upload failed: {upload_error}",
+                    "cleanup": "failed attachment shell removed",
+                }
+                try:
+                    created_item = self.item(key)
+                    if not created_item:
+                        raise RuntimeError("created attachment could not be reloaded")
+                    cleanup_response = self.delete_item(created_item)
+                    cleanup_status = getattr(cleanup_response, "status_code", None)
+                    if cleanup_status is not None and not 200 <= cleanup_status < 300:
+                        raise RuntimeError(
+                            f"Zotero returned HTTP {cleanup_status} during cleanup"
+                        )
+                except Exception as cleanup_error:
+                    failure["cleanup"] = "failed attachment shell may remain"
+                    failure["cleanup_error"] = str(cleanup_error)
+                result["failure"].append(failure)
+                continue
             result["success" if uploaded else "unchanged"].append(attached)
         return result
 

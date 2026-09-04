@@ -90,6 +90,7 @@ def test_all_profile_still_enforces_path_and_write_capabilities(monkeypatch):
     assert "search" in names
     assert "fetch" in names
     assert "zotero_get_attachment_path" not in names
+    assert "zotero_add_from_file" not in names
     assert "zotero_add_by_doi" in names
 
 
@@ -98,7 +99,61 @@ def test_all_profile_exposes_paths_only_with_explicit_local_opt_in(monkeypatch):
     monkeypatch.setenv("ZOTERO_LOCAL", "true")
     monkeypatch.setenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", "true")
 
-    assert "zotero_get_attachment_path" in _listed_tool_names()
+    names = _listed_tool_names()
+    assert "zotero_get_attachment_path" in names
+    assert "zotero_add_from_file" in names
+
+
+def test_citation_import_local_path_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "full")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_MCP_WRITE_SECRET", "correct-secret")
+    monkeypatch.delenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", raising=False)
+    middleware = ToolProfileMiddleware()
+
+    async def unexpected(_context):
+        raise AssertionError("local file path reached the tool without opt-in")
+
+    context = MiddlewareContext(
+        message=CallToolRequestParams(
+            name="zotero_add_by_bibtex",
+            arguments={
+                "file_path": "/srv/imports/references.bib",
+                "write_secret": "correct-secret",
+            },
+        ),
+        method="tools/call",
+    )
+
+    with pytest.raises(ToolError, match="ZOTERO_MCP_EXPOSE_LOCAL_PATHS"):
+        asyncio.run(middleware.on_call_tool(context, unexpected))
+
+
+def test_citation_import_inline_input_does_not_require_path_opt_in(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_TOOL_PROFILE", "full")
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_MCP_WRITE_SECRET", "correct-secret")
+    monkeypatch.delenv("ZOTERO_MCP_EXPOSE_LOCAL_PATHS", raising=False)
+    middleware = ToolProfileMiddleware()
+    seen = {}
+
+    async def execute(context):
+        seen.update(context.message.arguments)
+        return "ok"
+
+    context = MiddlewareContext(
+        message=CallToolRequestParams(
+            name="zotero_add_by_bibtex",
+            arguments={
+                "bibtex": "@article{x, title={Inline}}",
+                "write_secret": "correct-secret",
+            },
+        ),
+        method="tools/call",
+    )
+
+    assert asyncio.run(middleware.on_call_tool(context, execute)) == "ok"
+    assert seen == {"bibtex": "@article{x, title={Inline}}"}
 
 
 def test_annotation_authoring_requires_pdf_or_epub_dependency(monkeypatch):
