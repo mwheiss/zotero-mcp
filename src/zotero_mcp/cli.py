@@ -447,6 +447,25 @@ def main():
         help="Private JSON authorization store to import",
     )
 
+    schema_refresh_parser = subparsers.add_parser(
+        "schema-refresh",
+        help="Refresh cached Zotero item-type/base-field metadata",
+    )
+    schema_refresh_parser.add_argument(
+        "--source",
+        choices=["auto", "local", "web"],
+        default="auto",
+        help=(
+            "Schema source: auto uses the desktop API in local mode and "
+            "api.zotero.org otherwise"
+        ),
+    )
+    schema_refresh_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+
     # Update database command
     update_db_parser = subparsers.add_parser("update-db", help="Update semantic search database")
     update_db_parser.add_argument("--force-rebuild", action="store_true",
@@ -735,6 +754,43 @@ def main():
             "Imported remembered Local API authorization for server ID(s): "
             + ", ".join(server_ids)
         )
+        sys.exit(0)
+
+    elif args.command == "schema-refresh":
+        setup_zotero_environment()
+        from zotero_mcp import schema
+
+        try:
+            result = schema.refresh(source=args.source)
+        except Exception as exc:
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "source": args.source,
+                            "error": str(exc),
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"Schema refresh failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print("Zotero metadata schema refresh complete:")
+            print(f"- Status: {result['status']}")
+            print(f"- Source: {result['source']}")
+            print(f"- Schema version: {result['schema_version']}")
+            if result.get("zotero_version"):
+                print(f"- Zotero version: {result['zotero_version']}")
+            print(f"- Cache: {result['cache_path']}")
+            print(
+                "Long-running Zotero MCP processes load this cache on their "
+                "next restart."
+            )
         sys.exit(0)
 
     elif args.command == "update-db":
