@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - New attachment creation persists its request identity, expected MD5, and pre-write parent inventory before calling Zotero. A retry after a process crash recovers the unique matching attachment, while absent or ambiguous outcomes fail closed instead of risking a duplicate.
+- Local-mode background updates retain the canonical `user:0` identity even when cloud credentials coexist for fallback, preventing a redundant full reconciliation into a second semantic scope.
 
 ## [1.4.2] - 2026-09-04
 

@@ -241,9 +241,18 @@ def _normalize_library_type(library_type: str) -> str:
 def get_default_library() -> dict[str, str]:
     """Return the process configuration's fixed default library identity."""
     local = os.getenv("ZOTERO_LOCAL", "").lower() in {"true", "yes", "1"}
+    library_type = _normalize_library_type(
+        os.getenv("ZOTERO_LIBRARY_TYPE", "user")
+    )
+    configured_id = os.getenv("ZOTERO_LIBRARY_ID") or ""
+    # Zotero's Local API and every public MCP contract address the personal
+    # library as user:0. A cloud user ID may coexist in the service environment
+    # solely for Web API fallback; it must not fork semantic state or make the
+    # local corpus appear to be a new library.
+    library_id = "0" if local and library_type == "user" else configured_id
     return {
-        "library_id": os.getenv("ZOTERO_LIBRARY_ID") or ("0" if local else ""),
-        "library_type": _normalize_library_type(os.getenv("ZOTERO_LIBRARY_TYPE", "user")),
+        "library_id": library_id,
+        "library_type": library_type,
     }
 
 

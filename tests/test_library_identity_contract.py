@@ -2,6 +2,7 @@
 
 from conftest import DummyContext
 
+from zotero_mcp import client
 from zotero_mcp.tools import retrieval
 
 
@@ -36,6 +37,17 @@ def test_local_library_listing_uses_public_api_identities(monkeypatch):
     assert "`library_id=1234`, `library_type=group`" in result
     assert "`library_id=9`, `library_type=feed`" in result
     assert "libraryID=1" not in result
+
+
+def test_local_default_identity_ignores_cloud_user_id(monkeypatch):
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setenv("ZOTERO_LIBRARY_TYPE", "user")
+    monkeypatch.setenv("ZOTERO_LIBRARY_ID", "20765677")
+
+    assert client.get_default_library() == {
+        "library_id": "0",
+        "library_type": "user",
+    }
 
 
 def test_local_switch_rejects_sqlite_user_library_id(monkeypatch):
