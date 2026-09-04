@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from zotero_mcp._atomic_io import atomic_write_json, atomic_write_text
+from zotero_mcp._atomic_io import atomic_write_json, atomic_write_text, durable_unlink
 from zotero_mcp._file_lock import (
     acquire_file_lock,
     advisory_file_lock,
@@ -572,9 +572,13 @@ def operation_path(operation_id: str) -> Path:
     return _state_root() / "operations" / f"{operation_id}.json"
 
 
-def idempotency_record(key: str) -> dict[str, Any] | None:
+def idempotency_path(key: str) -> Path:
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    path = _state_root() / "idempotency" / f"{digest}.json"
+    return _state_root() / "idempotency" / f"{digest}.json"
+
+
+def idempotency_record(key: str) -> dict[str, Any] | None:
+    path = idempotency_path(key)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else None
@@ -612,11 +616,15 @@ def idempotency_lock(key: str):
 
 
 def save_idempotency_record(key: str, value: dict[str, Any]) -> None:
-    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    path = _state_root() / "idempotency" / f"{digest}.json"
+    path = idempotency_path(key)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_write_json(path, value, indent=2)
     _private_file(path)
+
+
+def clear_idempotency_record(key: str) -> None:
+    """Remove a definitely failed pending record so the request can retry."""
+    durable_unlink(idempotency_path(key))
 
 
 def prepare_operation(action: str, details: dict[str, Any], ttl: int = 900) -> dict[str, Any]:

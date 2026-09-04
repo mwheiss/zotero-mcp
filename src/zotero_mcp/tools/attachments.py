@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import tempfile
+import time
 from typing import Literal
 
 from pyzotero.zotero import build_url
@@ -81,6 +83,56 @@ def _consume_staged_upload(upload_id: str) -> str | None:
             f"{exc}"
         )
     return None
+
+
+def _file_md5(path) -> str:
+    """Return Zotero's content identity for a staged attachment."""
+    digest = hashlib.md5()  # noqa: S324 - Zotero exposes attachment MD5 values
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _parent_attachment_inventory(zot, parent_item_key: str) -> dict[str, dict]:
+    """Return every live direct attachment keyed by Zotero item key."""
+    inventory: dict[str, dict] = {}
+    for child in _helpers._paginate(zot.children, parent_item_key):
+        data = child.get("data", {}) or {}
+        if data.get("itemType") != "attachment":
+            continue
+        key = str(child.get("key") or data.get("key") or "")
+        if key:
+            inventory[key] = child
+    return inventory
+
+
+def _recover_pending_attachment(zot, record: dict) -> str | None:
+    """Resolve a post-crash creation from Zotero without issuing another write."""
+    request = record.get("request") or {}
+    parent_key = str(request.get("parent_item_key") or "")
+    filename = str(request.get("filename") or "")
+    expected_md5 = str(record.get("expected_md5") or "").casefold()
+    baseline = {str(key) for key in record.get("baseline_attachment_keys") or []}
+    if not parent_key or not filename or not expected_md5:
+        return None
+
+    matches: list[str] = []
+    for key, child in _parent_attachment_inventory(zot, parent_key).items():
+        if key in baseline:
+            continue
+        data = child.get("data", {}) or {}
+        if not data.get("filename") or not data.get("md5"):
+            try:
+                data = (_attachment_item(zot, key).get("data", {}) or {})
+            except Exception:
+                continue
+        if (
+            str(data.get("filename") or "") == filename
+            and str(data.get("md5") or "").casefold() == expected_md5
+        ):
+            matches.append(key)
+    return matches[0] if len(matches) == 1 else None
 
 
 @mcp.tool(
@@ -295,7 +347,10 @@ def prepare_attachment_change(
     description=(
         "Commit a staged binary as a new or replacement Zotero attachment. "
         "For creation, provide parent_item_key and upload_id; idempotency_key is "
-        "required. For replacement, also provide attachment_key plus the operation "
+        "required. Creation records a durable pre-write intent and recovers a "
+        "completed post-crash write by comparing the new attachment against its "
+        "pre-write parent inventory; an ambiguous outcome fails closed rather than "
+        "creating a duplicate. For replacement, also provide attachment_key plus the operation "
         "ID and confirmation token from zotero_prepare_attachment_change. Replacement "
         "preserves the attachment key and rechecks its version/hash. Requires "
         "write-admin access and client approval."
@@ -369,13 +424,42 @@ def put_attachment(
                         "parent_item_key": parent_item_key,
                         "sha256": manifest["sha256"],
                         "filename": manifest["filename"],
+                        "title": title or manifest["filename"],
                     }
                     if prior:
-                        if prior.get("request") != request_identity:
+                        prior_request = prior.get("request") or {}
+                        legacy_request = dict(request_identity)
+                        legacy_request.pop("title", None)
+                        if (
+                            prior_request != request_identity
+                            and prior_request != legacy_request
+                        ):
                             raise ValueError(
                                 "idempotency_key was already used for a different attachment"
                             )
                         prior_key = str(prior.get("attachment_key", ""))
+                        if not prior_key:
+                            prior_key = _recover_pending_attachment(
+                                write_zot, prior
+                            ) or ""
+                            if not prior_key:
+                                raise ValueError(
+                                    "A previous attachment creation with this "
+                                    "idempotency_key has an indeterminate outcome. "
+                                    "No duplicate was created. Retry later with the "
+                                    "same key; if it remains unresolved, inspect the "
+                                    "parent attachments before choosing a new key."
+                                )
+                            service.save_idempotency_record(
+                                idempotency_key,
+                                {
+                                    **prior,
+                                    "state": "complete",
+                                    "attachment_key": prior_key,
+                                    "completed_at": int(time.time()),
+                                    "recovered": True,
+                                },
+                            )
                         refreshed = _attachment_item(write_zot, prior_key)
                         cleanup_warning = _consume_staged_upload(upload_id)
                         response = {
@@ -397,18 +481,45 @@ def put_attachment(
                         raise ValueError(
                             "parent_item_key must identify a bibliographic item"
                         )
+                    expected_md5 = _file_md5(path)
+                    baseline_attachment_keys = sorted(
+                        _parent_attachment_inventory(
+                            write_zot, parent_item_key
+                        )
+                    )
+                    service.save_idempotency_record(
+                        idempotency_key,
+                        {
+                            "state": "pending",
+                            "request": request_identity,
+                            "expected_md5": expected_md5,
+                            "baseline_attachment_keys": baseline_attachment_keys,
+                            "started_at": int(time.time()),
+                        },
+                    )
                     result = write_zot.attachment_both(
                         [(title or manifest["filename"], str(path))],
                         parentid=parent_item_key,
                     )
                     output_key = _created_attachment_key(result)
                     if not output_key:
+                        if isinstance(result, dict) and result.get("failure"):
+                            # A structured one-file failure is definitive. The
+                            # local writer also compensates its empty shell.
+                            service.clear_idempotency_record(idempotency_key)
                         raise RuntimeError(
                             f"Zotero did not create the attachment: {result}"
                         )
                     service.save_idempotency_record(
                         idempotency_key,
-                        {"request": request_identity, "attachment_key": output_key},
+                        {
+                            "state": "complete",
+                            "request": request_identity,
+                            "expected_md5": expected_md5,
+                            "baseline_attachment_keys": baseline_attachment_keys,
+                            "attachment_key": output_key,
+                            "completed_at": int(time.time()),
+                        },
                     )
                 action = "created"
             refreshed = _attachment_item(write_zot, output_key)

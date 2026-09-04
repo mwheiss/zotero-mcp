@@ -443,6 +443,9 @@ def test_put_attachment_idempotency_is_atomic_under_concurrency(
                 return _attachment(key=key)
             raise KeyError(key)
 
+        def children(self, _parent_key, **_kwargs):
+            return []
+
         def attachment_both(self, _attachments, parentid=None):
             with self.lock:
                 key = f"NEW{len(self.created) + 1:05d}"
@@ -500,6 +503,9 @@ def test_failed_attachment_operation_preserves_staged_bytes(
         def attachment_both(self, _attachments, parentid=None):
             return {"failure": [{"error": "temporary Zotero failure"}]}
 
+        def children(self, _parent_key, **_kwargs):
+            return []
+
     zot = WriteZotero()
     monkeypatch.setattr(
         "zotero_mcp.tools.attachments._helpers._get_write_client",
@@ -521,6 +527,133 @@ def test_failed_attachment_operation_preserves_staged_bytes(
     manifest, path = service.read_upload(prepared["upload_id"])
     assert manifest["status"] == "ready"
     assert path.read_bytes() == b"retry me"
+    assert service.idempotency_record("retryable-request") is None
+
+
+def test_attachment_creation_recovers_after_crash_before_completion_record(
+    monkeypatch, attachment_state
+):
+    library = {"library_id": "0", "library_type": "user"}
+    payload = b"crash-durable attachment"
+    expected_md5 = hashlib.md5(payload).hexdigest()  # noqa: S324 - Zotero identity
+    prepared, _ = _ready_upload(payload, library)
+
+    class WriteZotero:
+        local_endpoint_role = "server-local"
+
+        def __init__(self):
+            self.created = {}
+            self.create_calls = 0
+
+        def item(self, key):
+            if key == "PARENT01":
+                return {"key": key, "data": {"itemType": "journalArticle"}}
+            return self.created[key]
+
+        def children(self, _parent_key, **_kwargs):
+            return list(self.created.values())
+
+        def attachment_both(self, _attachments, parentid=None):
+            self.create_calls += 1
+            key = "RECOVER1"
+            self.created[key] = _attachment(
+                key=key, md5=expected_md5
+            )
+            return {"success": {"0": key}}
+
+    zot = WriteZotero()
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._helpers._get_write_client",
+        lambda _ctx: (zot, zot),
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_current_library",
+        lambda: library,
+    )
+    original_save = service.save_idempotency_record
+
+    def crash_before_complete(key, value):
+        if value.get("state") == "complete":
+            raise RuntimeError("simulated process crash before completion record")
+        return original_save(key, value)
+
+    monkeypatch.setattr(service, "save_idempotency_record", crash_before_complete)
+    first = put_attachment(
+        parent_item_key="PARENT01",
+        upload_id=prepared["upload_id"],
+        idempotency_key="crash-recovery-key",
+        ctx=DummyContext(),
+    )
+    assert first.startswith("Error:")
+    assert service.idempotency_record("crash-recovery-key")["state"] == "pending"
+
+    monkeypatch.setattr(service, "save_idempotency_record", original_save)
+    recovered = json.loads(
+        put_attachment(
+            parent_item_key="PARENT01",
+            upload_id=prepared["upload_id"],
+            idempotency_key="crash-recovery-key",
+            ctx=DummyContext(),
+        )
+    )
+
+    assert recovered["status"] == "already-created"
+    assert recovered["attachment"]["attachment_key"] == "RECOVER1"
+    assert zot.create_calls == 1
+    record = service.idempotency_record("crash-recovery-key")
+    assert record["state"] == "complete"
+    assert record["recovered"] is True
+
+
+def test_indeterminate_attachment_creation_fails_closed_without_retrying_write(
+    monkeypatch, attachment_state
+):
+    library = {"library_id": "0", "library_type": "user"}
+    payload = b"uncertain attachment"
+    prepared, _ = _ready_upload(payload, library)
+    request = {
+        "library": library,
+        "parent_item_key": "PARENT01",
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "filename": "paper.pdf",
+        "title": "paper.pdf",
+    }
+    service.save_idempotency_record(
+        "indeterminate-key",
+        {
+            "state": "pending",
+            "request": request,
+            "expected_md5": hashlib.md5(payload).hexdigest(),  # noqa: S324
+            "baseline_attachment_keys": [],
+        },
+    )
+
+    class WriteZotero:
+        def children(self, _parent_key, **_kwargs):
+            return []
+
+        def attachment_both(self, *_args, **_kwargs):
+            raise AssertionError("indeterminate retries must not issue a write")
+
+    zot = WriteZotero()
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._helpers._get_write_client",
+        lambda _ctx: (zot, zot),
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_current_library",
+        lambda: library,
+    )
+
+    result = put_attachment(
+        parent_item_key="PARENT01",
+        upload_id=prepared["upload_id"],
+        idempotency_key="indeterminate-key",
+        ctx=DummyContext(),
+    )
+
+    assert "indeterminate outcome" in result
+    assert "No duplicate was created" in result
 
 
 def test_expired_upload_gc_is_bounded_and_preserves_live_uploads(
