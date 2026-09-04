@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 from zotero_mcp import client as _client
+from zotero_mcp import search_semantics as _search_semantics
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context, context_error, context_info, context_warning
@@ -583,10 +584,28 @@ def search_by_tag(
             results = zot.items()
 
         if not results:
-            return f"No items found with tag: '{tag}'"
+            if collection_key:
+                return (
+                    f"No items found with tag: '{tag}' in collection "
+                    f"{collection_key}. The collection was searched and no "
+                    "item in it carries that tag. Items elsewhere in the "
+                    "library may still carry it; re-running without "
+                    "collection_key searches the whole library."
+                )
+            scope = (
+                "all accessible libraries"
+                if search_all_libraries
+                else "the entire active library (no collection scope applied)"
+            )
+            return f"No items found with tag: '{tag}' in {scope}."
 
         # Format results as markdown
-        scope = f" in Collection {collection_key}" if collection_key else ""
+        if collection_key:
+            scope = f" in Collection {collection_key}"
+        elif search_all_libraries:
+            scope = " (all accessible libraries — no collection scope applied)"
+        else:
+            scope = " (entire active library — no collection scope applied)"
         output = [f"# Search Results for Tag: '{tag}'{scope}", ""]
 
         for i, item in enumerate(results, 1):
@@ -748,18 +767,7 @@ def advanced_search(
         context_info(ctx, f"Performing advanced search with {len(conditions)} conditions")
         zot = _client.get_zotero_client()
 
-        valid_operations = {
-            "is",
-            "isNot",
-            "contains",
-            "doesNotContain",
-            "beginsWith",
-            "endsWith",
-            "isGreaterThan",
-            "isLessThan",
-            "isBefore",
-            "isAfter",
-        }
+        valid_operations = _search_semantics.OPERATORS
 
         parsed_conditions: list[dict[str, str]] = []
         for i, condition in enumerate(conditions, 1):
@@ -852,7 +860,8 @@ def advanced_search(
 
             if field_lower in {"collection", "collections"}:
                 collections = data.get("collections", []) or []
-                return [str(value).strip() for value in collections if value]
+                values = [str(value).strip() for value in collections if value]
+                return values or [""]
 
             field_aliases = {
                 "itemtype": "itemType",
@@ -878,45 +887,6 @@ def advanced_search(
                 return []
             return [str(raw_value).strip()]
 
-        def _as_float(text: str) -> float | None:
-            try:
-                return float(text)
-            except ValueError:
-                return None
-
-        def _compare(candidate: str, expected: str, operation: str) -> bool:
-            # Normalize both sides for diacritics/dashes before comparison
-            left = _utils._normalize_for_search(candidate).lower()
-            right = _utils._normalize_for_search(expected).lower()
-
-            if operation == "is":
-                return left == right
-            if operation == "isNot":
-                return left != right
-            if operation == "contains":
-                return right in left
-            if operation == "doesNotContain":
-                return right not in left
-            if operation == "beginsWith":
-                return left.startswith(right)
-            if operation == "endsWith":
-                return left.endswith(right)
-
-            left_num = _as_float(left)
-            right_num = _as_float(right)
-            if (
-                operation in {"isGreaterThan", "isLessThan", "isBefore", "isAfter"}
-                and left_num is not None
-                and right_num is not None
-            ):
-                if operation in {"isGreaterThan", "isAfter"}:
-                    return left_num > right_num
-                return left_num < right_num
-
-            if operation in {"isGreaterThan", "isAfter"}:
-                return left > right
-            return left < right
-
         def _matches_condition(data: dict[str, object], condition: dict[str, str]) -> bool:
             values = _extract_values(data, condition["field"])
             operation = condition["operation"]
@@ -929,13 +899,7 @@ def advanced_search(
             if scope is not None and operation in {"is", "isNot"}:
                 matched = bool(set(values) & scope)
                 return matched if operation == "is" else not matched
-            if not values:
-                return operation in {"isNot", "doesNotContain"}
-            comparisons = [_compare(value, target, operation) for value in values]
-
-            if operation in {"isNot", "doesNotContain"}:
-                return all(comparisons)
-            return any(comparisons)
+            return _search_semantics.matches(values, target, operation)
 
         # Prefer SQLite when enabled. Global queries never fall back to the
         # one-library API path.
@@ -1274,7 +1238,15 @@ def semantic_search(
         search_results = results.get("results", [])
 
         if not search_results:
-            return f"No semantically similar items found for query: '{query}'"
+            empty_message = (
+                f"No semantically similar items found for query: '{query}'"
+            )
+            if global_warnings:
+                return (
+                    "> **Partial coverage:** " + "; ".join(global_warnings)
+                    + "\n\n" + empty_message
+                )
+            return empty_message
 
         # Format results as markdown
         output = [f"# Semantic Search Results for '{query}'", ""]

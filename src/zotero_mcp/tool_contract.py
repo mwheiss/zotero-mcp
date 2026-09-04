@@ -52,6 +52,7 @@ CONTENT_BEARING_TOOLS = {
 }
 
 STRUCTURED_JSON_TEXT_TOOLS = {
+    "zotero_get_annotations",
     "zotero_get_attachment",
     "zotero_list_attachments",
 }
@@ -315,7 +316,8 @@ def _is_empty_marker(line: str) -> bool:
             r"^(?:no\s+(?:matching\s+)?(?:annotations?|attachments?|"
             r"bibliography entries|changes|child items|collections?|duplicates?|"
             r"feed|full[- ]?text|items?|notes?|pdf attachment|pdf outline|related items|"
-            r"results?|rss feeds?|scite data|suitable attachment|tags?)\b|"
+            r"results?|rss feeds?|scite data|semantically similar items|"
+            r"suitable attachment|tags?)\b|"
             r"none of\b|doi\b.*\bnot found\b|isbn\b.*\bnot found\b|"
             r"relation\b.*\bnot found\b|openalex has no record\b)",
             marker,
@@ -349,8 +351,14 @@ def _is_partial_marker(line: str) -> bool:
     marker = _marker_text(line)
     return bool(
         re.match(r"^partial failure\s*:", marker, re.I)
+        or re.match(r"^partial coverage\s*:", marker, re.I)
         or re.match(r"^partially updated\b", marker, re.I)
         or re.match(r"^pdf\s*:.*;\s*partial failure\s*:", marker, re.I)
+        or re.match(
+            r"^note\s*:\s*search stopped\b.*\bresults are partial\.?$",
+            marker,
+            re.I,
+        )
     )
 
 
@@ -372,7 +380,8 @@ def _control_lines(text: str, *, content_bearing: bool = False) -> list[str]:
         # control meaning inside those otherwise content-bearing responses.
         safe_followups = re.compile(
             r"^(?:file download failed\.?$|no suitable attachment found\b|"
-            r"error accessing attachment\s*:)",
+            r"error accessing attachment\s*:|partial coverage\s*:|"
+            r"note\s*:\s*search stopped\b.*\bresults are partial\.?$)",
             re.I,
         )
         control.extend(
@@ -443,6 +452,13 @@ def classify_result(
         and data.get("count") == 0
     ):
         status = "empty"
+    elif (
+        tool_name == "zotero_get_annotations"
+        and isinstance(data, list)
+        and not data
+        and not errors
+    ):
+        status = "empty"
     elif empty:
         status = "empty"
     else:
@@ -467,7 +483,11 @@ def _result_data(result: ToolResult, text: str, *, tool_name: str | None = None)
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            pass
+            if tool_name == "zotero_get_annotations" and "\n\n" in text:
+                try:
+                    return json.loads(text.rsplit("\n\n", 1)[1])
+                except json.JSONDecodeError:
+                    pass
     return _legacy_result_data(
         text,
         content_bearing=tool_name in CONTENT_BEARING_TOOLS,

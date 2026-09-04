@@ -54,7 +54,7 @@ from .config_light import (
     load_update_config,
     should_update,
 )
-from .local_db import LocalZoteroReader
+from .local_db import LocalZoteroReader, validate_collection_keys
 from .utils import _paginate, format_creators, is_local_mode, suppress_stdout
 
 logger = logging.getLogger(__name__)
@@ -1343,6 +1343,7 @@ class ZoteroSemanticSearch:
         logger.info("Fetching items from local Zotero database...")
         self._last_scan_indexable_keys = None
         self._last_scan_attachment_snapshot_complete = True
+        self._last_scan_extraction_complete = True
 
         try:
             api_metadata_by_key: dict[str, dict[str, Any]] = {}
@@ -1451,6 +1452,7 @@ class ZoteroSemanticSearch:
                     _skipped_failed: list[tuple[str, str]] = []
                     _truncated_pdfs: list[tuple[str, int, int]] = []
                     _deferred_attachments: list[tuple[str, int]] = []
+                    _deferred_after_timeout: list[str] = []
 
                     # Show startup note
                     try:
@@ -1684,9 +1686,18 @@ class ZoteroSemanticSearch:
                                     skipped_existing += 1
 
                         if should_extract:
+                            if _extraction_stopped:
+                                # Do not replace an existing full-text record
+                                # with metadata-only content merely because a
+                                # previous PDF tripped the circuit breaker.
+                                # Excluding this item from the returned batch
+                                # leaves its current index records intact.
+                                _deferred_after_timeout.append(
+                                    display or f"item {it.key}"
+                                )
+                                continue
                             # Extract fulltext if item doesn't have it yet
-                            # (skip if circuit breaker has tripped)
-                            if not getattr(it, "fulltext", None) and not _extraction_stopped:
+                            if not getattr(it, "fulltext", None):
                                 text = (
                                     reader.extract_fulltext_for_item(it.item_id)
                                     if allowed_attachment_keys is None
@@ -1697,23 +1708,32 @@ class ZoteroSemanticSearch:
                                     failure_reason = f"PDF extraction timed out after {pdf_timeout} seconds."
                                     it._fulltext_error = failure_reason
                                     _failed_extractions.append((display or f"item {it.key}", failure_reason))
+                                    # Even one timeout leaves an item deferred.
+                                    # Retain the prior API watermark so the
+                                    # next incremental run must revisit it.
+                                    self._last_scan_extraction_complete = False
                                     consecutive_timeouts += 1
                                     if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
                                         logger.warning(
                                             f"Stopping PDF extraction after {MAX_CONSECUTIVE_TIMEOUTS} "
-                                            f"consecutive timeouts — remaining items will use metadata only"
+                                            "consecutive timeouts — remaining items will be deferred"
                                         )
                                         try:
                                             sys.stderr.write(
                                                 f"\n  Warning: PDF extraction stopped after {MAX_CONSECUTIVE_TIMEOUTS} "
-                                                f"consecutive timeouts. Remaining items will be indexed with "
-                                                f"metadata only (titles, abstracts, authors).\n\n"
+                                                "consecutive timeouts. Remaining items that need extraction "
+                                                "will be deferred and left unchanged in the index.\n\n"
                                             )
                                         except Exception:
                                             pass
                                         _extraction_stopped = True
-                                    # Don't skip the item — still add it with metadata only
-                                    it._fulltext_attempted = True  # Mark so metadata knows extraction was tried
+                                    it._fulltext_attempted = True
+                                    # A timeout is transient. Leaving the item
+                                    # out of this batch preserves any previous
+                                    # body chunks and ensures a later local
+                                    # scan retries it instead of cementing a
+                                    # metadata-only replacement.
+                                    continue
                                 else:
                                     # Reset counter on successful extraction
                                     if text:
@@ -1795,6 +1815,21 @@ class ZoteroSemanticSearch:
                                 sys.stderr.write(f"    ... and {len(_deferred_attachments) - 10} more\n")
                             sys.stderr.write(
                                 "  Their existing index records were left unchanged; the next update will retry them.\n"
+                            )
+                        if _deferred_after_timeout:
+                            sys.stderr.write(
+                                f"  Warning: deferred {len(_deferred_after_timeout)} item(s) "
+                                "after the PDF timeout circuit breaker opened:\n"
+                            )
+                            for name in _deferred_after_timeout[:10]:
+                                sys.stderr.write(f"    - {name}\n")
+                            if len(_deferred_after_timeout) > 10:
+                                sys.stderr.write(
+                                    f"    ... and {len(_deferred_after_timeout) - 10} more\n"
+                                )
+                            sys.stderr.write(
+                                "  Their existing index records were left unchanged; "
+                                "the next update will retry them.\n"
                             )
                         if _skipped_failed:
                             sys.stderr.write(
@@ -2686,6 +2721,9 @@ class ZoteroSemanticSearch:
                         )
             except Exception:
                 pass
+            configured_collection_keys = validate_collection_keys(
+                configured_collection_keys
+            )
             use_local_source = bool(extract_fulltext or configured_collection_keys)
             if force_clear and not force_full_rebuild:
                 raise ValueError("force_clear requires force_full_rebuild")
@@ -2899,9 +2937,17 @@ class ZoteroSemanticSearch:
                 # The API may briefly lead even a consistent SQLite/WAL
                 # snapshot; only promote the watermark if key coverage agrees.
                 if use_local_source and target_sync_version is not None:
-                    verified_sync_version = self._verify_local_snapshot_version(target_sync_version)
-                    local_snapshot_complete = verified_sync_version is not None
-                    target_sync_version = verified_sync_version
+                    if not getattr(self, "_last_scan_extraction_complete", True):
+                        # A partial extraction scan cannot account for all
+                        # changes at this version. Keep the old watermark so
+                        # the next run necessarily revisits deferred items.
+                        target_sync_version = None
+                    else:
+                        verified_sync_version = self._verify_local_snapshot_version(
+                            target_sync_version
+                        )
+                        local_snapshot_complete = verified_sync_version is not None
+                        target_sync_version = verified_sync_version
 
                 # Local full-text scans return only new/changed items for
                 # embedding, so reconcile against the complete indexable key

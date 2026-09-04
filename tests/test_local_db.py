@@ -436,6 +436,74 @@ def test_get_feed_items_includes_publication_date(tmp_path):
     assert items[0]["date"] == "2024-05-15"
 
 
+def test_get_feed_items_strips_internal_multipart_date_prefix(tmp_path):
+    db_path = tmp_path / "zotero.sqlite"
+    _create_feed_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE itemDataValues SET value = ? WHERE valueID = 1003",
+        ("2024-05-00 May 2024",),
+    )
+    conn.commit()
+    conn.close()
+
+    with LocalZoteroReader(db_path=str(db_path)) as reader:
+        items = reader.get_feed_items(10, limit=20)
+
+    assert items[0]["date"] == "May 2024"
+
+
+def test_get_feed_items_preserves_non_multipart_date_with_spaces(tmp_path):
+    db_path = tmp_path / "zotero.sqlite"
+    _create_feed_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE itemDataValues SET value = ? WHERE valueID = 1003",
+        ("May 2024",),
+    )
+    conn.commit()
+    conn.close()
+
+    with LocalZoteroReader(db_path=str(db_path)) as reader:
+        items = reader.get_feed_items(10, limit=20)
+
+    assert items[0]["date"] == "May 2024"
+
+
+def test_get_attachment_by_key_can_be_library_scoped(tmp_path):
+    db_path = tmp_path / "zotero.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE items (
+            itemID INTEGER PRIMARY KEY, key TEXT, libraryID INTEGER
+        );
+        CREATE TABLE itemAttachments (
+            itemID INTEGER, parentItemID INTEGER, path TEXT, contentType TEXT
+        );
+        CREATE TABLE itemData (itemID INTEGER, fieldID INTEGER, valueID INTEGER);
+        CREATE TABLE itemDataValues (valueID INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE fields (fieldID INTEGER PRIMARY KEY, fieldName TEXT);
+        CREATE TABLE deletedItems (itemID INTEGER);
+        INSERT INTO fields VALUES (1, 'title');
+        INSERT INTO items VALUES
+            (1, 'PARENT01', 1), (2, 'SAMEKEY1', 1),
+            (3, 'PARENT02', 2), (4, 'SAMEKEY1', 2);
+        INSERT INTO itemAttachments VALUES
+            (2, 1, 'storage:first.pdf', 'application/pdf'),
+            (4, 3, 'storage:second.pdf', 'application/pdf');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with LocalZoteroReader(db_path=str(db_path)) as reader:
+        attachment = reader.get_attachment_by_key("SAMEKEY1", library_id=2)
+
+    assert attachment is not None
+    assert attachment["zotero_path"] == "storage:second.pdf"
+
+
 def test_get_feed_items_includes_doi(tmp_path):
     db_path = tmp_path / "zotero.sqlite"
     _create_feed_db(db_path)

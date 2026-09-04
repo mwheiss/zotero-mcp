@@ -16,6 +16,29 @@ from pathlib import Path
 # This allows CLI commands like update-db to print "Starting up..." instantly.
 
 
+def _iter_chroma_records(collection, *, include: list[str], page_size: int = 500):
+    """Yield aligned Chroma records without loading the collection at once."""
+    offset = 0
+    while True:
+        page = collection.get(
+            limit=page_size,
+            offset=offset,
+            include=include,
+        )
+        ids = page.get("ids") or []
+        metadatas = page.get("metadatas") or []
+        documents = page.get("documents") or []
+        for index, record_id in enumerate(ids):
+            yield {
+                "id": record_id,
+                "metadata": metadatas[index] if index < len(metadatas) else None,
+                "document": documents[index] if index < len(documents) else None,
+            }
+        if len(ids) < page_size:
+            break
+        offset += len(ids)
+
+
 def _confirm_force_rebuild() -> bool:
     """Require an explicit interactive confirmation for a full rebuild."""
     print(
@@ -153,8 +176,13 @@ def _save_zotero_db_path_to_config(config_path: Path, db_path: str) -> None:
             try:
                 with open(config_path) as f:
                     full_config = json.load(f)
-            except Exception:
-                pass
+                if not isinstance(full_config, dict):
+                    raise ValueError("configuration root must be an object")
+            except (OSError, ValueError, TypeError) as exc:
+                raise RuntimeError(
+                    "Refusing to replace an existing unreadable or malformed "
+                    f"configuration: {exc}"
+                ) from exc
 
         # Ensure semantic_search section exists
         if "semantic_search" not in full_config:
@@ -163,11 +191,11 @@ def _save_zotero_db_path_to_config(config_path: Path, db_path: str) -> None:
         # Save the db_path
         full_config["semantic_search"]["zotero_db_path"] = db_path
 
-        # Write back to file
-        with open(config_path, 'w') as f:
-            json.dump(full_config, f, indent=2)
-        # The config can hold credentials (API/embedding keys) — keep it
-        # owner-only. Best-effort; no-op on platforms without POSIX perms.
+        # The config can contain credentials. Replace it atomically so a crash
+        # cannot truncate the prior settings or expose a permissive mode.
+        from zotero_mcp._atomic_io import atomic_write_json
+
+        atomic_write_json(config_path, full_config, indent=2, mode=0o600)
         try:
             os.chmod(config_path, 0o600)
         except OSError:
@@ -838,6 +866,7 @@ def main():
     elif args.command == "db-health":
         setup_zotero_environment()
 
+        from zotero_mcp import client as zotero_client
         from zotero_mcp.db_health import (
             audit_semantic_database,
             format_health_report,
@@ -848,6 +877,7 @@ def main():
             zotero_db_path=args.db_path,
             full_integrity=not args.quick,
             compare_zotero=not args.no_zotero_compare,
+            library=zotero_client.get_current_library(),
         )
         if args.json:
             print(json.dumps(report.to_dict(), indent=2))
@@ -927,42 +957,45 @@ def main():
 
             if args.stats:
                 # Show aggregate stats (merged from former db-stats)
-                meta = col.get(include=["metadatas"])  # type: ignore
-                metas = meta.get("metadatas", [])
                 print("=== Semantic DB Inspection (Stats) ===")
                 info = client.get_collection_info()
                 print(f"Collection: {info.get('name')} @ {info.get('persist_directory')}")
                 print(f"Count: {info.get('count')}")
 
-                # Item type distribution
-                item_types = [ (m or {}).get("item_type", "") for m in metas ]
-                ct_types = Counter(item_types)
+                ct_types = Counter()
+                coverage = {}
+                ct_titles = Counter()
+                for record in _iter_chroma_records(
+                    col, include=["metadatas"]
+                ):
+                    metadata = record["metadata"] or {}
+                    item_type = metadata.get("item_type", "")
+                    ct_types[item_type] += 1
+                    coverage_row = coverage.setdefault(
+                        item_type or "(missing)",
+                        {"total": 0, "with_fulltext": 0, "pdf": 0, "html": 0},
+                    )
+                    coverage_row["total"] += 1
+                    if metadata.get("has_fulltext"):
+                        coverage_row["with_fulltext"] += 1
+                        source = (metadata.get("fulltext_source") or "").lower()
+                        if source == "pdf":
+                            coverage_row["pdf"] += 1
+                        elif source == "html":
+                            coverage_row["html"] += 1
+                    if title := metadata.get("title", ""):
+                        ct_titles[title] += 1
+
                 print("Item types:")
                 for t, c in ct_types.most_common(20):
                     print(f"  {t or '(missing)'}: {c}")
 
                 # Fulltext coverage by type (pdf/html)
-                coverage = {}
-                for m in metas:
-                    m = m or {}
-                    t = m.get("item_type", "") or "(missing)"
-                    cov = coverage.setdefault(t, {"total": 0, "with_fulltext": 0, "pdf": 0, "html": 0})
-                    cov["total"] += 1
-                    if m.get("has_fulltext"):
-                        cov["with_fulltext"] += 1
-                        src = (m.get("fulltext_source") or "").lower()
-                        if src == "pdf":
-                            cov["pdf"] += 1
-                        elif src == "html":
-                            cov["html"] += 1
                 print("Fulltext coverage (by type):")
                 for t, cov in coverage.items():
                     print(f"  {t}: {cov['with_fulltext']}/{cov['total']} (pdf:{cov['pdf']}, html:{cov['html']})")
 
                 # Common titles (may indicate duplicates)
-                titles = [ (m or {}).get("title", "") for m in metas ]
-                from collections import Counter as _Counter
-                ct_titles = _Counter([t for t in titles if t])
                 common = [(t,c) for t,c in ct_titles.most_common(10)]
                 if common:
                     print("Common titles:")
@@ -974,17 +1007,17 @@ def main():
             if args.show_documents:
                 include.append("documents")
 
-            # Fetch up to limit; filter client-side if requested
-            data = col.get(limit=args.limit, include=include)
-
             print("=== Semantic DB Inspection ===")
             total = client.get_collection_info().get("count", 0)
             print(f"Total documents: {total}")
             print(f"Showing up to: {args.limit}")
 
             shown = 0
-            for i, meta in enumerate(data.get("metadatas", [])):
-                meta = meta or {}
+            page_size = 500 if args.filter_text else max(1, args.limit)
+            for record in _iter_chroma_records(
+                col, include=include, page_size=page_size
+            ):
+                meta = record["metadata"] or {}
                 title = meta.get("title", "")
                 creators = meta.get("creators", "")
                 if args.filter_text:
@@ -993,7 +1026,7 @@ def main():
                         continue
                 print(f"- {title} | {creators}")
                 if args.show_documents:
-                    doc = (data.get("documents", [""])[i] or "").strip()
+                    doc = (record["document"] or "").strip()
                     snippet = doc[:200].replace("\n", " ") + ("..." if len(doc) > 200 else "")
                     if snippet:
                         print(f"  doc: {snippet}")

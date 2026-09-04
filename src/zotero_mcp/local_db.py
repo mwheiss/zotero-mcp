@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import search_semantics
 from .utils import _generate_search_variants, _normalize_for_search, is_local_mode
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,31 @@ _BETTERISSA_ARTIFACT_TITLES = frozenset(
 _BETTERISSA_SELECTABLE_TITLES = _BETTERISSA_ARTIFACT_TITLES - {_BETTERISSA_REFERENCES_TITLE}
 
 _SNAPSHOT_CAPTURE_ATTEMPTS = 3
+
+_MULTIPART_DATE = re.compile(r"^(\d{4}-\d{2}-\d{2})\s(.*)$", re.DOTALL)
+
+
+def _split_zotero_date(value: str | None) -> tuple[str, str]:
+    """Return Zotero's internal ISO prefix and user-facing date value."""
+    raw = value or ""
+    match = _MULTIPART_DATE.match(raw)
+    if not match:
+        return "", raw
+    return match.group(1), match.group(2)
+
+
+def validate_collection_keys(value: Any) -> list[str] | None:
+    """Validate and normalize semantic-index collection configuration."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or any(
+        not isinstance(key, str) or not key.strip() for key in value
+    ):
+        raise ValueError(
+            "semantic_search.collection_keys must be a list of "
+            "non-empty collection-key strings"
+        )
+    return list(dict.fromkeys(key.strip() for key in value))
 
 
 def _file_fingerprint(path: Path) -> tuple[int, int, int, int] | None:
@@ -1337,7 +1363,12 @@ class LocalZoteroReader:
             """,
             (library_id, limit),
         ).fetchall()
-        return [dict(row) for row in rows]
+        output = []
+        for row in rows:
+            item = dict(row)
+            _, item["date"] = _split_zotero_date(item.get("date"))
+            output.append(item)
+        return output
 
     def get_item_count(self) -> int:
         """
@@ -1496,10 +1527,12 @@ class LocalZoteroReader:
         if library_id is not None:
             query += " AND i.libraryID = ?"
             params.append(library_id)
-        if collection_keys:
+        if collection_keys is not None:
+            collection_keys = validate_collection_keys(collection_keys)
             # Restrict the corpus to the configured collections, including
             # all of their subcollections (resolved recursively).
-            all_collection_ids = []
+            all_collection_ids: list[int] = []
+            unresolved: list[str] = []
             for ckey in collection_keys:
                 if library_id is None:
                     root = conn.execute(
@@ -1511,15 +1544,26 @@ class LocalZoteroReader:
                         "SELECT collectionID FROM collections WHERE key = ? AND libraryID = ?",
                         (ckey, library_id),
                     ).fetchone()
-                if root:
-                    to_process = [root[0]]
-                    while to_process:
-                        cid = to_process.pop()
-                        all_collection_ids.append(cid)
-                        for sub in conn.execute(
-                            "SELECT collectionID FROM collections WHERE parentCollectionID = ?", (cid,)
-                        ).fetchall():
-                            to_process.append(sub[0])
+                if not root:
+                    unresolved.append(ckey)
+                    continue
+                to_process = [root[0]]
+                visited: set[int] = set()
+                while to_process:
+                    cid = to_process.pop()
+                    if cid in visited:
+                        continue
+                    visited.add(cid)
+                    all_collection_ids.append(cid)
+                    for sub in conn.execute(
+                        "SELECT collectionID FROM collections WHERE parentCollectionID = ?", (cid,)
+                    ).fetchall():
+                        to_process.append(sub[0])
+            if unresolved:
+                raise ValueError(
+                    "Configured collection key(s) are not present in the "
+                    f"active Zotero library: {', '.join(unresolved)}"
+                )
             if all_collection_ids:
                 placeholders = ",".join("?" * len(all_collection_ids))
                 query += f" AND i.itemID IN (SELECT DISTINCT itemID FROM collectionItems WHERE collectionID IN ({placeholders}))"
@@ -1615,8 +1659,12 @@ class LocalZoteroReader:
             )
         return out
 
-    def get_attachment_by_key(self, attachment_key: str) -> dict | None:
-        """Return one live attachment addressed by its own Zotero key."""
+    def get_attachment_by_key(
+        self,
+        attachment_key: str,
+        library_id: int | None = None,
+    ) -> dict | None:
+        """Return one live attachment, optionally scoped to one library."""
         row = self._get_connection().execute(
             """
             SELECT att.key AS attachmentKey,
@@ -1635,9 +1683,10 @@ class LocalZoteroReader:
             LEFT JOIN itemDataValues title_val
               ON title_data.valueID = title_val.valueID
             WHERE att.key = ?
+              AND (? IS NULL OR att.libraryID = ?)
               AND att.itemID NOT IN (SELECT itemID FROM deletedItems)
             """,
-            (attachment_key,),
+            (attachment_key, library_id, library_id),
         ).fetchone()
         if row is None:
             return None
@@ -1830,11 +1879,11 @@ class LocalZoteroReader:
             item_type = row["itemType"]
             data = dict(fields.get(item_id, {}))
             date_field = schema.resolve_field(item_type, "date")
-            if isinstance(data.get(date_field), str) and re.match(
-                r"^\d{4}-\d{2}-\d{2}\s", data[date_field]
-            ):
-                data["_dateISO"] = data[date_field][:10]
-                data[date_field] = data[date_field].split(" ", 1)[1]
+            if isinstance(data.get(date_field), str):
+                iso_date, display_date = _split_zotero_date(data[date_field])
+                if iso_date:
+                    data["_dateISO"] = iso_date
+                    data[date_field] = display_date
             data.update(
                 key=row["key"],
                 itemType=item_type,
@@ -1887,6 +1936,16 @@ class LocalZoteroReader:
         group_id: int | None = 0,
     ) -> list[dict] | None:
         if qmode not in {"titleCreatorYear", "everything"}:
+            return None
+        if item_type:
+            bare_type = item_type[1:] if item_type.startswith("-") else item_type
+            if (
+                not re.fullmatch(r"[A-Za-z]+", bare_type)
+                or item_type.count("-") > 1
+                or "||" in item_type
+            ):
+                return None
+        if tag and any("*" in expression for expression in tag):
             return None
         items = self._metadata_search_items(group_id)
         if items is None:
@@ -1950,14 +2009,9 @@ class LocalZoteroReader:
         if lowered in {"tag", "tags"}:
             return [entry.get("tag", "") for entry in data.get("tags", [])]
         if lowered in {"collection", "collections"}:
-            return list(data.get("collections", []))
-        aliases = {
-            "itemtype": "itemType",
-            "dateadded": "dateAdded",
-            "datemodified": "dateModified",
-            "doi": "DOI",
-        }
-        key = aliases.get(lowered, field)
+            values = list(data.get("collections", []))
+            return values or [""]
+        key = search_semantics.canonical_field(field)
         if lowered == "title":
             from zotero_mcp.utils import item_display_title
 
@@ -1967,35 +2021,16 @@ class LocalZoteroReader:
 
             date = item_display_date(data)
             if lowered == "year":
-                match = re.search(r"\b(\d{4})\b", date)
+                raw_year = str(data.get("_dateISO") or "")[:4]
+                match = re.search(r"\b(\d{4})\b", raw_year or date)
                 return [match.group(1)] if match else []
             if operation in {"isGreaterThan", "isLessThan", "isBefore", "isAfter"}:
                 return [str(data.get("_dateISO") or date)]
             return [date]
+        if key not in data:
+            return [""]
         value = data.get(key)
         return [] if value is None else [str(value)]
-
-    @staticmethod
-    def _advanced_compare(candidate: str, expected: str, operation: str) -> bool:
-        left = _normalize_for_search(candidate).casefold()
-        right = _normalize_for_search(expected).casefold()
-        if operation == "is":
-            return left == right
-        if operation == "isNot":
-            return left != right
-        if operation == "contains":
-            return right in left
-        if operation == "doesNotContain":
-            return right not in left
-        if operation == "beginsWith":
-            return left.startswith(right)
-        if operation == "endsWith":
-            return left.endswith(right)
-        if operation in {"isGreaterThan", "isAfter"}:
-            return left > right
-        if operation in {"isLessThan", "isBefore"}:
-            return left < right
-        return False
 
     def advanced_search_sql(
         self,
@@ -2006,6 +2041,11 @@ class LocalZoteroReader:
         items = self._metadata_search_items(group_id)
         if items is None:
             return None
+        if join_mode not in {"all", "any"} or any(
+            condition.get("operation") not in search_semantics.OPERATORS
+            for condition in conditions
+        ):
+            return None
         output = []
         for item in items:
             checks = []
@@ -2014,17 +2054,10 @@ class LocalZoteroReader:
                 values = self._advanced_values(
                     item["data"], condition["field"], operation
                 )
-                if not values:
-                    checks.append(operation in {"isNot", "doesNotContain"})
-                    continue
-                compared = [
-                    self._advanced_compare(value, condition["value"], operation)
-                    for value in values
-                ]
                 checks.append(
-                    all(compared)
-                    if operation in {"isNot", "doesNotContain"}
-                    else any(compared)
+                    search_semantics.matches(
+                        values, condition["value"], operation
+                    )
                 )
             if all(checks) if join_mode == "all" else any(checks):
                 item["data"].pop("_noteText", None)

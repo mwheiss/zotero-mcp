@@ -167,6 +167,53 @@ def test_attachment_json_is_parsed_by_call_middleware():
     }
 
 
+def test_annotation_json_records_are_native_envelope_data():
+    async def run():
+        middleware = ToolContractMiddleware()
+        context = SimpleNamespace(
+            message=SimpleNamespace(name="zotero_get_annotations")
+        )
+
+        async def call_next(_context):
+            return ToolResult(
+                content='[{"annotation_key":"ANNO001","page_index":2}]'
+            )
+
+        return await middleware.on_call_tool(context, call_next)
+
+    structured = asyncio.run(run()).structured_content
+    assert structured["status"] == "success"
+    assert structured["data"] == [
+        {"annotation_key": "ANNO001", "page_index": 2}
+    ]
+
+
+def test_annotation_json_empty_and_partial_results_remain_truthful():
+    async def invoke(content):
+        middleware = ToolContractMiddleware()
+        context = SimpleNamespace(
+            message=SimpleNamespace(name="zotero_get_annotations")
+        )
+
+        async def call_next(_context):
+            return ToolResult(content=content)
+
+        return (await middleware.on_call_tool(context, call_next)).structured_content
+
+    empty = asyncio.run(invoke("[]"))
+    assert empty["status"] == "empty"
+    assert empty["data"] == []
+
+    partial = asyncio.run(
+        invoke(
+            "Partial failure: Better BibTeX unavailable\n\n"
+            '[{"annotation_key":"ANNO001"}]'
+        )
+    )
+    assert partial["status"] == "partial"
+    assert partial["data"] == [{"annotation_key": "ANNO001"}]
+
+
 def test_result_classification_recognizes_formatted_failures_and_warnings():
     failures = [
         "# Database\n\n**Error:** embedding failed",

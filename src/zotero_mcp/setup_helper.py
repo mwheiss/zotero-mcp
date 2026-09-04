@@ -15,6 +15,8 @@ import shutil
 import sys
 from pathlib import Path
 
+from zotero_mcp._atomic_io import atomic_write_json
+
 
 def _obfuscate_sensitive(value: str | None, keep_chars: int = 4) -> str:
     """Obfuscate sensitive values for terminal display."""
@@ -427,9 +429,9 @@ def save_semantic_search_config(config: dict, semantic_config_path: Path) -> boo
         # Add semantic search config
         full_semantic_config["semantic_search"] = config
 
-        # Write config
-        with open(semantic_config_path, 'w') as f:
-            json.dump(full_semantic_config, f, indent=2)
+        # Replace atomically so interruption cannot truncate credentials or
+        # leave a partially written configuration.
+        atomic_write_json(semantic_config_path, full_semantic_config, indent=2)
         _restrict_file_permissions(semantic_config_path)
 
         print(f"Semantic search configuration saved to: {semantic_config_path}")
@@ -528,8 +530,7 @@ def update_claude_config(config_path, zotero_mcp_path, local=True, api_key=None,
 
     # Write updated config
     try:
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
+        atomic_write_json(config_path, config, indent=2)
         _restrict_file_permissions(config_path)
         print(f"\nSuccessfully wrote config to: {config_path}")
     except Exception as e:
@@ -575,8 +576,7 @@ def _write_standalone_config(local: bool, api_key: str, library_id: str, library
 
     full["client_env"] = client_env
 
-    with open(cfg_path, 'w') as f:
-        json.dump(full, f, indent=2)
+    atomic_write_json(cfg_path, full, indent=2)
     _restrict_file_permissions(cfg_path)
 
     return cfg_path
