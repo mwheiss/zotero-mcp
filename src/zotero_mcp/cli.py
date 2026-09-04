@@ -918,6 +918,10 @@ def main():
             print("\nUpdate configuration:")
             print(f"- Auto update: {update_config.get('auto_update', False)}")
             print(f"- Frequency: {update_config.get('update_frequency', 'manual')}")
+            print(
+                "- Automatic embedding concurrency: "
+                f"{update_config.get('embedding_concurrency', 1)}"
+            )
             print(f"- Last update: {update_config.get('last_update', 'Never')}")
             print(f"- Should update: {status.get('should_update', False)}")
             print(f"- OpenAI Batch API: {'active' if batch_config.get('active') else 'inactive'}")

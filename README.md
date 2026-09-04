@@ -242,10 +242,33 @@ With `--fulltext`, each update selects the best attachment currently
 available for semantic retrieval. BetterIssa sources are preferred in this
 order: `BetterIssa indexing text`, `BetterIssa semantic document`,
 `BetterIssa Advanced OCR Markdown`, then `BetterIssa Reading View`. The
-original PDF and legacy text sources remain fallbacks. `BetterIssa references`
+original PDF and other supported text sources remain fallbacks. `BetterIssa references`
 is never embedded. A later artifact or an in-place BetterIssa upsert changes
 the attachment fingerprint, so the affected item advances to the better source
 on the next `update-db --fulltext` run without a force rebuild.
+
+Automatic updates use the same persisted content mode and a separately saved
+embedding concurrency. For example, the following runs a full-text incremental
+update in the background whenever the MCP server starts, while issuing only one
+embedding request at a time so another local encoder slot remains available for
+search:
+
+```json
+{
+  "semantic_search": {
+    "fulltext": true,
+    "update_config": {
+      "auto_update": true,
+      "update_frequency": "startup",
+      "embedding_concurrency": 1
+    }
+  }
+}
+```
+
+`startup` runs once during server lifecycle initialization; it is not relaunched
+before every semantic query. `daily` and `every_N` policies may additionally be
+triggered in the background when a semantic search notices that they are due.
 
 **Example Semantic Queries in your AI assistant:**
 - *"Find research similar to machine learning concepts in neuroscience"*

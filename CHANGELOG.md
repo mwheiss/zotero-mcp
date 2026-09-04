@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-09-04
+
+### Changed
+- Automatic semantic updates now honor the saved full-text mode and an explicit bounded `embedding_concurrency`; startup-only policy is no longer incorrectly relaunched before later searches.
+
+### Fixed
+- New attachment creation persists its request identity, expected MD5, and pre-write parent inventory before calling Zotero. A retry after a process crash recovers the unique matching attachment, while absent or ambiguous outcomes fail closed instead of risking a duplicate.
+
 ## [1.4.2] - 2026-09-04
 
 ### Added

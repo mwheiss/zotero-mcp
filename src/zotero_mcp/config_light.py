@@ -15,6 +15,7 @@ _DEFAULT_UPDATE_CONFIG: dict[str, Any] = {
     "update_frequency": "manual",
     "last_update": None,
     "update_days": 7,
+    "embedding_concurrency": 1,
 }
 
 _DEFAULT_RERANKER_CONFIG: dict[str, Any] = {
@@ -72,6 +73,15 @@ def should_update(update_config: dict[str, Any]) -> bool:
         )
     except (TypeError, ValueError):
         return False
+
+
+def auto_update_embedding_concurrency(update_config: dict[str, Any]) -> int:
+    """Return a safe realtime embedding worker count for automatic updates."""
+    try:
+        value = int(update_config.get("embedding_concurrency", 1))
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(value, 32))
 
 
 def load_reranker_config(config_path: str | None) -> dict[str, Any]:

@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from zotero_mcp._atomic_io import atomic_write_json
+from zotero_mcp.config_light import auto_update_embedding_concurrency
 
 
 def _obfuscate_sensitive(value: str | None, keep_chars: int = 4) -> str:
@@ -327,6 +328,14 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
             "update_days": days
         }
         print(f"Database will be updated every {days} days.")
+
+    # Automatic updates are deliberately conservative by default so one local
+    # encoder slot remains available to serve semantic searches.
+    update_config["embedding_concurrency"] = auto_update_embedding_concurrency(
+        existing_semantic_config.get("update_config", {})
+        if existing_semantic_config
+        else {}
+    )
 
     # Configure extraction settings
     print("\n=== Content Extraction Settings ===")

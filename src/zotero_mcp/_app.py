@@ -23,11 +23,16 @@ logging.basicConfig(
 )
 
 
-def _sync_semantic_update() -> None:
+def _sync_semantic_update(config_path: Path | None = None) -> None:
     """Check for and run semantic search auto-update (called in a worker thread)."""
-    from zotero_mcp.config_light import should_update
+    from zotero_mcp.config_light import (
+        auto_update_embedding_concurrency,
+        should_update,
+    )
 
-    config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
+    config_path = config_path or (
+        Path.home() / ".config" / "zotero-mcp" / "config.json"
+    )
     if not config_path.exists():
         return
 
@@ -37,7 +42,8 @@ def _sync_semantic_update() -> None:
     try:
         with open(config_path) as f:
             cfg = json.load(f)
-        update_cfg = cfg.get("semantic_search", {}).get("update_config", {})
+        semantic_cfg = cfg.get("semantic_search", {})
+        update_cfg = semantic_cfg.get("update_config", {})
     except Exception:
         return
 
@@ -51,7 +57,10 @@ def _sync_semantic_update() -> None:
         return
 
     sys.stderr.write("Auto-updating semantic search database...\n")
-    stats = search.update_database()
+    stats = search.update_database(
+        fulltext=bool(semantic_cfg.get("fulltext", False)),
+        embedding_concurrency=auto_update_embedding_concurrency(update_cfg),
+    )
     sys.stderr.write(
         f"Database update completed: {stats.get('processed_items', 0)} items processed\n"
     )

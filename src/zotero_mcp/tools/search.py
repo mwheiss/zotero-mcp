@@ -72,6 +72,10 @@ def _maybe_fire_presearch_sync(search) -> None:
     surface as a search-tool error to the user.
     """
     global _last_presearch_sync_ts
+    # "startup" is a lifecycle event, not a standing instruction to launch a
+    # full database scan before every semantic query.
+    if search.update_config.get("update_frequency") == "startup":
+        return
     try:
         if not search.should_update_database():
             return
@@ -85,7 +89,14 @@ def _maybe_fire_presearch_sync(search) -> None:
 
     def _run():
         try:
-            search.update_database()
+            from zotero_mcp.config_light import auto_update_embedding_concurrency
+
+            search.update_database(
+                fulltext=getattr(search, "_active_fulltext", None),
+                embedding_concurrency=auto_update_embedding_concurrency(
+                    search.update_config
+                ),
+            )
         except Exception as e:
             _search_logger.debug(f"Background pre-search sync failed: {e}")
 
@@ -1821,6 +1832,10 @@ def get_search_database_status(*, ctx: Context) -> str:
         output.append("## Update Configuration")
         output.append(f"**Auto Update:** {update_config.get('auto_update', False)}")
         output.append(f"**Frequency:** {update_config.get('update_frequency', 'manual')}")
+        output.append(
+            "**Automatic Embedding Concurrency:** "
+            f"{update_config.get('embedding_concurrency', 1)}"
+        )
         output.append(
             f"**Last Successful Refresh:** "
             f"{update_config.get('last_update', 'Never')}"
