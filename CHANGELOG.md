@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.5] - 2026-09-05
+
+### Added
+- `zotero-mcp schema-refresh` manually refreshes Zotero item-type/base-field metadata. Automatic routing reads `/api/schema` from the installed desktop in local mode and `api.zotero.org/schema` in web-only mode, with validated atomic source-specific caches.
+
 ## [1.4.4] - 2026-09-05
 
 ### Changed

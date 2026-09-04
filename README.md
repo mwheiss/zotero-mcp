@@ -219,6 +219,9 @@ zotero-mcp update-db --force-rebuild --force-clear --no-openai-batch
 
 # Check database status
 zotero-mcp db-status
+
+# Refresh item-type/base-field metadata from the active local/web Zotero API
+zotero-mcp schema-refresh
 ```
 
 For an OpenAI-compatible proxy whose API model name is only an alias, declare
@@ -279,6 +282,21 @@ triggered in the background when a semantic search notices that they are due.
 - *"Find papers conceptually similar to this abstract: [paste abstract]"*
 
 The semantic search provides similarity scores and finds papers based on conceptual understanding, not just keyword matching.
+
+### Zotero metadata schema refresh
+
+`zotero-mcp schema-refresh` refreshes logical Zotero item metadata: item types
+and mappings such as `title` to `caseName`. With `--source auto` (the default),
+local mode reads the installed desktop's `http://127.0.0.1:23119/api/schema`;
+web-only mode reads `https://api.zotero.org/schema`. `--source local|web`
+selects one explicitly, and `--json` returns a machine-readable report.
+
+Local and web responses are validated and cached atomically in separate
+`schema-local.json` and `schema-web.json` files under the Zotero MCP cache
+directory. A malformed response or cache never replaces the built-in mapping.
+Restart a long-running MCP server after a manual refresh so it loads the new
+cache. This metadata schema is not Zotero's physical `zotero.sqlite` table
+layout; SQLite layout changes still require a zotero-mcp code update.
 
 ## 🖥️ Setup & Usage
 
@@ -434,6 +452,7 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `ZOTERO_MCP_API_LOCK_PATH`: Optional shared API lock-file path when MCP and CLI processes use different home/config directories
 - `ZOTERO_MCP_IDENTIFIER_LOCK_DIR`: Optional directory for per-library, per-identifier import locks shared by MCP and CLI processes
 - `ZOTERO_MCP_UPDATE_LOCK_PATH`: Optional shared semantic-update lock path (default: `~/.config/zotero-mcp/update.lock`)
+- `ZOTERO_MCP_SCHEMA_CACHE_DIR`: Optional directory for separate local/web metadata-schema caches (default: `~/.cache/zotero-mcp`)
 - `ZOTERO_MCP_WRITE_SECRET`: Required per-call admin secret for every MCP tool that mutates Zotero or the semantic index. The value is never exposed in tool descriptions
 - `ZOTERO_MCP_EXPOSE_LOCAL_PATHS=true`: Explicitly expose server-local path tools in local Zotero mode; remote clients should use staged attachment uploads and inline citation data
 - `ZOTERO_MCP_PUBLIC_BASE_URL`: Public MCP URL prefix used to create short-lived signed attachment upload/download URLs
@@ -508,6 +527,7 @@ zotero-mcp setup-info                      # Show installation path and config i
 zotero-mcp update                          # Update to latest version
 zotero-mcp update --check-only             # Check for updates without installing
 zotero-mcp update --force                  # Force update even if up to date
+zotero-mcp schema-refresh                  # Refresh local/web item metadata mappings
 
 # Semantic search database management
 zotero-mcp update-db                       # Index API title and abstract only (default)
