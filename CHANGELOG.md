@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.6] - 2026-09-05
+
+### Added
+- Optional automatic Zotero metadata-schema refresh uses the active local/web route, a weekly default interval, source-specific last-known-good caches, and a one-day failure backoff without blocking MCP startup.
+
 ## [1.4.5] - 2026-09-05
 
 ### Added

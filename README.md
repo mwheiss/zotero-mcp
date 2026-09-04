@@ -294,8 +294,28 @@ selects one explicitly, and `--json` returns a machine-readable report.
 Local and web responses are validated and cached atomically in separate
 `schema-local.json` and `schema-web.json` files under the Zotero MCP cache
 directory. A malformed response or cache never replaces the built-in mapping.
-Restart a long-running MCP server after a manual refresh so it loads the new
-cache. This metadata schema is not Zotero's physical `zotero.sqlite` table
+Restart a long-running MCP server after a manual refresh from another process
+so it loads the new cache.
+
+An opt-in startup worker can keep the active source current automatically. This
+example checks weekly and, after a failed check, retains the last-known-good
+cache and waits one day before trying again:
+
+```json
+{
+  "schema_refresh": {
+    "auto_refresh": true,
+    "source": "auto",
+    "interval_days": 7,
+    "failure_backoff_hours": 24
+  }
+}
+```
+
+The worker uses the desktop endpoint only when `source: "auto"` resolves to
+local mode; web-only mode uses Zotero's cloud endpoint and its separate cache.
+It runs outside the MCP event loop and does not delay server startup. This is
+Zotero's logical API metadata schema, not the physical `zotero.sqlite` table
 layout; SQLite layout changes still require a zotero-mcp code update.
 
 ## 🖥️ Setup & Usage
