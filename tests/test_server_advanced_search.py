@@ -114,7 +114,7 @@ def test_advanced_search_exposes_bulk_inventory_fields(monkeypatch):
     assert "**Date Modified:** 2026-08-06T11:30:00Z" in result
 
 
-def test_advanced_search_caps_bulk_results_at_2000(monkeypatch):
+def test_advanced_search_caps_bulk_results_at_500(monkeypatch):
     fake_items = [
         {
             "key": f"K{i:07d}",
@@ -139,6 +139,6 @@ def test_advanced_search_caps_bulk_results_at_2000(monkeypatch):
         ctx=DummyContext(),
     )
 
-    assert "Found 2000 items matching the search criteria" in result
-    assert "Paper 1999" in result
-    assert "Paper 2000" not in result
+    assert "Found 500 items matching the search criteria" in result
+    assert "Paper 499" in result
+    assert "Paper 500" not in result

@@ -48,6 +48,15 @@ class _AttachZotero(FakeZotero):
 
     def attachment_both(self, files, parentid=None, **kwargs):
         self.attachments.append({"files": files, "parentid": parentid})
+        key = f"ATT{len(self.attachments):05d}"
+        self._items.append(
+            {
+                "key": key,
+                "version": 1,
+                "data": {"filename": files[0][0], "md5": "test-md5"},
+            }
+        )
+        return {"success": [{"key": key}]}
 
 
 def _allow_ssrf_guard(monkeypatch):

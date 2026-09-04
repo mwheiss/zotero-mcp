@@ -321,8 +321,8 @@ class TestCrossrefTypeMap:
     def test_edited_book(self):
         assert server.CROSSREF_TYPE_MAP["edited-book"] == "book"
 
-    def test_standard_is_document(self):
-        assert server.CROSSREF_TYPE_MAP["standard"] == "document"
+    def test_standard_uses_native_type(self):
+        assert server.CROSSREF_TYPE_MAP["standard"] == "standard"
 
     def test_unknown_type_fallback(self):
         assert server.CROSSREF_TYPE_MAP.get("unknown-type", "document") == "document"

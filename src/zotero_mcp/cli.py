@@ -192,6 +192,14 @@ def _warmup_reranker_in_background() -> None:
     """
     import threading
 
+    try:
+        from zotero_mcp.config_light import reranker_enabled
+
+        if not reranker_enabled(str(_semantic_config_path(None))):
+            return
+    except Exception:
+        return
+
     def _run() -> None:
         try:
             from zotero_mcp.semantic_search import warmup_reranker

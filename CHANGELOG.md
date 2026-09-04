@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-04
+
+### Added
+- Split search routing by default: live local API for keyword/tag semantics, SQLite for advanced and explicit all-library searches; `api` and forced `sqlite` remain available overrides.
+- `search_all_libraries` on keyword, tag, advanced, and semantic searches; global results identify their source library.
+- Subcollection-aware collection search, paginated collection/duplicate listings, publisher-page citation metadata extraction, batch DOI/URL/ISBN inputs, Zotero base-field resolution, and direct note-key reading.
+- Read-only exact-DOI duplicate merge planning with deterministic keeper recommendations.
+
+### Changed
+- Generic URL imports now prefer Highwire/Dublin Core citation metadata, and thin Crossref records use publisher metadata as a fallback.
+- Removed the obsolete legacy XML document classifier, extractor, priority tier, and regression fixtures; the BetterIssa document pipeline is authoritative.
+- Local and remote attachment writes are verified; configured WebDAV uploads create a shell and send bytes directly to WebDAV instead of consuming Zotero Storage quota.
+- Package and semantic configuration imports are lazy, and local database paths configured at either the top level or legacy semantic-search location apply to every local reader.
+
+### Fixed
+- `zotero-mcp update` no longer replaces an ahead fork/development version with an older upstream release.
+- Child listings are fully paginated, PDF outline crashes and hangs are contained in a bounded subprocess, linked files resolve through `zotero.sqlite`, and trashed attachments cannot win full-text selection.
+- Concurrent identifier imports serialize their final check/create step, HTTP 412 updates retry with fresh versions, partial writes report partial status, Crossref-shaped CSL arrays/types import correctly, and type-specific title/date fields render and update correctly.
+- Duplicate execution now requires a short-lived one-use plan bound to the library, item versions, and complete child inventory; stale previews cannot be executed.
+- Dependency bounds require pyzotero's corrected rate-limit behavior and prevent an unreviewed FastMCP 4 upgrade.
+
 ## [1.3.1] - 2026-09-03
 
 ### Fixed

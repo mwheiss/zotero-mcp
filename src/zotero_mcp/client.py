@@ -6,6 +6,7 @@ import functools
 import math
 import os
 import re
+import shutil
 import threading
 import time
 from collections import OrderedDict
@@ -18,6 +19,7 @@ from dotenv import load_dotenv
 from markitdown import MarkItDown
 from pyzotero import zotero
 
+from zotero_mcp import schema
 from zotero_mcp._file_lock import acquire_file_lock, release_file_lock
 from zotero_mcp.local_api import (
     LocalApiHttpClient,
@@ -27,7 +29,13 @@ from zotero_mcp.local_api import (
     remote_local_host_header,
     writable_local_api_endpoints,
 )
-from zotero_mcp.utils import format_creators
+from zotero_mcp.utils import (
+    _paginate,
+    format_creators,
+    html_to_text,
+    item_display_date,
+    item_display_title,
+)
 from zotero_mcp.webdav import (
     WebDAVNotConfiguredError,
     download_attachment_from_webdav,
@@ -293,6 +301,17 @@ def get_current_library() -> dict[str, str]:
     return get_active_library() or get_default_library()
 
 
+def get_active_group_id() -> int:
+    """Return 0 for the personal library or the active Zotero group ID."""
+    library = get_current_library()
+    if _normalize_library_type(library.get("library_type", "user")) == "user":
+        return 0
+    try:
+        return int(library.get("library_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _make_local_http_client(
     *,
     authorize_writes: bool = False,
@@ -555,7 +574,7 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
 
     # Basic information
     lines = [
-        f"# {data.get('title', 'Untitled')}",
+        f"# {item_display_title(data)}",
         f"**Type:** {item_type}",
         f"**Item Key:** {data.get('key')}",
     ]
@@ -568,8 +587,11 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
         lines.append("**Status:** 🗑️ In Trash (recoverable from Zotero Trash view)")
 
     # Date
-    if date := data.get("date"):
+    if date := item_display_date(data):
         lines.append(f"**Date:** {date}")
+
+    if item_type == "note" and (note := data.get("note")):
+        lines.extend(["", "## Note", html_to_text(note)])
 
     # Authors/Creators
     if creators := data.get("creators", []):
@@ -599,6 +621,25 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
         lines.append(f"**Publisher:** {publisher}")
     if place := data.get("place"):
         lines.append(f"**Place:** {place}")
+
+    # Render populated type-specific fields that do not have a dedicated line
+    # above (court, docketNumber, nameOfAct, issueDate, and so on).
+    displayed = {
+        "key", "version", "itemType", "title", "date", "creators",
+        "publicationTitle", "bookTitle", "volume", "issue", "pages",
+        "publisher", "place", "DOI", "ISBN", "ISSN", "url", "extra",
+        "tags", "abstractNote", "relations", "collections", "deleted",
+        "dateAdded", "dateModified", "note",
+    }
+    displayed.add(schema.resolve_field(item_type, "title"))
+    displayed.add(schema.resolve_field(item_type, "date"))
+    for field, value in data.items():
+        if field in displayed or value in (None, "", [], {}, False):
+            continue
+        if not isinstance(value, (str, int, float, bool)):
+            continue
+        label = re.sub(r"(?<!^)(?=[A-Z])", " ", field).replace("_", " ").title()
+        lines.append(f"**{label}:** {value}")
 
     # Identifiers and URL
     if doi := data.get("DOI"):
@@ -705,7 +746,9 @@ def generate_bibtex(item: dict[str, Any]) -> str:
         first = creators[0]
         author = first.get("lastName", first.get("name", "").split()[-1] if first.get("name") else "").replace(" ", "")
 
-    year = data.get("date", "")[:4] if data.get("date") else "nodate"
+    display_date = item_display_date(data)
+    year_match = re.search(r"\b(\d{4})\b", display_date)
+    year = year_match.group(1) if year_match else "nodate"
     cite_key = f"{author}{year}_{item_key}"
 
     # Build BibTeX entry
@@ -725,9 +768,17 @@ def generate_bibtex(item: dict[str, Any]) -> str:
         ("DOI", "doi"),
         ("url", "url"),
         ("abstractNote", "abstract"),
+        ("ISBN", "isbn"),
+        ("ISSN", "issn"),
     ]
 
+    resolved_title = item_display_title(data)
+    if resolved_title and resolved_title != "Untitled":
+        lines.append(f"  title = {{{resolved_title}}},")
+
     for zotero_field, bibtex_field in field_mappings:
+        if zotero_field == "title":
+            continue
         if value := data.get(zotero_field):
             # Escape special characters
             value = value.replace("{", "\\{").replace("}", "\\}")
@@ -783,7 +834,7 @@ def get_attachment_details(zot: zotero.Zotero, item: dict[str, Any]) -> Attachme
 
     # For regular items, look for child attachments
     try:
-        children = zot.children(item_key)
+        children = _paginate(zot.children, item_key)
 
         # Group attachments by content type
         pdfs = []
@@ -854,7 +905,7 @@ def get_pdf_attachment_details(
         )
 
     candidates = []
-    for child in zot.children(item.get("key") or data.get("key", "")):
+    for child in _paginate(zot.children, item.get("key") or data.get("key", "")):
         child_data = child.get("data", {})
         content_type = child_data.get("contentType", "")
         filename = child_data.get("filename", "")
@@ -904,10 +955,7 @@ def download_attachment_file(
     """
     Download an attachment using the best available source.
 
-    The fallback order is:
-    1. local Zotero API (works with local storage or desktop-managed WebDAV)
-    2. Direct WebDAV access via environment variables
-    3. Zotero Web API (works with Zotero cloud storage)
+    The fallback order is local storage, local API, WebDAV, then cloud API.
     """
     destination = Path(destination_dir)
     destination.mkdir(parents=True, exist_ok=True)
@@ -918,6 +966,55 @@ def download_attachment_file(
     def _cleanup_target() -> None:
         if target_path.exists() and target_path.stat().st_size == 0:
             target_path.unlink()
+
+    def _try_local_storage() -> AttachmentDownloadResult | None:
+        """Copy a stored or linked attachment from the local Zotero library."""
+        try:
+            from zotero_mcp.local_db import LocalZoteroReader
+            from zotero_mcp.utils import is_local_mode
+
+            if not is_local_mode():
+                return None
+            config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
+            db_path = None
+            if config_path.exists():
+                try:
+                    import json
+
+                    with config_path.open(encoding="utf-8") as handle:
+                        config = json.load(handle)
+                    db_path = config.get("zotero_db_path") or (
+                        config.get("semantic_search", {}) or {}
+                    ).get("zotero_db_path")
+                except (OSError, ValueError, TypeError):
+                    pass
+            with LocalZoteroReader(db_path=db_path) as reader:
+                attachment = reader.get_attachment_by_key(attachment_key)
+                if attachment is None:
+                    return None
+                resolved = reader._resolve_attachment_path(
+                    attachment_key, attachment.get("zotero_path") or ""
+                )
+                if not (resolved and resolved.exists()):
+                    resolved = reader._scan_storage_for_attachment(
+                        attachment_key, attachment.get("content_type")
+                    )
+                if not (
+                    resolved
+                    and resolved.exists()
+                    and resolved.stat().st_size > 0
+                ):
+                    return None
+                # Callers own and may delete the returned path, so never expose
+                # the user's library file itself.
+                shutil.copyfile(resolved, target_path)
+                return AttachmentDownloadResult(
+                    path=target_path, source="Local storage", errors=errors
+                )
+        except Exception as exc:
+            errors.append(f"Local storage: {exc}")
+            _cleanup_target()
+            return None
 
     def _try_dump(label: str, zot_client: zotero.Zotero | None) -> AttachmentDownloadResult | None:
         if zot_client is None:
@@ -938,6 +1035,10 @@ def download_attachment_file(
             _cleanup_target()
 
         return None
+
+    storage_result = _try_local_storage()
+    if storage_result:
+        return storage_result
 
     local_result = _try_dump("Local Zotero", local_client)
     if local_result:

@@ -25,7 +25,8 @@ from zotero_mcp.tool_profiles import (
         "Inspect the active Zotero MCP contract before choosing a workflow. "
         "Reports the requested/effective tool profile, active library, local "
         "versus Web API mode, write availability, semantic/PDF optional "
-        "dependencies, full-text source availability, and whether local paths "
+        "dependencies, metadata-search backend/global-search availability, "
+        "full-text source availability, and whether local paths "
         "are exposed. Read-only and available in every profile."
     ),
 )
@@ -54,6 +55,7 @@ def get_capabilities(*, ctx: Context) -> str:
     )
     write_gate_configured = bool(os.getenv("ZOTERO_MCP_WRITE_SECRET"))
     write_usable = write_transport_usable and write_gate_configured
+    search_backend = _utils.get_search_backend()
 
     lines = [
         "# Zotero MCP Capabilities",
@@ -67,6 +69,9 @@ def get_capabilities(*, ctx: Context) -> str:
         f"**Write transport usable:** {'yes' if write_transport_usable else 'no'}",
         f"**Per-call write secret required:** {'yes' if write_gate_configured else 'misconfigured'}",
         f"**Semantic search installed:** {'yes' if semantic_available else 'no'}",
+        f"**Metadata search backend:** {search_backend}",
+        f"**All-library search:** "
+        f"{'yes' if local_mode and search_backend != 'api' else 'no'}",
         f"**PDF page/outline support:** {'yes' if pdf_available else 'no'}",
         f"**EPUB annotation authoring:** {'yes' if epub_available else 'no'}",
         f"**Local full-text extraction:** {'yes' if local_mode else 'no'}",

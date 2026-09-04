@@ -156,6 +156,12 @@ def get_item_fulltext(
         # Get item metadata in markdown format
         metadata = _client.format_item_metadata(item, include_abstract=True)
 
+        if (item.get("data", {}) or {}).get("itemType") == "note":
+            if attachment_key:
+                return f"Error: note `{item_key}` cannot have an attachment override."
+            note = _utils.html_to_text(item.get("data", {}).get("note", ""))
+            return f"{metadata}\n\n---\n\n## Note Text\n\n{note}"
+
         # In local mode, prefer direct local DB/storage extraction first.
         # This avoids pyzotero dump() failures on linked file:// attachments
         # when using remote clients over SSE/HTTP.
@@ -232,7 +238,9 @@ def get_item_fulltext(
         # Try to get attachment details
         attachment = selected_attachment
         if attachment is None:
-            selected = _attachments.select_best_attachment(zot.children(item_key))
+            selected = _attachments.select_best_attachment(
+                _helpers._paginate(zot.children, item_key)
+            )
             if selected is not None:
                 selected_item, selected_artifact_type = selected
                 selected_data = selected_item.get("data", {}) or {}
@@ -538,6 +546,8 @@ def get_collection_items(
     collection_key: str,
     detail: Literal["keys_only", "summary", "full"] = "summary",
     limit: int | str | None = 50,
+    offset: int | str = 0,
+    include_subcollections: bool = False,
     *,
     ctx: Context,
 ) -> str:
@@ -571,10 +581,18 @@ def get_collection_items(
                 f"If you just created this collection, wait a moment and try again."
             )
 
-        limit = _helpers._normalize_limit(limit, default=50)
+        limit = _helpers._normalize_limit(limit, default=50, max_val=2000)
+        try:
+            offset = max(0, int(offset))
+        except (TypeError, ValueError):
+            return "Error: offset must be a non-negative integer"
 
         # Fetch all items (includes children mixed in with parents)
-        all_items = _helpers._paginate(zot.collection_items, collection_key)
+        all_items = _helpers.fetch_collection_scope(
+            zot,
+            collection_key,
+            include_subcollections=include_subcollections,
+        )
         if not all_items:
             return f"No items found in collection: {collection_name} (Key: {collection_key})"
 
@@ -603,18 +621,13 @@ def get_collection_items(
         if not parent_items:
             return f"No items found in collection: {collection_name} (Key: {collection_key})"
 
-        # Apply display limit after filtering
-        if limit and len(parent_items) > limit:
-            display_items = parent_items[:limit]
-            truncated = True
-        else:
-            display_items = parent_items
-            truncated = False
+        display_items = parent_items[offset : offset + limit]
+        truncated = offset + len(display_items) < len(parent_items)
 
         # Format items as markdown based on detail level
         output = [f"# Items in Collection: {collection_name} ({len(parent_items)} items)", ""]
 
-        for i, item in enumerate(display_items, 1):
+        for i, item in enumerate(display_items, offset + 1):
             key = item.get("key", "")
             data = item.get("data", {})
             info = attachment_info.get(key, {})
@@ -649,7 +662,8 @@ def get_collection_items(
 
         if truncated:
             output.append(
-                f"\n*Showing {limit} of {len(parent_items)} items. Increase the limit parameter to see more.*"
+                f"\n*Showing items {offset + 1}-{offset + len(display_items)} of "
+                f"{len(parent_items)}. Continue with offset={offset + len(display_items)}.*"
             )
 
         result = "\n".join(output)
@@ -708,7 +722,7 @@ def get_item_children(item_key: str, *, ctx: Context) -> str:
             parent_title = f"Item {item_key}"
 
         # Then get the children
-        children = zot.children(item_key)
+        children = _helpers._paginate(zot.children, item_key)
         if not children:
             return f"No child items found for: {parent_title} (Key: {item_key})"
 
@@ -849,7 +863,7 @@ def get_items_children(item_keys: list[str] | str, *, ctx: Context) -> str:
             output.append(f"## {title} (`{key}`)")
 
             try:
-                children = zot.children(key)
+                children = _helpers._paginate(zot.children, key)
             except Exception as e:
                 output.append(f"  Error fetching children: {e}")
                 output.append("")
@@ -1440,7 +1454,7 @@ def get_recent(limit: int | str = 10, collection_key: str | None = None, *, ctx:
 
         # Format items as markdown
         scope = f" in Collection {collection_key}" if collection_key else ""
-        output = [f"# {limit} Most Recently Added Items{scope}", ""]
+        output = [f"# {len(items)} Most Recently Added Items{scope}", ""]
 
         for i, item in enumerate(items, 1):
             added = item.get("data", {}).get("dateAdded", "Unknown")

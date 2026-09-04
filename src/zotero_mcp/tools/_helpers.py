@@ -1,15 +1,18 @@
 """Shared private helpers used across tool modules."""
 
+import contextlib
 import json
 import os
 import re
 import socket
 import tempfile
+import threading
 from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
+from pyzotero.zotero_errors import PreConditionFailedError
 
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
@@ -20,6 +23,18 @@ from zotero_mcp._context import context_error, context_info, context_warning
 # ---------------------------------------------------------------------------
 
 ZOTERO_MCP_CONFIG_PATH = Path.home() / ".config" / "zotero-mcp" / "config.json"
+
+
+def global_search_error() -> str | None:
+    """Return why global search is unavailable, or ``None`` when enabled."""
+    if not _utils.is_local_mode():
+        return "Error: search_all_libraries requires local Zotero mode."
+    if _utils.get_search_backend() == "api":
+        return (
+            "Error: search_all_libraries requires the default split backend "
+            "or ZOTERO_SEARCH_BACKEND=sqlite."
+        )
+    return None
 
 
 def _load_zotero_mcp_config() -> dict:
@@ -42,27 +57,8 @@ def _load_zotero_mcp_config() -> dict:
 # ---------------------------------------------------------------------------
 
 def _paginate(zot_method, *args, max_items=None, **kwargs):
-    """Fetch all results from a pyzotero method using manual pagination.
-
-    Avoids zot.everything() which can cause RLock pickling in MCP contexts.
-    Accepts the same positional and keyword arguments as the wrapped method,
-    plus an optional max_items to cap the total results.
-    """
-    items = []
-    start = 0
-    page_size = 100
-    while True:
-        batch = zot_method(*args, start=start, limit=page_size, **kwargs)
-        if not batch:
-            break
-        items.extend(batch)
-        if len(batch) < page_size:
-            break
-        start += page_size
-        if max_items and len(items) >= max_items:
-            items = items[:max_items]
-            break
-    return items
+    """Compatibility alias for :func:`zotero_mcp.utils._paginate`."""
+    return _utils._paginate(zot_method, *args, max_items=max_items, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -71,19 +67,45 @@ def _paginate(zot_method, *args, max_items=None, **kwargs):
 
 CROSSREF_TYPE_MAP = {
     "journal-article": "journalArticle",
+    "journal-issue": "journalArticle",
+    "journal-volume": "journalArticle",
+    "journal": "journalArticle",
     "book": "book",
+    "monograph": "book",
+    "edited-book": "book",
+    "reference-book": "book",
+    "book-set": "book",
+    "book-series": "book",
     "book-chapter": "bookSection",
+    "book-part": "bookSection",
+    "book-section": "bookSection",
+    "book-track": "bookSection",
     "proceedings-article": "conferencePaper",
+    "proceedings": "book",
+    "proceedings-series": "book",
     "report": "report",
+    "report-series": "report",
+    "report-component": "report",
     "dissertation": "thesis",
     "posted-content": "preprint",
-    "monograph": "book",
     "reference-entry": "encyclopediaArticle",
-    "dataset": "document",
+    "dataset": "dataset",
+    "database": "dataset",
     "peer-review": "document",
-    "edited-book": "book",
-    "standard": "document",
+    "standard": "standard",
+    "component": "document",
+    "grant": "document",
+    "other": "document",
 }
+
+
+def crossref_type_note(cr_type: str) -> str:
+    if not cr_type or cr_type in CROSSREF_TYPE_MAP:
+        return ""
+    return (
+        f"\nNote: CrossRef type '{cr_type}' is not mapped by this version; "
+        "the item used Zotero's generic document type and may need correction."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +225,74 @@ def _handle_write_response(response, ctx=None):
     return bool(response)
 
 
+_MAX_VERSION_CONFLICT_RETRIES = 3
+
+
+def _update_item_with_version_retry(write_zot, item_key, mutate_fn, ctx=None):
+    """Refetch and replay an update after a stale-version HTTP 412."""
+    last_error = None
+    for attempt in range(_MAX_VERSION_CONFLICT_RETRIES):
+        item = write_zot.item(item_key)
+        mutate_fn(item)
+        try:
+            return write_zot.update_item(item)
+        except PreConditionFailedError as exc:
+            last_error = exc
+            if ctx is not None:
+                context_info(
+                    ctx,
+                    f"Version conflict updating {item_key} "
+                    f"({attempt + 1}/{_MAX_VERSION_CONFLICT_RETRIES}); retrying.",
+                )
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Could not update item {item_key}")
+
+
+_identifier_locks: dict[str, list] = {}
+_identifier_locks_guard = threading.Lock()
+
+
+def identifier_lock_key(kind: str, raw) -> str | None:
+    """Return the canonical in-process lock key for an identifier."""
+    if raw is None:
+        return None
+    if kind == "doi":
+        normalized = _normalize_doi(raw)
+    elif kind == "isbn":
+        normalized = _normalize_isbn(raw)
+    elif kind == "arxiv":
+        normalized = _normalize_arxiv_id(raw)
+    elif kind == "url":
+        normalized = str(raw).strip() or None
+    else:
+        raise ValueError(f"unknown identifier kind {kind!r}")
+    return f"{kind}:{normalized}" if normalized else None
+
+
+@contextlib.contextmanager
+def identifier_lock(kind: str, raw):
+    """Serialize one identifier's check-then-create sequence in-process."""
+    key = identifier_lock_key(kind, raw)
+    if key is None:
+        yield None
+        return
+    with _identifier_locks_guard:
+        entry = _identifier_locks.get(key)
+        if entry is None:
+            entry = _identifier_locks[key] = [threading.RLock(), 0]
+        entry[1] += 1
+    entry[0].acquire()
+    try:
+        yield key
+    finally:
+        entry[0].release()
+        with _identifier_locks_guard:
+            entry[1] -= 1
+            if entry[1] == 0 and _identifier_locks.get(key) is entry:
+                del _identifier_locks[key]
+
+
 def ensure_collection_membership(write_zot, item_key: str, coll_keys: list[str], ctx=None) -> list[str]:
     """Force *item_key* into each collection in *coll_keys*; return keys we couldn't file.
 
@@ -250,7 +340,9 @@ def _normalize_limit(limit: int | str | None, default: int = 10, max_val: int = 
         return default
     if isinstance(limit, str):
         limit = int(limit)
-    return max(1, min(limit, max_val))
+    if limit <= 0:
+        return default
+    return min(limit, max_val)
 
 
 def _normalize_str_list_input(value, field_name="value"):
@@ -385,6 +477,60 @@ def build_collection_paths(collections) -> dict[str, list[str]]:
     for key in by_key:
         _segments(key, {key})
     return paths
+
+
+def collection_descendants(collections, collection_key: str) -> list[str]:
+    """Return a collection and all descendants, breadth-first and cycle-safe."""
+    children: dict[str, list[str]] = {}
+    for collection in collections:
+        key = collection.get("key")
+        parent = (collection.get("data", {}) or {}).get("parentCollection")
+        if key and parent:
+            children.setdefault(parent, []).append(key)
+    ordered = [collection_key]
+    seen = {collection_key}
+    queue = [collection_key]
+    while queue:
+        current = queue.pop(0)
+        for child in children.get(current, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            ordered.append(child)
+            queue.append(child)
+    return ordered
+
+
+def expand_collection_scope(
+    zot, collection_key: str, include_subcollections: bool
+) -> list[str]:
+    if not include_subcollections:
+        return [collection_key]
+    return collection_descendants(_paginate(zot.collections), collection_key)
+
+
+def fetch_collection_scope(
+    zot,
+    collection_key: str,
+    *,
+    include_subcollections: bool = False,
+    max_items: int | None = None,
+    **kwargs,
+) -> list[dict]:
+    """Fetch and de-duplicate items across a collection subtree."""
+    output: list[dict] = []
+    seen: set[str] = set()
+    for key in expand_collection_scope(zot, collection_key, include_subcollections):
+        for item in _paginate(zot.collection_items, key, **kwargs):
+            item_key = item.get("key") or (item.get("data", {}) or {}).get("key")
+            if item_key and item_key in seen:
+                continue
+            if item_key:
+                seen.add(item_key)
+            output.append(item)
+            if max_items and len(output) >= max_items:
+                return output[:max_items]
+    return output[:max_items] if max_items else output
 
 
 def resolve_collection_specs(
@@ -824,17 +970,18 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
                 context_info(ctx, "Downloaded file too small, likely not a real PDF")
                 return None
 
-            attach_result = write_zot.attachment_both(
-                [(filename, filepath)],
-                parentid=item_key,
-            )
-            # Must run inside the with-block — temp file disappears on exit.
-            return _maybe_upload_to_webdav(
-                attach_result,
+            ok, detail, _ = _attach_and_verify(
+                write_zot,
+                filename,
                 filepath,
+                item_key,
                 ctx,
-                write_zot=write_zot,
+                content_type="application/pdf",
             )
+            if not ok:
+                context_info(ctx, f"PDF attachment failed verification: {detail}")
+                return None
+            return detail
     except Exception as e:
         context_info(ctx, f"PDF download/attach failed: {e}")
         return None
@@ -893,6 +1040,158 @@ def _maybe_upload_to_webdav(attach_result, file_path, ctx, write_zot=None):
             f" (WARNING: WebDAV upload failed — {e}; "
             f"attachment {attachment_key} exists but has no file bytes on WebDAV)"
         )
+
+
+def _extract_attachment_key(attach_result) -> str | None:
+    """Return the first attachment key in a pyzotero upload result."""
+    if not isinstance(attach_result, dict):
+        return None
+    for status in ("success", "unchanged"):
+        value = attach_result.get(status)
+        if isinstance(value, dict):
+            for entry in value.values():
+                if isinstance(entry, str):
+                    return entry
+                if isinstance(entry, dict) and entry.get("key"):
+                    return str(entry["key"])
+        for entry in value or [] if isinstance(value, list) else []:
+            if isinstance(entry, dict) and entry.get("key"):
+                return str(entry["key"])
+    return None
+
+
+def _describe_attach_failure(attach_result) -> str | None:
+    if _extract_attachment_key(attach_result) is not None:
+        return None
+    if not isinstance(attach_result, dict):
+        return f"unexpected upload result: {attach_result!r}"
+    failures = attach_result.get("failure") or []
+    if failures:
+        return f"upload rejected: {failures}"
+    return "upload returned no attachment key"
+
+
+def _delete_orphan_attachment(write_zot, attachment_key, version, ctx) -> str | None:
+    try:
+        if version is None:
+            version = write_zot.item(attachment_key)["version"]
+        write_zot.delete_item({"key": attachment_key, "version": version})
+        context_info(ctx, f"Cleaned up orphan attachment {attachment_key}")
+        return None
+    except Exception as exc:
+        return f"orphan attachment {attachment_key} could not be removed: {exc}"
+
+
+def _webdav_first_attach(
+    write_zot, filename, file_path, parent_key, ctx, content_type=None
+):
+    """Create only the Zotero item shell when bytes belong on WebDAV."""
+    from zotero_mcp import webdav as _webdav
+
+    if getattr(write_zot, "local", False) or not _webdav.is_webdav_configured():
+        return None
+    template = write_zot.item_template("attachment", linkmode="imported_file")
+    template.update(title=filename, filename=filename, parentItem=parent_key)
+    if content_type:
+        template["contentType"] = content_type
+    result = write_zot.create_items([template])
+    if not (isinstance(result, dict) and result.get("success")):
+        return False, f"could not create WebDAV attachment shell: {result}", None
+    key = next(iter(result["success"].values()))
+    version = next(iter((result.get("successVersions") or {}).values()), None)
+    try:
+        _webdav.upload_attachment_to_webdav(
+            attachment_key=key, file_path=file_path
+        )
+        context_info(ctx, f"WebDAV PUT: {key}.zip uploaded")
+        return True, f" (uploaded directly to WebDAV as {key}.zip)", key
+    except Exception as exc:
+        cleanup = _delete_orphan_attachment(write_zot, key, version, ctx)
+        reason = f"WebDAV upload failed: {exc}"
+        if cleanup:
+            reason += f"; {cleanup}"
+        return False, reason, None
+
+
+def _two_step_attach(
+    write_zot, filename, file_path, parent_key, ctx, content_type=None
+):
+    """Create an attachment shell, upload bytes, and verify stored MD5."""
+    template = write_zot.item_template("attachment", linkmode="imported_file")
+    template["title"] = filename
+    template["filename"] = filename
+    template["parentItem"] = parent_key
+    if content_type:
+        template["contentType"] = content_type
+    result = write_zot.create_items([template])
+    if not (isinstance(result, dict) and result.get("success")):
+        return None, f"could not create attachment item: {result}"
+    attachment_key = next(iter(result["success"].values()))
+    version = next(iter((result.get("successVersions") or {}).values()), None)
+    try:
+        attachment = write_zot.item(attachment_key)["data"]
+        attachment["filename"] = file_path
+        upload = write_zot.upload_attachments([attachment])
+        if isinstance(upload, dict) and upload.get("failure"):
+            raise RuntimeError(f"upload rejected: {upload['failure']}")
+        stored = write_zot.item(attachment_key)
+        if not (stored.get("data", {}) or {}).get("md5"):
+            raise RuntimeError("upload reported success but no MD5 was stored")
+        return attachment_key, None
+    except Exception as exc:
+        cleanup = _delete_orphan_attachment(
+            write_zot, attachment_key, version, ctx
+        )
+        reason = str(exc)
+        return None, f"{reason}; {cleanup}" if cleanup else reason
+
+
+def _attach_and_verify(
+    write_zot, filename, file_path, parent_key, ctx, content_type=None
+):
+    """Attach a file and return ``(ok, detail, attachment_key)``."""
+    webdav_result = _webdav_first_attach(
+        write_zot,
+        filename,
+        file_path,
+        parent_key,
+        ctx,
+        content_type=content_type,
+    )
+    if webdav_result is not None:
+        return webdav_result
+    attach_result = write_zot.attachment_both(
+        [(filename, file_path)], parentid=parent_key
+    )
+    reason = _describe_attach_failure(attach_result)
+    if reason is None:
+        key = _extract_attachment_key(attach_result)
+        # Refetching verifies that the attachment was registered. Some local
+        # write transports do not expose md5 immediately, so key existence is
+        # the portable baseline; the two-step fallback below requires md5.
+        stored = write_zot.item(key)
+        if not stored or not (stored.get("data", {}) or {}).get("filename"):
+            reason = "attachment key was returned but could not be verified"
+        else:
+            suffix = _maybe_upload_to_webdav(
+                attach_result, file_path, ctx, write_zot=write_zot
+            )
+            return True, suffix, key
+    context_info(ctx, f"attachment_both failed ({reason}); trying create + upload")
+    key, fallback_reason = _two_step_attach(
+        write_zot,
+        filename,
+        file_path,
+        parent_key,
+        ctx,
+        content_type=content_type,
+    )
+    if key is None:
+        return False, f"{reason}; two-step retry failed: {fallback_reason}", None
+    suffix = _maybe_upload_to_webdav(
+        {"success": [{"key": key}]}, file_path, ctx, write_zot=write_zot
+    )
+    return True, suffix, key
 
 
 def _attach_pdf_linked_url(write_zot, pdf_url, parent_key, ctx):

@@ -286,7 +286,7 @@ def get_annotations(
                     # Ensure PDF annotation tool is installed
                     if ensure_pdfannots_installed():
                         # Get PDF attachments via the resolved parent key
-                        children = zot.children(parent_item_key)
+                        children = _helpers._paginate(zot.children, parent_item_key)
                         pdf_attachments = [
                             item for item in children
                             if item.get("data", {}).get("contentType") == "application/pdf"
@@ -526,7 +526,13 @@ def get_notes(
         # Get notes (paginated to avoid missing results)
         notes = []
         if item_key:
-            notes = _helpers._paginate(zot.children, item_key, max_items=limit, **params)
+            addressed = zot.item(item_key)
+            if (addressed.get("data", {}) or {}).get("itemType") == "note":
+                notes = [addressed]
+            else:
+                notes = _helpers._paginate(
+                    zot.children, item_key, max_items=limit, **params
+                )
         else:
             notes = _helpers._paginate(zot.items, max_items=limit, **params)
 
@@ -560,7 +566,7 @@ def get_notes(
             note_text = data.get("note", "")
 
             if not raw_html:
-                note_text = _utils.clean_html(note_text)
+                note_text = _utils.html_to_text(note_text)
 
             # Limit note length for display
             if truncate and len(note_text) > 500:

@@ -5,7 +5,7 @@ Each test prevents a specific bug from reappearing.
 
 import json
 
-from conftest import DummyContext, FakeZotero, _FakeResponse
+from conftest import DummyContext, FakeZotero, _FakeResponse, execute_merge_with_plan
 
 from zotero_mcp import server
 
@@ -111,8 +111,8 @@ class TestMergeTrashMethod:
         fake = self._setup(monkeypatch)
         ctx = DummyContext()
 
-        server.merge_duplicates(
-            keeper_key="KEEP", duplicate_keys=["DUP1"], confirm=True, ctx=ctx
+        execute_merge_with_plan(
+            server.merge_duplicates, "KEEP", ["DUP1"], ctx
         )
 
         # update_item should NOT have been called with any "deleted" field
@@ -168,9 +168,6 @@ class TestPdfOutlineDownloadMethod:
     """PDF outline and page reading share deterministic attachment selection."""
 
     def test_shared_pdf_resolver_is_used(self, monkeypatch, tmp_path):
-        import sys
-        import types
-
         pdf_path = tmp_path / "paper.pdf"
         pdf_path.write_bytes(b"%PDF-1.4 fake")
         resolver_calls = []
@@ -182,16 +179,13 @@ class TestPdfOutlineDownloadMethod:
         monkeypatch.setattr("zotero_mcp.tools.read_pdf._get_pdf_path", resolve)
         monkeypatch.setattr("zotero_mcp.tools.read_pdf._cleanup_path", lambda _path: None)
 
-        # Mock fitz
-        class FakeDoc:
-            def get_toc(self):
-                return [[1, "Intro", 1]]
-            def close(self):
-                pass
+        from zotero_mcp.tools import write
 
-        fake_fitz = types.ModuleType("fitz")
-        fake_fitz.open = lambda *a, **kw: FakeDoc()
-        monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
+        monkeypatch.setattr(
+            write,
+            "_extract_pdf_toc",
+            lambda _path: write.TocOutcome("ok", [[1, "Intro", 1]]),
+        )
 
         ctx = DummyContext()
         result = server.get_pdf_outline(item_key="PARENT01", ctx=ctx)

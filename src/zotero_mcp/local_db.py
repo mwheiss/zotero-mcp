@@ -12,12 +12,11 @@ import os
 import platform
 import re
 import sqlite3
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .utils import _normalize_for_search, is_local_mode
+from .utils import _generate_search_variants, _normalize_for_search, is_local_mode
 
 logger = logging.getLogger(__name__)
 
@@ -211,10 +210,20 @@ class LocalZoteroReader:
             pdf_max_pages: Maximum pages to extract from PDFs.
             pdf_timeout: Seconds to wait for PDF extraction before killing the process.
         """
+        if db_path is None:
+            config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                db_path = config.get("zotero_db_path") or (
+                    config.get("semantic_search", {}) or {}
+                ).get("zotero_db_path")
+            except (OSError, ValueError, TypeError):
+                db_path = None
         self.db_path = db_path or self._find_zotero_db()
         self._connection: sqlite3.Connection | None = None
         self.pdf_max_pages: int | None = pdf_max_pages
         self.pdf_timeout: int = pdf_timeout
+        self._library_labels: dict[int, tuple[int, str]] | None = None
         # Reduce noise from pdfminer warnings
         try:
             logging.getLogger("pdfminer").setLevel(logging.ERROR)
@@ -322,7 +331,8 @@ class LocalZoteroReader:
                    att.key as attachmentKey
             FROM itemAttachments ia
             JOIN items att ON att.itemID = ia.itemID
-            WHERE ia.parentItemID = ?
+            LEFT JOIN deletedItems d ON d.itemID = ia.itemID
+            WHERE ia.parentItemID = ? AND d.itemID IS NULL
             """
         for row in conn.execute(query, (parent_item_id,)):
             yield row["attachmentKey"], row["path"], row["contentType"]
@@ -348,7 +358,8 @@ class LocalZoteroReader:
                  )
                 LEFT JOIN itemDataValues idv
                   ON idv.valueID = id.valueID
-                WHERE ia.parentItemID = ?
+                LEFT JOIN deletedItems d ON d.itemID = ia.itemID
+                WHERE ia.parentItemID = ? AND d.itemID IS NULL
                 """,
                     (parent_item_id,),
                 )
@@ -380,7 +391,6 @@ class LocalZoteroReader:
         filename = path.rsplit("/", 1)[-1]
         words = re.sub(r"[^a-z0-9]+", " ", f"{title} {filename}".casefold()).split()
         is_pdf = (content_type or "").lower() == "application/pdf" or path.lower().endswith(".pdf")
-        is_xml = (content_type or "").lower() in {"application/xml", "text/xml"} or path.lower().endswith(".xml")
         is_fulltext = "fulltext" in words or ("full" in words and "text" in words)
         is_betterissa = "betterissa" in words
         return (
@@ -394,8 +404,7 @@ class LocalZoteroReader:
                     or ("reading" in words and "view" in words)
                 )
             )
-            or (is_xml and ("grobid" in words or "tei" in words))
-            or (not is_pdf and not is_xml and is_fulltext)
+            or (not is_pdf and is_fulltext)
             or (is_pdf and ("ocr" in words or is_fulltext))
         )
 
@@ -639,46 +648,6 @@ class LocalZoteroReader:
         except Exception:
             return ""
 
-    @staticmethod
-    def _normalize_xml_text(element: ET.Element) -> str:
-        """Collapse XML text nodes into readable prose."""
-        text = re.sub(r"\s+", " ", " ".join(element.itertext())).strip()
-        return re.sub(r"\s+([,.;:!?])", r"\1", text)
-
-    def _extract_grobid_tei(self, file_path: Path) -> str:
-        """Extract only abstract and body text from a GROBID TEI document."""
-        try:
-            root = ET.parse(file_path).getroot()
-        except (ET.ParseError, OSError, ValueError) as exc:
-            logger.debug("Could not parse GROBID TEI %s: %s", file_path, exc)
-            return ""
-
-        def local_name(element: ET.Element) -> str:
-            return element.tag.rsplit("}", 1)[-1].lower()
-
-        if local_name(root) != "tei":
-            return ""
-
-        abstracts: list[str] = []
-        for element in root.iter():
-            is_abstract = local_name(element) == "abstract"
-            is_abstract_div = local_name(element) == "div" and element.attrib.get("type", "").lower() == "abstract"
-            if is_abstract or is_abstract_div:
-                text = self._normalize_xml_text(element)
-                if text and text not in abstracts:
-                    abstracts.append(text)
-
-        bodies = [self._normalize_xml_text(element) for element in root.iter() if local_name(element) == "body"]
-        bodies = [text for text in bodies if text]
-        if not bodies:
-            return ""
-
-        parts = []
-        if abstracts:
-            parts.append("Abstract:\n" + "\n\n".join(abstracts))
-        parts.append("Body:\n" + "\n\n".join(bodies))
-        return "\n\n".join(parts)
-
     def _extract_betterissa_semantic_document(self, file_path: Path) -> str:
         """Extract the clean text payload from a BetterIssa semantic document."""
         try:
@@ -915,7 +884,7 @@ class LocalZoteroReader:
         2. BetterIssa semantic-document clean text.
         3. BetterIssa Advanced OCR Markdown.
         4. BetterIssa Reading View.
-        5. Legacy GROBID / named fulltext sources.
+        5. Named fulltext sources.
         6. Any PDF, regardless of its filename or Zotero title.
         7. Any other extractable attachment.
 
@@ -1092,16 +1061,6 @@ class LocalZoteroReader:
                 [candidate for candidate in candidates if is_betterissa_reading_view(candidate)],
             ),
             (
-                "grobid-tei",
-                [
-                    candidate
-                    for candidate in candidates
-                    if not has_betterissa_auxiliary_marker(candidate)
-                    and is_xml(candidate)
-                    and (is_named(candidate, "grobid") or is_named(candidate, "tei"))
-                ],
-            ),
-            (
                 "fulltext",
                 [
                     candidate
@@ -1155,11 +1114,7 @@ class LocalZoteroReader:
                 if not resolved or not resolved.exists():
                     resolved = self._scan_storage_for_attachment(candidate.key, candidate.content_type)
 
-                if source == "grobid-tei":
-                    if not resolved or not resolved.exists():
-                        continue
-                    text = self._extract_grobid_tei(resolved)
-                elif source == "betterissa-semantic":
+                if source == "betterissa-semantic":
                     if not resolved or not resolved.exists():
                         continue
                     text = self._extract_betterissa_semantic_document(resolved)
@@ -1603,6 +1558,40 @@ class LocalZoteroReader:
             )
         return out
 
+    def get_attachment_by_key(self, attachment_key: str) -> dict | None:
+        """Return one live attachment addressed by its own Zotero key."""
+        row = self._get_connection().execute(
+            """
+            SELECT att.key AS attachmentKey,
+                   ia.path AS path,
+                   ia.contentType AS contentType,
+                   title_val.value AS title,
+                   parent.key AS parentKey
+            FROM itemAttachments ia
+            JOIN items att ON att.itemID = ia.itemID
+            LEFT JOIN items parent ON parent.itemID = ia.parentItemID
+            LEFT JOIN itemData title_data
+              ON title_data.itemID = att.itemID
+             AND title_data.fieldID = (
+                 SELECT fieldID FROM fields WHERE fieldName = 'title'
+             )
+            LEFT JOIN itemDataValues title_val
+              ON title_data.valueID = title_val.valueID
+            WHERE att.key = ?
+              AND att.itemID NOT IN (SELECT itemID FROM deletedItems)
+            """,
+            (attachment_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "key": row["attachmentKey"],
+            "content_type": row["contentType"],
+            "zotero_path": row["path"],
+            "title": row["title"],
+            "parent_key": row["parentKey"],
+        }
+
     def get_item_by_key(self, key: str, library_id: int | None = None) -> ZoteroItem | None:
         """
         Get a specific item by its Zotero key.
@@ -1640,6 +1629,351 @@ class LocalZoteroReader:
                     break
 
         return matching_items
+
+    # ------------------------------------------------------------------
+    # Optional SQLite metadata-search backend
+    # ------------------------------------------------------------------
+
+    def _resolve_search_library_ids(self, group_id: int | None) -> list[int] | None:
+        conn = self._get_connection()
+        if group_id is None:
+            rows = conn.execute(
+                "SELECT libraryID FROM libraries "
+                "WHERE type IN ('user', 'group') ORDER BY libraryID"
+            ).fetchall()
+            return [int(row[0]) for row in rows] or None
+        if group_id == 0:
+            row = conn.execute(
+                "SELECT libraryID FROM libraries WHERE type = 'user' LIMIT 1"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT libraryID FROM groups WHERE groupID = ?", (group_id,)
+            ).fetchone()
+        return [int(row[0])] if row is not None else None
+
+    def get_library_labels(self) -> dict[int, tuple[int, str]]:
+        if self._library_labels is None:
+            rows = self._get_connection().execute(
+                """
+                SELECT l.libraryID, l.type, g.groupID, g.name
+                FROM libraries l
+                LEFT JOIN groups g ON l.libraryID = g.libraryID
+                """
+            ).fetchall()
+            labels: dict[int, tuple[int, str]] = {}
+            for row in rows:
+                if row["type"] == "user":
+                    labels[int(row["libraryID"])] = (0, "My Library")
+                elif row["type"] == "group" and row["groupID"] is not None:
+                    labels[int(row["libraryID"])] = (
+                        int(row["groupID"]),
+                        row["name"] or f"Group {row['groupID']}",
+                    )
+            self._library_labels = labels
+        return self._library_labels
+
+    @staticmethod
+    def _chunks(values: list[int], size: int = 500):
+        for start in range(0, len(values), size):
+            yield values[start : start + size]
+
+    def _metadata_search_items(self, group_id: int | None) -> list[dict] | None:
+        """Hydrate live top-level items directly from zotero.sqlite."""
+        conn = self._get_connection()
+        library_ids = self._resolve_search_library_ids(group_id)
+        if not library_ids:
+            return None
+        placeholders = ",".join("?" * len(library_ids))
+        rows = conn.execute(
+            f"""
+            SELECT i.itemID, i.key, i.libraryID, it.typeName AS itemType,
+                   i.dateAdded, i.dateModified
+            FROM items i
+            JOIN itemTypes it ON it.itemTypeID = i.itemTypeID
+            WHERE i.libraryID IN ({placeholders})
+              AND it.typeName NOT IN ('attachment', 'note', 'annotation')
+              AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
+            ORDER BY i.dateModified DESC, i.itemID DESC
+            """,
+            library_ids,
+        ).fetchall()
+        item_ids = [int(row["itemID"]) for row in rows]
+        fields: dict[int, dict[str, Any]] = {}
+        creators: dict[int, list[dict[str, str]]] = {}
+        tags: dict[int, list[dict[str, str]]] = {}
+        collections: dict[int, list[str]] = {}
+        notes: dict[int, list[str]] = {}
+        for chunk in self._chunks(item_ids):
+            marks = ",".join("?" * len(chunk))
+            for row in conn.execute(
+                f"""
+                SELECT d.itemID, f.fieldName, v.value
+                FROM itemData d
+                JOIN fields f ON f.fieldID = d.fieldID
+                JOIN itemDataValues v ON v.valueID = d.valueID
+                WHERE d.itemID IN ({marks})
+                """,
+                chunk,
+            ):
+                fields.setdefault(int(row["itemID"]), {})[row["fieldName"]] = row["value"]
+            for row in conn.execute(
+                f"""
+                SELECT ic.itemID, c.firstName, c.lastName, ct.creatorType
+                FROM itemCreators ic
+                JOIN creators c ON c.creatorID = ic.creatorID
+                LEFT JOIN creatorTypes ct ON ct.creatorTypeID = ic.creatorTypeID
+                WHERE ic.itemID IN ({marks})
+                ORDER BY ic.itemID, ic.orderIndex
+                """,
+                chunk,
+            ):
+                creator = {"creatorType": row["creatorType"] or "author"}
+                if row["firstName"]:
+                    creator.update(
+                        firstName=row["firstName"], lastName=row["lastName"] or ""
+                    )
+                else:
+                    creator["name"] = row["lastName"] or ""
+                creators.setdefault(int(row["itemID"]), []).append(creator)
+            for row in conn.execute(
+                f"""
+                SELECT itg.itemID, t.name
+                FROM itemTags itg JOIN tags t ON t.tagID = itg.tagID
+                WHERE itg.itemID IN ({marks})
+                """,
+                chunk,
+            ):
+                tags.setdefault(int(row["itemID"]), []).append({"tag": row["name"]})
+            for row in conn.execute(
+                f"""
+                SELECT ci.itemID, c.key
+                FROM collectionItems ci
+                JOIN collections c ON c.collectionID = ci.collectionID
+                WHERE ci.itemID IN ({marks})
+                """,
+                chunk,
+            ):
+                collections.setdefault(int(row["itemID"]), []).append(row["key"])
+            for row in conn.execute(
+                f"""
+                SELECT parentItemID, note FROM itemNotes
+                WHERE parentItemID IN ({marks})
+                """,
+                chunk,
+            ):
+                notes.setdefault(int(row["parentItemID"]), []).append(row["note"] or "")
+
+        from zotero_mcp import schema
+
+        labels = self.get_library_labels()
+        output: list[dict] = []
+        for row in rows:
+            item_id = int(row["itemID"])
+            item_type = row["itemType"]
+            data = dict(fields.get(item_id, {}))
+            date_field = schema.resolve_field(item_type, "date")
+            if isinstance(data.get(date_field), str) and re.match(
+                r"^\d{4}-\d{2}-\d{2}\s", data[date_field]
+            ):
+                data["_dateISO"] = data[date_field][:10]
+                data[date_field] = data[date_field].split(" ", 1)[1]
+            data.update(
+                key=row["key"],
+                itemType=item_type,
+                dateAdded=row["dateAdded"] or "",
+                dateModified=row["dateModified"] or "",
+                creators=creators.get(item_id, []),
+                tags=tags.get(item_id, []),
+                collections=collections.get(item_id, []),
+            )
+            if notes.get(item_id):
+                data["_noteText"] = "\n".join(notes[item_id])
+            item = {"key": row["key"], "data": data}
+            label = labels.get(int(row["libraryID"]))
+            if label:
+                gid, name = label
+                item["library"] = {
+                    "id": gid,
+                    "type": "user" if gid == 0 else "group",
+                    "name": name,
+                }
+            output.append(item)
+        return output
+
+    @staticmethod
+    def _matches_tag_filter(data: dict, filters: list[str]) -> bool:
+        actual = {
+            str(entry.get("tag", "")).casefold()
+            for entry in data.get("tags", [])
+            if isinstance(entry, dict)
+        }
+        for expression in filters:
+            terms = [part.strip() for part in re.split(r"\s+OR\s+|\|\|", expression)]
+            matches = []
+            for term in terms:
+                excluded = term.startswith("-")
+                value = (term[1:] if excluded else term).strip().casefold()
+                present = value in actual
+                matches.append(not present if excluded else present)
+            if not any(matches):
+                return False
+        return True
+
+    def search_items_sql(
+        self,
+        query: str,
+        qmode: str = "titleCreatorYear",
+        item_type: str = "-attachment",
+        tag: list[str] | None = None,
+        limit: int = 10,
+        group_id: int | None = 0,
+    ) -> list[dict] | None:
+        if qmode not in {"titleCreatorYear", "everything"}:
+            return None
+        items = self._metadata_search_items(group_id)
+        if items is None:
+            return None
+        variants = [
+            _normalize_for_search(value).casefold()
+            for value in _generate_search_variants(query)
+            if value
+        ]
+        output = []
+        for item in items:
+            data = item["data"]
+            current_type = data.get("itemType", "")
+            if item_type.startswith("-") and current_type == item_type[1:]:
+                continue
+            if item_type and not item_type.startswith("-") and current_type != item_type:
+                continue
+            if tag and not self._matches_tag_filter(data, tag):
+                continue
+            from zotero_mcp.utils import format_creators, item_display_date, item_display_title
+
+            values = [
+                item_display_title(data),
+                format_creators(data.get("creators", [])),
+                item_display_date(data),
+            ]
+            if qmode == "everything":
+                values.extend(
+                    [
+                        data.get("abstractNote", ""),
+                        data.get("extra", ""),
+                        data.get("_noteText", ""),
+                        " ".join(t.get("tag", "") for t in data.get("tags", [])),
+                    ]
+                )
+            haystack = _normalize_for_search(" ".join(map(str, values))).casefold()
+            if variants and not any(variant in haystack for variant in variants):
+                continue
+            data.pop("_noteText", None)
+            data.pop("_dateISO", None)
+            output.append(item)
+            if len(output) >= limit:
+                break
+        return output
+
+    @staticmethod
+    def _advanced_values(
+        data: dict, field: str, operation: str | None = None
+    ) -> list[str]:
+        lowered = field.lower()
+        if lowered in {"author", "authors", "creator", "creators"}:
+            values = []
+            for creator in data.get("creators", []):
+                values.append(
+                    " ".join(
+                        filter(None, [creator.get("firstName"), creator.get("lastName")])
+                    )
+                    or creator.get("name", "")
+                )
+            return values
+        if lowered in {"tag", "tags"}:
+            return [entry.get("tag", "") for entry in data.get("tags", [])]
+        if lowered in {"collection", "collections"}:
+            return list(data.get("collections", []))
+        aliases = {
+            "itemtype": "itemType",
+            "dateadded": "dateAdded",
+            "datemodified": "dateModified",
+            "doi": "DOI",
+        }
+        key = aliases.get(lowered, field)
+        if lowered == "title":
+            from zotero_mcp.utils import item_display_title
+
+            return [item_display_title(data)]
+        if lowered in {"date", "year"}:
+            from zotero_mcp.utils import item_display_date
+
+            date = item_display_date(data)
+            if lowered == "year":
+                match = re.search(r"\b(\d{4})\b", date)
+                return [match.group(1)] if match else []
+            if operation in {"isGreaterThan", "isLessThan", "isBefore", "isAfter"}:
+                return [str(data.get("_dateISO") or date)]
+            return [date]
+        value = data.get(key)
+        return [] if value is None else [str(value)]
+
+    @staticmethod
+    def _advanced_compare(candidate: str, expected: str, operation: str) -> bool:
+        left = _normalize_for_search(candidate).casefold()
+        right = _normalize_for_search(expected).casefold()
+        if operation == "is":
+            return left == right
+        if operation == "isNot":
+            return left != right
+        if operation == "contains":
+            return right in left
+        if operation == "doesNotContain":
+            return right not in left
+        if operation == "beginsWith":
+            return left.startswith(right)
+        if operation == "endsWith":
+            return left.endswith(right)
+        if operation in {"isGreaterThan", "isAfter"}:
+            return left > right
+        if operation in {"isLessThan", "isBefore"}:
+            return left < right
+        return False
+
+    def advanced_search_sql(
+        self,
+        conditions: list[dict[str, str]],
+        join_mode: str = "all",
+        group_id: int | None = 0,
+    ) -> list[dict] | None:
+        items = self._metadata_search_items(group_id)
+        if items is None:
+            return None
+        output = []
+        for item in items:
+            checks = []
+            for condition in conditions:
+                operation = condition["operation"]
+                values = self._advanced_values(
+                    item["data"], condition["field"], operation
+                )
+                if not values:
+                    checks.append(operation in {"isNot", "doesNotContain"})
+                    continue
+                compared = [
+                    self._advanced_compare(value, condition["value"], operation)
+                    for value in values
+                ]
+                checks.append(
+                    all(compared)
+                    if operation in {"isNot", "doesNotContain"}
+                    else any(compared)
+                )
+            if all(checks) if join_mode == "all" else any(checks):
+                item["data"].pop("_noteText", None)
+                item["data"].pop("_dateISO", None)
+                output.append(item)
+        return output
 
     def search_notes_local(self, query: str, limit: int = 20) -> list[dict]:
         """Search notes in the local Zotero database by text content."""

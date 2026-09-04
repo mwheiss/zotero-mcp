@@ -23,7 +23,7 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Any
@@ -48,8 +48,14 @@ from .client import (
     get_zotero_server_id,
     library_identity,
 )
+from .config_light import (
+    _DEFAULT_RERANKER_CONFIG,
+    load_reranker_config,
+    load_update_config,
+    should_update,
+)
 from .local_db import LocalZoteroReader
-from .utils import format_creators, is_local_mode, suppress_stdout
+from .utils import _paginate, format_creators, is_local_mode, suppress_stdout
 
 logger = logging.getLogger(__name__)
 
@@ -387,56 +393,6 @@ def _truncate_to_tokens(text: str, max_tokens: int = 8000) -> str:
     return text
 
 
-_DEFAULT_UPDATE_CONFIG = {
-    "auto_update": False,
-    "update_frequency": "manual",
-    "last_update": None,
-    "update_days": 7,
-}
-
-
-def load_update_config(config_path: str | None) -> dict[str, Any]:
-    """Read the semantic-search ``update_config`` block from disk.
-
-    Pure file read with no ChromaDB or embedding-model side effects, so it is
-    safe on the read-only status path. Returns defaults when the file is
-    missing or unreadable.
-    """
-    config = dict(_DEFAULT_UPDATE_CONFIG)
-    if config_path and os.path.exists(config_path):
-        try:
-            with open(config_path) as f:
-                file_config = json.load(f)
-            config.update(file_config.get("semantic_search", {}).get("update_config", {}))
-        except Exception as e:
-            logger.warning(f"Error loading update config: {e}")
-    return config
-
-
-_DEFAULT_RERANKER_CONFIG: dict[str, Any] = {
-    "enabled": False,
-    "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-    "candidate_multiplier": 3,
-}
-
-
-def load_reranker_config(config_path: str | None) -> dict[str, Any]:
-    """Read the semantic-search ``reranker`` block from disk.
-
-    Pure file read with no model load, so the server can consult it (e.g. to
-    decide whether to warm up) without paying the cross-encoder cost.
-    """
-    config = dict(_DEFAULT_RERANKER_CONFIG)
-    if config_path and os.path.exists(config_path):
-        try:
-            with open(config_path) as f:
-                file_config = json.load(f)
-            config.update(file_config.get("semantic_search", {}).get("reranker", {}))
-        except Exception as e:
-            logger.warning(f"Error loading reranker config: {e}")
-    return config
-
-
 def warmup_reranker(config_path: str | None = None) -> bool:
     """Preload the configured reranker into the process-wide cache.
 
@@ -455,40 +411,6 @@ def warmup_reranker(config_path: str | None = None) -> bool:
     except Exception as e:
         logger.warning(f"Reranker warmup failed for '{model}': {e}")
         return False
-
-
-def should_update(update_config: dict[str, Any]) -> bool:
-    """Decide whether an auto-update is due from ``update_config`` alone.
-
-    Pure function of the config dict (and the wall clock) — no I/O, no model
-    load — so both :class:`ZoteroSemanticSearch` and the status tool can share
-    one source of truth.
-    """
-    if not update_config.get("auto_update", False):
-        return False
-
-    frequency = update_config.get("update_frequency", "manual")
-
-    if frequency == "manual":
-        return False
-    elif frequency == "startup":
-        return True
-    elif frequency == "daily":
-        last_update = update_config.get("last_update")
-        if not last_update:
-            return True
-        return datetime.now() - datetime.fromisoformat(last_update) >= timedelta(days=1)
-    elif frequency.startswith("every_"):
-        try:
-            days = int(frequency.split("_")[1])
-            last_update = update_config.get("last_update")
-            if not last_update:
-                return True
-            return datetime.now() - datetime.fromisoformat(last_update) >= timedelta(days=days)
-        except (ValueError, IndexError):
-            return False
-
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -2350,7 +2272,7 @@ class ZoteroSemanticSearch:
                     if self._last_api_attachment_keys_by_parent is not None:
                         api_attachment_keys = set(self._last_api_attachment_keys_by_parent.get(item_key, set()))
                     else:
-                        children = self.zotero_client.children(item_key) or []
+                        children = _paginate(self.zotero_client.children, item_key) or []
                         api_attachment_keys = {
                             child.get("key") or child.get("data", {}).get("key")
                             for child in children

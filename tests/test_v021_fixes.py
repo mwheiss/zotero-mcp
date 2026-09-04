@@ -3,7 +3,7 @@ merge attachment dedup, linked-URL removal, and no-PDF messaging."""
 
 from unittest.mock import MagicMock, patch
 
-from conftest import DummyContext
+from conftest import DummyContext, execute_merge_with_plan
 
 from zotero_mcp.tools import _helpers
 from zotero_mcp.tools.annotations import (
@@ -237,7 +237,9 @@ class TestMergeAttachmentDedup:
 
         from zotero_mcp.tools.write import merge_duplicates
 
-        result = merge_duplicates("KEEPER", ["DUP1"], confirm=True, ctx=dummy_ctx)
+        result = execute_merge_with_plan(
+            merge_duplicates, "KEEPER", ["DUP1"], dummy_ctx
+        )
 
         # The duplicate attachment should NOT have been re-parented
         # update_item should not be called for the dup attachment
@@ -281,7 +283,9 @@ class TestMergeAttachmentDedup:
 
         from zotero_mcp.tools.write import merge_duplicates
 
-        merge_duplicates("KEEPER", ["DUP1"], confirm=True, ctx=dummy_ctx)
+        execute_merge_with_plan(
+            merge_duplicates, "KEEPER", ["DUP1"], dummy_ctx
+        )
 
         # The different attachment SHOULD have been re-parented
         reparent_calls = [

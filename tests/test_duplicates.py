@@ -1,9 +1,43 @@
 """Tests for Features 7-8: find_duplicates and merge_duplicates."""
 
+import re
 
+import pytest
 from conftest import FakeZotero, _FakeResponse
 
 from zotero_mcp import server
+
+
+@pytest.fixture(autouse=True)
+def duplicate_plan_state(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "ZOTERO_MCP_ATTACHMENT_STATE_DIR", str(tmp_path / "operation-state")
+    )
+
+
+def _plan_credentials(preview: str) -> tuple[str, str]:
+    plan_id = re.search(r"\*\*Plan ID:\*\* `([^`]+)`", preview)
+    token = re.search(r"\*\*Plan token:\*\* `([^`]+)`", preview)
+    assert plan_id and token, preview
+    return plan_id.group(1), token.group(1)
+
+
+def _execute_merge(*, keeper_key, duplicate_keys, ctx):
+    preview = server.merge_duplicates(
+        keeper_key=keeper_key,
+        duplicate_keys=duplicate_keys,
+        confirm=False,
+        ctx=ctx,
+    )
+    plan_id, plan_token = _plan_credentials(preview)
+    return server.merge_duplicates(
+        keeper_key=keeper_key,
+        duplicate_keys=duplicate_keys,
+        confirm=True,
+        plan_id=plan_id,
+        plan_token=plan_token,
+        ctx=ctx,
+    )
 
 # ---------------------------------------------------------------------------
 # Helpers: item factory and extended FakeZotero for duplicates
@@ -199,6 +233,28 @@ class TestFindDuplicates:
         assert "F3" in result
         assert "F4" in result
 
+    def test_exact_doi_plan_recommends_deterministic_keeper(
+        self, monkeypatch, dummy_ctx
+    ):
+        fake = FakeZoteroForDuplicates()
+        first = _make_item("OLD", "Older", doi="10.1000/same")
+        first["data"]["dateAdded"] = "2020-01-01"
+        first["meta"] = {"numChildren": 3}
+        second = _make_item("NEW", "Newer", doi="10.1000/same")
+        second["data"]["dateAdded"] = "2024-01-01"
+        second["meta"] = {"numChildren": 1}
+        fake._items = [first, second]
+        monkeypatch.setattr("zotero_mcp.client.get_zotero_client", lambda: fake)
+
+        result = server.find_duplicates(
+            plan_exact_doi=True, ctx=dummy_ctx
+        )
+
+        assert "Exact-DOI Duplicate Merge Plan" in result
+        assert "Recommended keeper:** `OLD`" in result
+        assert "confirm=False" in result
+        assert "No Zotero records were changed" in result
+
 
 # ---------------------------------------------------------------------------
 # Feature 8: merge_duplicates
@@ -293,8 +349,8 @@ class TestMergeDuplicatesConfirm:
         """All unique tags from duplicates are consolidated into keeper."""
         fake = self._setup_merge(monkeypatch)
 
-        server.merge_duplicates(
-            keeper_key="KEEP", duplicate_keys=["DUP1", "DUP2"], confirm=True, ctx=dummy_ctx
+        _execute_merge(
+            keeper_key="KEEP", duplicate_keys=["DUP1", "DUP2"], ctx=dummy_ctx
         )
 
         # Find the keeper update that has tags
@@ -310,8 +366,8 @@ class TestMergeDuplicatesConfirm:
         """Child items (notes, attachments, annotations) get parentItem set to keeper."""
         fake = self._setup_merge(monkeypatch)
 
-        server.merge_duplicates(
-            keeper_key="KEEP", duplicate_keys=["DUP1", "DUP2"], confirm=True, ctx=dummy_ctx
+        _execute_merge(
+            keeper_key="KEEP", duplicate_keys=["DUP1", "DUP2"], ctx=dummy_ctx
         )
 
         # Collect all child reparenting updates
@@ -332,8 +388,8 @@ class TestMergeDuplicatesConfirm:
         delete_calls = []
         fake.delete_item = lambda *a, **kw: delete_calls.append(a)
 
-        server.merge_duplicates(
-            keeper_key="KEEP", duplicate_keys=["DUP1", "DUP2"], confirm=True, ctx=dummy_ctx
+        _execute_merge(
+            keeper_key="KEEP", duplicate_keys=["DUP1", "DUP2"], ctx=dummy_ctx
         )
 
         # delete_item should never be called
@@ -349,8 +405,8 @@ class TestMergeDuplicatesConfirm:
         """Keeper is added to every collection the duplicates belonged to."""
         fake = self._setup_merge(monkeypatch)
 
-        server.merge_duplicates(
-            keeper_key="KEEP", duplicate_keys=["DUP1", "DUP2"], confirm=True, ctx=dummy_ctx
+        _execute_merge(
+            keeper_key="KEEP", duplicate_keys=["DUP1", "DUP2"], ctx=dummy_ctx
         )
 
         # Keeper was already in COL_A, so addto_collection should be called for COL_B and COL_C
@@ -371,8 +427,8 @@ class TestMergeDuplicatesConfirm:
         monkeypatch.setattr("zotero_mcp.tools._helpers._get_write_client", lambda ctx: (fake, fake))
 
         # Pass keeper_key inside duplicate_keys too
-        result = server.merge_duplicates(
-            keeper_key="KEEP", duplicate_keys=["KEEP", "DUP1"], confirm=True, ctx=dummy_ctx
+        result = _execute_merge(
+            keeper_key="KEEP", duplicate_keys=["KEEP", "DUP1"], ctx=dummy_ctx
         )
 
         # Keeper should NOT be trashed — check the direct PATCH calls
@@ -445,8 +501,8 @@ class TestMergeDuplicatesConfirm:
 
         fake.update_item = failing_update
 
-        result = server.merge_duplicates(
-            keeper_key="KEEP", duplicate_keys=["DUP1"], confirm=True, ctx=dummy_ctx
+        result = _execute_merge(
+            keeper_key="KEEP", duplicate_keys=["DUP1"], ctx=dummy_ctx
         )
 
         # Should report the failure
@@ -458,10 +514,9 @@ class TestMergeDuplicatesConfirm:
         fake = self._setup_merge(monkeypatch)
         fake.client.patch = lambda **_kwargs: _FakeResponse(500, text="failed")
 
-        result = server.merge_duplicates(
+        result = _execute_merge(
             keeper_key="KEEP",
             duplicate_keys=["DUP1", "DUP2"],
-            confirm=True,
             ctx=dummy_ctx,
         )
 
@@ -475,10 +530,9 @@ class TestMergeDuplicatesConfirm:
         fake = self._setup_merge(monkeypatch)
         fake.addto_collection = lambda *_args, **_kwargs: _FakeResponse(500)
 
-        result = server.merge_duplicates(
+        result = _execute_merge(
             keeper_key="KEEP",
             duplicate_keys=["DUP1", "DUP2"],
-            confirm=True,
             ctx=dummy_ctx,
         )
 
@@ -506,8 +560,8 @@ class TestMergeDuplicatesConfirm:
 
         fake.item = tracking_item
 
-        server.merge_duplicates(
-            keeper_key="KEEP", duplicate_keys=["DUP1"], confirm=True, ctx=dummy_ctx
+        _execute_merge(
+            keeper_key="KEEP", duplicate_keys=["DUP1"], ctx=dummy_ctx
         )
 
         # Keeper should be fetched multiple times: initial + after tag update + after collection add
@@ -528,9 +582,137 @@ class TestMergeDuplicatesConfirm:
         monkeypatch.setattr("zotero_mcp.tools._helpers._get_write_client", lambda ctx: (fake, fake))
 
         # Pass a single string instead of a list
-        server.merge_duplicates(
-            keeper_key="KEEP", duplicate_keys="DUP1", confirm=True, ctx=dummy_ctx
+        _execute_merge(
+            keeper_key="KEEP", duplicate_keys="DUP1", ctx=dummy_ctx
         )
 
         # Should succeed — DUP1 trashed via direct PATCH
         assert any("DUP1" in c["url"] for c in fake.client.patch_calls)
+
+    def test_confirm_requires_bound_plan(self, monkeypatch, dummy_ctx):
+        fake = FakeZoteroForDuplicates()
+        fake._items = [
+            _make_item("KEEP", "Keeper", version=1),
+            _make_item("DUP1", "Duplicate", version=2),
+        ]
+        fake._children = {"KEEP": [], "DUP1": []}
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client",
+            lambda ctx: (fake, fake),
+        )
+
+        result = server.merge_duplicates(
+            keeper_key="KEEP",
+            duplicate_keys=["DUP1"],
+            confirm=True,
+            ctx=dummy_ctx,
+        )
+
+        assert "requires the plan_id and plan_token" in result
+        assert fake.client.patch_calls == []
+
+    def test_changed_item_version_rejects_stale_plan(
+        self, monkeypatch, dummy_ctx
+    ):
+        fake = FakeZoteroForDuplicates()
+        fake._items = [
+            _make_item("KEEP", "Keeper", version=1),
+            _make_item("DUP1", "Duplicate", version=2),
+        ]
+        fake._children = {"KEEP": [], "DUP1": []}
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client",
+            lambda ctx: (fake, fake),
+        )
+        preview = server.merge_duplicates(
+            keeper_key="KEEP",
+            duplicate_keys=["DUP1"],
+            confirm=False,
+            ctx=dummy_ctx,
+        )
+        plan_id, plan_token = _plan_credentials(preview)
+        fake._items[1]["version"] = 3
+
+        result = server.merge_duplicates(
+            keeper_key="KEEP",
+            duplicate_keys=["DUP1"],
+            confirm=True,
+            plan_id=plan_id,
+            plan_token=plan_token,
+            ctx=dummy_ctx,
+        )
+
+        assert "plan rejected" in result.lower()
+        assert fake.client.patch_calls == []
+
+    def test_changed_child_inventory_rejects_stale_plan(
+        self, monkeypatch, dummy_ctx
+    ):
+        fake = FakeZoteroForDuplicates()
+        fake._items = [
+            _make_item("KEEP", "Keeper", version=1),
+            _make_item("DUP1", "Duplicate", version=2),
+        ]
+        fake._children = {"KEEP": [], "DUP1": []}
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client",
+            lambda ctx: (fake, fake),
+        )
+        preview = server.merge_duplicates(
+            keeper_key="KEEP",
+            duplicate_keys=["DUP1"],
+            confirm=False,
+            ctx=dummy_ctx,
+        )
+        plan_id, plan_token = _plan_credentials(preview)
+        new_note = {
+            "key": "NOTE1",
+            "version": 1,
+            "data": {"itemType": "note", "parentItem": "DUP1"},
+        }
+        fake._items.append(new_note)
+        fake._children["DUP1"] = [new_note]
+
+        result = server.merge_duplicates(
+            keeper_key="KEEP",
+            duplicate_keys=["DUP1"],
+            confirm=True,
+            plan_id=plan_id,
+            plan_token=plan_token,
+            ctx=dummy_ctx,
+        )
+
+        assert "plan rejected" in result.lower()
+        assert fake.client.patch_calls == []
+
+    def test_merge_plan_is_one_use(self, monkeypatch, dummy_ctx):
+        fake = FakeZoteroForDuplicates()
+        fake._items = [
+            _make_item("KEEP", "Keeper", version=1),
+            _make_item("DUP1", "Duplicate", version=2),
+        ]
+        fake._children = {"KEEP": [], "DUP1": []}
+        monkeypatch.setattr(
+            "zotero_mcp.tools._helpers._get_write_client",
+            lambda ctx: (fake, fake),
+        )
+        preview = server.merge_duplicates(
+            keeper_key="KEEP",
+            duplicate_keys=["DUP1"],
+            confirm=False,
+            ctx=dummy_ctx,
+        )
+        plan_id, plan_token = _plan_credentials(preview)
+        arguments = {
+            "keeper_key": "KEEP",
+            "duplicate_keys": ["DUP1"],
+            "confirm": True,
+            "plan_id": plan_id,
+            "plan_token": plan_token,
+            "ctx": dummy_ctx,
+        }
+
+        assert "Merge complete" in server.merge_duplicates(**arguments)
+        second = server.merge_duplicates(**arguments)
+
+        assert "already been used" in second

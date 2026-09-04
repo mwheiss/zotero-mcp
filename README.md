@@ -437,6 +437,13 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
   database is located automatically: a data directory configured in Zotero's
   preferences (read from the profile's `prefs.js`) is tried first, then the
   default `~/Zotero` location.
+- `ZOTERO_SEARCH_BACKEND=split|api|sqlite`: Search routing policy. `split` is
+  the default: ordinary keyword and tag searches retain Zotero's live local-API
+  semantics, while advanced and all-library searches use `zotero.sqlite`.
+  `api` forces the live API and disables all-library search; `sqlite` forces
+  every supported metadata search through SQLite. Unsupported single-library
+  requests fall back to the API; global requests fail closed rather than
+  silently searching only the active library.
 
 ### Command-Line Options
 
@@ -633,13 +640,13 @@ diagnosis but still applies credential, local-path, and optional-dependency
 capability gates.
 
 ### 🔍 Search Tools
-- `zotero_search_items`: Search your library by keywords
-- `zotero_advanced_search`: Perform complex searches with multiple criteria
+- `zotero_search_items`: Search by keywords; supports collection subtrees and, with the SQLite backend, all libraries
+- `zotero_advanced_search`: Perform bounded multi-criteria searches with correct date sorting, collection-subtree scope, and optional global SQLite scope
 - `zotero_get_collections`: List collections
-- `zotero_get_collection_items`: Get items in a collection
+- `zotero_get_collection_items`: Page through items in a collection or collection subtree using `limit` and `offset`
 - `zotero_get_tags`: List all tags
 - `zotero_get_recent`: Get recently added items
-- `zotero_search_by_tag`: Search your library using custom tag filters
+- `zotero_search_by_tag`: Search using custom tag filters, collection subtrees, or all local libraries
 - `zotero_search_by_citation_key`: Look up an item by an exact Better BibTeX citation key
 
 ### 🗂️ Library and Feed Tools
@@ -692,9 +699,9 @@ Scite support uses the core HTTP dependency and is available in the default inst
 - `scite_check_retractions`: Scan items for retractions and editorial notices
 
 ### 📦 Item & Collection Management Tools
-- `zotero_add_by_doi`: Add a paper by DOI with automatic metadata and open-access PDF attachment
-- `zotero_add_by_url`: Add a paper by URL (arXiv, DOI URLs, and general webpages)
-- `zotero_add_by_isbn`: Add a book by ISBN (Open Library + Google Books cascade)
+- `zotero_add_by_doi`: Add one or multiple DOIs with Crossref metadata and open-access PDF attachment
+- `zotero_add_by_url`: Add one or multiple URLs; publisher pages contribute Highwire/Dublin Core citation metadata
+- `zotero_add_by_isbn`: Add one or multiple ISBNs through the Open Library + Google Books cascade
 - `zotero_add_by_bibtex`: Add one or more items from BibTeX (inline or .bib file)
 - `zotero_add_by_csl_json`: Add one or more items from CSL JSON (inline or file)
 - `zotero_add_from_file`: Import a local PDF, EPUB, DjVu, DOC/DOCX, ODT, or RTF file (PDFs get automatic DOI extraction)
@@ -708,8 +715,11 @@ All add tools take a `collections` parameter accepting collection keys, names, o
 - `zotero_delete_collection`: Permanently delete a collection after an explicit confirmation preview
 - `zotero_batch_update_tags`: Add/remove tags across a bounded item selection
 - `zotero_batch_update_extra`: Upsert/remove structured lines in multiple Extra fields
-- `zotero_find_duplicates`: Find duplicate items by title and/or DOI
-- `zotero_merge_duplicates`: Merge duplicate items with dry-run preview; consolidates all child items
+- `zotero_find_duplicates`: Find duplicate items by title/DOI, or produce a read-only exact-DOI merge plan with deterministic keeper recommendations
+- `zotero_merge_duplicates`: Merge duplicates only from a fresh, one-use, version- and child-inventory-bound dry-run plan
+
+Deferred work, including the proposed JSON CLI and packaged local-agent skill,
+is tracked in [docs/future-features.md](docs/future-features.md).
 
 ### 🧭 Agentic Research Tools
 - `zotero_find_related_papers`: Traverse an OpenAlex citation neighborhood

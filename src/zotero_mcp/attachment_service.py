@@ -12,7 +12,6 @@ import os
 import re
 import secrets
 import time
-import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -107,11 +106,11 @@ def verify_token(token: str, action: str) -> dict[str, Any]:
             raise ValueError
         payload = json.loads(_b64decode(encoded))
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("Invalid attachment capability token") from exc
+        raise ValueError("Invalid capability token") from exc
     if payload.get("action") != action:
-        raise ValueError("Attachment capability token has the wrong action")
+        raise ValueError("Capability token has the wrong action")
     if int(payload.get("exp", 0)) < int(time.time()):
-        raise ValueError("Attachment capability token has expired")
+        raise ValueError("Capability token has expired")
     return payload
 
 
@@ -164,7 +163,6 @@ def attachment_artifact_type(item: dict[str, Any]) -> str | None:
     is_pdf = content_type == "application/pdf" or filename.lower().endswith(".pdf")
     is_json = content_type == "application/json" or filename.lower().endswith(".json")
     is_html = content_type.startswith("text/html") or filename.lower().endswith((".html", ".htm"))
-    is_xml = content_type in {"application/xml", "text/xml"} or filename.lower().endswith(".xml")
     if "betterissa" in words and (
         words & {"state", "summary", "references", "sections"}
         or {"extraction", "metadata"} <= words
@@ -178,10 +176,8 @@ def attachment_artifact_type(item: dict[str, Any]) -> str | None:
         return "betterissa-ocr"
     if is_html and {"betterissa", "reading", "view"} <= words:
         return "betterissa-reading-view"
-    if is_xml and ("grobid" in words or "tei" in words):
-        return "grobid-tei"
     fulltext = "fulltext" in words or {"full", "text"} <= words
-    if not is_pdf and not is_xml and fulltext:
+    if not is_pdf and fulltext:
         return "fulltext"
     if is_pdf and "ocr" in words:
         return "ocr-pdf"
@@ -219,11 +215,10 @@ _ARTIFACT_PRIORITY = {
     "betterissa-semantic": 1,
     "betterissa-ocr": 2,
     "betterissa-reading-view": 3,
-    "grobid-tei": 4,
-    "fulltext": 5,
-    "ocr-pdf": 6,
-    "pdf": 8,
-    "file": 9,
+    "fulltext": 4,
+    "ocr-pdf": 5,
+    "pdf": 7,
+    "file": 8,
 }
 
 
@@ -274,24 +269,6 @@ def document_text_from_file(path: Path, artifact_type: str) -> str:
             text,
             flags=re.IGNORECASE,
         ).strip()
-    if artifact_type == "grobid-tei":
-        try:
-            root = ET.parse(path).getroot()
-        except (ET.ParseError, OSError, ValueError):
-            return ""
-        def local_name(element):
-            return element.tag.rsplit("}", 1)[-1].lower()
-        abstracts = [
-            " ".join(element.itertext()).strip()
-            for element in root.iter()
-            if local_name(element) == "abstract"
-        ]
-        bodies = [
-            " ".join(element.itertext()).strip()
-            for element in root.iter()
-            if local_name(element) == "body"
-        ]
-        return "\n\n".join(value for value in [*abstracts, *bodies] if value)
     if artifact_type in {"betterissa-indexing", "fulltext", "file"}:
         try:
             return path.read_text(encoding="utf-8", errors="replace")
@@ -513,19 +490,19 @@ def consume_operation(
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError("Unknown or expired attachment operation") from exc
+            raise ValueError("Unknown or expired operation") from exc
         token = verify_token(confirmation_token, "confirm")
         digest = hashlib.sha256(
             json.dumps(details, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         if record.get("used"):
-            raise ValueError("Attachment operation has already been used")
+            raise ValueError("Operation has already been used")
         if int(record.get("expires_at", 0)) < int(time.time()):
-            raise ValueError("Attachment operation has expired")
+            raise ValueError("Operation has expired")
         if record.get("action") != action or record.get("digest") != digest:
-            raise ValueError("Attachment operation does not match the requested mutation")
+            raise ValueError("Operation does not match the requested mutation")
         if token.get("operation_id") != operation_id or token.get("digest") != digest:
-            raise ValueError("Confirmation token does not match the attachment operation")
+            raise ValueError("Confirmation token does not match the operation")
         record["used"] = True
         atomic_write_json(path, record, indent=2)
         _private_file(path)

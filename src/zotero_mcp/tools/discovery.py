@@ -284,7 +284,7 @@ def _item_has_pdf(zot, item: dict) -> bool | None:
     if not key:
         return False
     try:
-        children = zot.children(key)
+        children = _helpers._paginate(zot.children, key)
     except Exception:
         return None
     for child in children or []:
@@ -317,6 +317,7 @@ def _item_has_pdf(zot, item: dict) -> bool | None:
 )
 def library_coverage(
     collection_key: str | None = None,
+    include_subcollections: bool = False,
     limit: int | str | None = 200,
     *,
     ctx: Context,
@@ -330,9 +331,10 @@ def library_coverage(
 
         context_info(ctx, "Scanning library for PDF coverage...")
         if collection_key:
-            items = _helpers._paginate(
-                zot.collection_items,
+            items = _helpers.fetch_collection_scope(
+                zot,
                 collection_key,
+                include_subcollections=include_subcollections,
                 max_items=limit,
                 itemType="-attachment",
             )

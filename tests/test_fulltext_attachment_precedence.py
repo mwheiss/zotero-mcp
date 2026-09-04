@@ -1,39 +1,10 @@
-"""Tests for BetterIssa and legacy semantic full-text attachment selection."""
+"""Tests for BetterIssa and generic full-text attachment selection."""
 
 from pathlib import Path
 
 import pytest
 
 from zotero_mcp.local_db import LocalZoteroReader
-
-TEI = """\
-<?xml version="1.0" encoding="UTF-8"?>
-<TEI xmlns="http://www.tei-c.org/ns/1.0">
-  <teiHeader>
-    <fileDesc>
-      <titleStmt>
-        <title>Header title must be excluded</title>
-        <author>Header author must be excluded</author>
-      </titleStmt>
-    </fileDesc>
-    <profileDesc>
-      <abstract><div><p>Semantic abstract text.</p></div></abstract>
-    </profileDesc>
-  </teiHeader>
-  <text>
-    <front><div><p>Front matter must be excluded.</p></div></front>
-    <body>
-      <div>
-        <head>Methods</head>
-        <p>Body text with an <ref>inline citation</ref>.</p>
-      </div>
-    </body>
-    <back>
-      <listBibl><biblStruct>Bibliography must be excluded.</biblStruct></listBibl>
-    </back>
-  </text>
-</TEI>
-"""
 
 
 class _Reader(LocalZoteroReader):
@@ -95,7 +66,6 @@ def _attachment(key: str, filename: str, content_type: str):
             "application/json",
             False,
         ),
-        ("BetterIssa GROBID TEI", "storage:output.xml", "application/xml", True),
         ("", "storage:BetterIssa-fulltext.txt", "text/plain", True),
         ("BetterIssa OCR PDF", "storage:paper.pdf", "application/pdf", True),
         ("Full Text PDF", "storage:paper.pdf", "application/pdf", True),
@@ -112,21 +82,6 @@ def test_named_attachment_precedence_classifier(
         )
         is expected
     )
-
-
-def test_grobid_tei_extracts_only_abstract_and_body(tmp_path):
-    tei = tmp_path / "paper.xml"
-    tei.write_text(TEI)
-    reader = _Reader([], {})
-
-    text = reader._extract_grobid_tei(tei)
-
-    assert "Semantic abstract text." in text
-    assert "Methods Body text with an inline citation." in text
-    assert "Header title" not in text
-    assert "Header author" not in text
-    assert "Front matter" not in text
-    assert "Bibliography" not in text
 
 
 def test_betterissa_indexing_text_wins_over_every_other_artifact(tmp_path):
@@ -295,7 +250,7 @@ def test_betterissa_fixed_artifact_fallback_order(tmp_path):
         ({"semantic", "ocr", "reading", "pdf"}, "semantic text", "betterissa-semantic", 1),
         ({"ocr", "reading", "pdf"}, "advanced OCR text", "betterissa-ocr", 2),
         ({"reading", "pdf"}, "reading view text", "betterissa-reading-view", 3),
-        ({"pdf"}, "Zotero PDF cache", "zotero-cache", 8),
+        ({"pdf"}, "Zotero PDF cache", "zotero-cache", 7),
     ]
     for included, expected_text, expected_source, expected_priority in expected:
         attachments = []
@@ -409,38 +364,31 @@ def test_betterissa_workflow_artifacts_never_reach_generic_fallback(tmp_path):
     ("included_keys", "expected_text", "expected_source", "expected_priority"),
     [
         (
-            {"tei", "fulltext", "ocr", "full_text_pdf", "pdf", "other"},
-            "Semantic abstract text.",
-            "grobid-tei",
-            4,
-        ),
-        (
             {"fulltext", "ocr", "full_text_pdf", "pdf", "other"},
             "named fulltext",
             "fulltext",
-            5,
+            4,
         ),
         (
             {"ocr", "full_text_pdf", "pdf", "other"},
             "ocr pdf",
             "ocr-pdf",
-            6,
+            5,
         ),
         (
             {"full_text_pdf", "pdf", "other"},
             "full text pdf",
             "pdf",
-            7,
+            6,
         ),
-        ({"pdf", "other"}, "generic pdf", "pdf", 8),
-        ({"other"}, "generic text", "file", 9),
+        ({"pdf", "other"}, "generic pdf", "pdf", 7),
+        ({"other"}, "generic text", "file", 8),
     ],
 )
 def test_requested_attachment_precedence(
     tmp_path, included_keys, expected_text, expected_source, expected_priority
 ):
     files = {
-        "tei": ("BetterIssa-GROBID-TEI.xml", "application/xml", TEI),
         "fulltext": ("BetterIssa-fulltext.txt", "text/plain", "named fulltext"),
         "ocr": ("BetterIssa-OCR.pdf", "application/pdf", "ocr pdf"),
         "full_text_pdf": ("Full Text PDF.pdf", "application/pdf", "full text pdf"),
@@ -463,48 +411,6 @@ def test_requested_attachment_precedence(
     assert expected_text in text
     assert source == expected_source
     assert reader.last_extraction_details["selection_priority"] == expected_priority
-
-
-def test_malformed_or_bodyless_tei_falls_back_to_fulltext(tmp_path):
-    broken_tei = tmp_path / "BetterIssa-GROBID-TEI.xml"
-    broken_tei.write_text("<TEI><text><body>")
-    fulltext = tmp_path / "BetterIssa-fulltext.txt"
-    fulltext.write_text("fallback fulltext")
-    attachments = [
-        _attachment("tei", broken_tei.name, "application/xml"),
-        _attachment("fulltext", fulltext.name, "text/plain"),
-    ]
-    reader = _Reader(
-        attachments,
-        {"tei": broken_tei, "fulltext": fulltext},
-    )
-
-    assert reader._extract_fulltext_for_item(1) == (
-        "fallback fulltext",
-        "fulltext",
-    )
-
-
-def test_pdf_cache_does_not_preempt_grobid_tei(tmp_path):
-    tei = tmp_path / "BetterIssa-GROBID-TEI.xml"
-    tei.write_text(TEI)
-    pdf = tmp_path / "Full Text PDF.pdf"
-    pdf.write_text("direct PDF text")
-    attachments = [
-        _attachment("pdf", pdf.name, "application/pdf"),
-        _attachment("tei", tei.name, "application/xml"),
-    ]
-    reader = _Reader(
-        attachments,
-        {"pdf": pdf, "tei": tei},
-        caches={"pdf": "older Zotero PDF cache"},
-    )
-
-    text, source = reader._extract_fulltext_for_item(1)
-
-    assert "Semantic abstract text." in text
-    assert "older Zotero PDF cache" not in text
-    assert source == "grobid-tei"
 
 
 def test_newest_ocr_pdf_wins_within_its_precedence_group(tmp_path):

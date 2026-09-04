@@ -190,6 +190,7 @@ PARAMETER_DESCRIPTIONS = {
     "filename": "Safe filename for the attachment binary.",
     "identifier": "Seed paper as an 8-character Zotero item key, DOI, or DOI URL.",
     "include_trashed": "Include collections currently in Zotero Trash.",
+    "include_subcollections": "Include items filed in descendant collections as well as the named collection.",
     "inline": "Embed base64 only within the configured inline limit (1 MiB by default).",
     "idempotency_key": "Caller-generated stable key that makes attachment creation safe to retry.",
     "isbn": "ISBN-10 or ISBN-13, with optional hyphens or URL/isbn prefix.",
@@ -199,11 +200,15 @@ PARAMETER_DESCRIPTIONS = {
     "keeper_key": "Exact key of the Zotero item that will retain the merged metadata and children.",
     "language": "Replacement language value for the Zotero item.",
     "limit": "Maximum number of results or items to process.",
+    "offset": "Zero-based result offset used to continue a paginated listing.",
     "method": "Duplicate matching method: title, DOI, or both.",
     "name": "Name for the new Zotero collection.",
     "pages": "Replacement page range or article number.",
     "parent_collection": "Parent collection as an exact key or unambiguous name; omit for top level.",
     "parent_item_key": "Exact parent bibliographic item key for the attachment.",
+    "plan_exact_doi": "Return a read-only exact-DOI batch plan with deterministic keeper recommendations.",
+    "plan_id": "Short-lived duplicate-merge plan identifier returned by the dry-run preview.",
+    "plan_token": "One-use version-bound duplicate-merge token returned by the dry-run preview.",
     "publication_title": "Replacement journal, magazine, or publication title.",
     "publisher": "Replacement publisher name.",
     "quick": "Skip the slower full SQLite integrity check while retaining other health checks.",
@@ -213,6 +218,7 @@ PARAMETER_DESCRIPTIONS = {
     "sha256": "Expected lowercase hexadecimal SHA-256 digest of the complete binary.",
     "size": "Exact binary size in bytes.",
     "short_title": "Replacement short title for the Zotero item.",
+    "search_all_libraries": "Search the personal library and all locally available group libraries.",
     "tag": "Tag filter or list of tag filters.",
     "tags": "Tags to apply to created or reused items.",
     "text": "Replacement highlighted annotation text; an empty string clears it.",
@@ -343,6 +349,7 @@ def _is_partial_marker(line: str) -> bool:
     marker = _marker_text(line)
     return bool(
         re.match(r"^partial failure\s*:", marker, re.I)
+        or re.match(r"^partially updated\b", marker, re.I)
         or re.match(r"^pdf\s*:.*;\s*partial failure\s*:", marker, re.I)
     )
 

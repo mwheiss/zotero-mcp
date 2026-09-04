@@ -357,7 +357,8 @@ class TestCollectionItemsEdgeCases:
         from zotero_mcp.tools.retrieval import get_collection_items
 
         result = get_collection_items(collection_key="COL1", detail="summary", limit=1, ctx=dummy_ctx)
-        assert "Showing 1 of 2 items" in result
+        assert "Showing items 1-1 of 2" in result
+        assert "offset=1" in result
 
 
 class TestBatchChildrenEdgeCases:

@@ -1,6 +1,7 @@
 """Shared test fixtures for Zotero MCP tests."""
 
 import os
+import re
 
 import pytest
 
@@ -18,6 +19,7 @@ def isolated_zotero_locks(tmp_path_factory):
     names = {
         "ZOTERO_MCP_API_LOCK_PATH": lock_root / "api.lock",
         "ZOTERO_MCP_UPDATE_LOCK_PATH": lock_root / "update.lock",
+        "ZOTERO_MCP_ATTACHMENT_STATE_DIR": lock_root / "attachment-state",
     }
     previous = {name: os.environ.get(name) for name in names}
     for name, path in names.items():
@@ -30,6 +32,27 @@ def isolated_zotero_locks(tmp_path_factory):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+def execute_merge_with_plan(merge_fn, keeper_key, duplicate_keys, ctx):
+    """Run the duplicate merge's required preview/plan/confirm sequence."""
+    preview = merge_fn(
+        keeper_key=keeper_key,
+        duplicate_keys=duplicate_keys,
+        confirm=False,
+        ctx=ctx,
+    )
+    plan_id = re.search(r"\*\*Plan ID:\*\* `([^`]+)`", preview)
+    token = re.search(r"\*\*Plan token:\*\* `([^`]+)`", preview)
+    assert plan_id and token, preview
+    return merge_fn(
+        keeper_key=keeper_key,
+        duplicate_keys=duplicate_keys,
+        confirm=True,
+        plan_id=plan_id.group(1),
+        plan_token=token.group(1),
+        ctx=ctx,
+    )
 
 
 class DummyContext:

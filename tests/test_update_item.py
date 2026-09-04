@@ -1073,7 +1073,7 @@ class TestUpdateItemNewFields:
         assert d["issue"] == "4"
         assert d["pages"] == "27-61"
         assert d["publisher"] == "Springer"
-        assert "Successfully" in result
+        assert "Successfully updated" in result
 
     def test_update_book_section_multiple_fields(self, monkeypatch):
         """Update bookSection-specific fields together."""
@@ -1096,7 +1096,7 @@ class TestUpdateItemNewFields:
         assert d["edition"] == "2nd"
         assert d["pages"] == "100-150"
         assert d["ISBN"] == "978-0-000000-00-0"
-        assert "Successfully" in result
+        assert "Successfully updated" in result
 
 
 # ---------------------------------------------------------------------------
@@ -1164,7 +1164,7 @@ class TestUpdateItemSkippedFields:
         # edition should be applied (valid for book)
         assert len(fake.update_calls) == 1
         assert fake.update_calls[0]["data"]["edition"] == "2nd"
-        assert "Successfully" in result
+        assert "Partially updated" in result
         # issue and pages should be skipped (not valid for book)
         assert "issue" in result
         assert "pages" in result

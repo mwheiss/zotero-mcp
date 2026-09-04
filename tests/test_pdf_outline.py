@@ -1,9 +1,7 @@
 """Tests for Feature 9: PDF Outline Extraction (zotero_get_pdf_outline)."""
 
-import sys
-import types
-
 from zotero_mcp import server
+from zotero_mcp.tools import write
 
 # ---------------------------------------------------------------------------
 # Helpers: fake fitz module and document
@@ -28,17 +26,11 @@ class FakeDocument:
         self.close()
 
 
-def _make_fake_fitz(toc=None):
-    """Return a fake ``fitz`` module whose ``open()`` returns a FakeDocument."""
-    fake_fitz = types.ModuleType("fitz")
-    fake_fitz.open = lambda *args, **kwargs: FakeDocument(toc)  # noqa: ARG005
-    return fake_fitz
-
-
 def _patch_fitz(monkeypatch, toc=None):
-    """Patch fitz in sys.modules so 'import fitz' inside server functions works."""
-    fake_fitz = _make_fake_fitz(toc)
-    monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
+    """Stub the subprocess boundary; subprocess behavior has dedicated tests."""
+    monkeypatch.setattr(
+        write, "_extract_pdf_toc", lambda _path: write.TocOutcome("ok", toc or [])
+    )
 
 
 # ---------------------------------------------------------------------------

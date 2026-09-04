@@ -177,6 +177,36 @@ def get_latest_version() -> str | None:
     return None
 
 
+def _normalize_version(version: str) -> str:
+    """Strip whitespace and a leading ``v`` from a version string."""
+    return version.strip().lstrip("v").strip()
+
+
+def is_newer_version(current: str, latest: str) -> bool:
+    """Return whether *latest* is strictly newer than *current*.
+
+    Comparing for inequality would offer a downgrade whenever a development
+    build or downstream fork is ahead of the latest upstream release.
+    """
+    current_norm = _normalize_version(current)
+    latest_norm = _normalize_version(latest)
+    try:
+        from packaging.version import Version
+
+        return Version(latest_norm) > Version(current_norm)
+    except Exception:
+        def as_tuple(value: str) -> tuple[int, ...]:
+            parts: list[int] = []
+            for component in value.split("."):
+                try:
+                    parts.append(int(component))
+                except ValueError:
+                    break
+            return tuple(parts)
+
+        return as_tuple(latest_norm) > as_tuple(current_norm)
+
+
 def backup_configurations() -> Path:
     """
     Backup current configurations before update.
@@ -432,20 +462,29 @@ def update_zotero_mcp(check_only: bool = False,
         result["message"] = "Could not check for latest version"
         return result
 
-    # Check if update is needed
-    needs_update = current_version != latest_version or force
+    # Only a strictly newer release counts as an update. Downstream/dev builds
+    # must never be replaced with an older upstream package by default.
+    is_ahead = is_newer_version(latest_version, current_version)
+    needs_update = is_newer_version(current_version, latest_version) or force
     result["needs_update"] = needs_update
+
+    up_to_date_message = (
+        f"Already up to date (version {current_version} is ahead of the "
+        f"latest release {latest_version})"
+        if is_ahead
+        else f"Already up to date (version {current_version})"
+    )
 
     if not needs_update and not force:
         result["success"] = True
-        result["message"] = f"Already up to date (version {current_version})"
+        result["message"] = up_to_date_message
         return result
 
     if check_only:
         if needs_update:
             result["message"] = f"Update available: {current_version} → {latest_version}"
         else:
-            result["message"] = f"Already up to date (version {current_version})"
+            result["message"] = up_to_date_message
         result["success"] = True
         return result
 
@@ -458,11 +497,17 @@ def update_zotero_mcp(check_only: bool = False,
     print(f"Latest version: {latest_version}")
 
     if not needs_update:
-        print("Already up to date!")
+        print(up_to_date_message)
         if not force:
             result["success"] = True
-            result["message"] = "Already up to date"
+            result["message"] = up_to_date_message
             return result
+
+    if is_ahead and force:
+        print(
+            f"Warning: --force will replace {current_version} with the older "
+            f"released version {latest_version}."
+        )
 
     # Backup configurations
     print("Backing up configurations...")

@@ -92,7 +92,7 @@ def list_attachments(item_key: str, *, ctx: Context) -> str:
         else:
             attachments = [
                 child
-                for child in zot.children(item_key)
+                for child in _helpers._paginate(zot.children, item_key)
                 if (child.get("data", {}) or {}).get("itemType") == "attachment"
             ]
         return _json(
