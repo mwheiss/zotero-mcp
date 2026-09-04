@@ -497,7 +497,9 @@ class TestArxivHttps:
             server.add_by_url(url="https://arxiv.org/abs/2401.00001", ctx=dummy_ctx)
             call_kwargs = mock_get.call_args[1]
             assert "timeout" in call_kwargs, "requests.get must include a timeout"
-            assert call_kwargs["timeout"] > 0
+            timeout = call_kwargs["timeout"]
+            values = timeout if isinstance(timeout, tuple) else (timeout,)
+            assert all(value > 0 for value in values)
 
 
 # ---------------------------------------------------------------------------

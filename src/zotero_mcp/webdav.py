@@ -7,6 +7,7 @@ import io
 import os
 import stat
 import tempfile
+import time
 import zipfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
@@ -18,10 +19,12 @@ DEFAULT_MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_COMPRESSION_RATIO = 200.0
 DEFAULT_MAX_ARCHIVE_MEMBERS = 1024
+DEFAULT_DOWNLOAD_DEADLINE_SECONDS = 300.0
 HARD_MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
 HARD_MAX_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 HARD_MAX_COMPRESSION_RATIO = 1000.0
 HARD_MAX_ARCHIVE_MEMBERS = 4096
+HARD_DOWNLOAD_DEADLINE_SECONDS = 3600.0
 
 
 class WebDAVNotConfiguredError(RuntimeError):
@@ -70,8 +73,16 @@ def _bounded_int_setting(
     return max(1, min(value, hard_max))
 
 
-def _bounded_float_setting(name: str, default: float, hard_max: float) -> float:
+def _bounded_float_setting(
+    name: str,
+    default: float,
+    hard_max: float,
+    *,
+    fallback_name: str | None = None,
+) -> float:
     raw = os.getenv(name, "").strip()
+    if not raw and fallback_name:
+        raw = os.getenv(fallback_name, "").strip()
     try:
         value = float(raw) if raw else default
     except ValueError:
@@ -114,6 +125,22 @@ def max_archive_members() -> int:
     )
 
 
+def download_deadline_seconds() -> float:
+    return _bounded_float_setting(
+        "ZOTERO_MCP_WEBDAV_DOWNLOAD_DEADLINE_SECONDS",
+        DEFAULT_DOWNLOAD_DEADLINE_SECONDS,
+        HARD_DOWNLOAD_DEADLINE_SECONDS,
+        fallback_name="ZOTERO_MCP_REMOTE_DOWNLOAD_DEADLINE_SECONDS",
+    )
+
+
+def _remaining_timeout(deadline: float) -> tuple[float, float]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("WebDAV download exceeded its total time limit")
+    return min(10.0, remaining), min(30.0, remaining)
+
+
 def _select_primary_member(
     members: list[zipfile.ZipInfo], expected_filename: str | None
 ) -> zipfile.ZipInfo:
@@ -139,6 +166,8 @@ def _extract_archive(
     archive_source: bytes | str | Path,
     destination_dir: str | Path,
     expected_filename: str | None,
+    *,
+    deadline: float | None = None,
 ) -> Path:
     """Extract a WebDAV attachment zip and return the primary file path."""
     destination = Path(destination_dir)
@@ -169,6 +198,10 @@ def _extract_archive(
         validated_members: list[tuple[zipfile.ZipInfo, Path]] = []
         destination_names: set[str] = set()
         for info in members:
+            if deadline is not None and time.monotonic() > deadline:
+                raise TimeoutError(
+                    "WebDAV extraction exceeded its total time limit"
+                )
             ratio = info.file_size / max(1, info.compress_size)
             if ratio > ratio_limit:
                 raise ValueError(
@@ -207,6 +240,10 @@ def _extract_archive(
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info) as source, open(output_path, "wb") as target:
                     while chunk := source.read(64 * 1024):
+                        if deadline is not None and time.monotonic() > deadline:
+                            raise TimeoutError(
+                                "WebDAV extraction exceeded its total time limit"
+                            )
                         total_written += len(chunk)
                         if total_written > max_uncompressed_bytes():
                             raise ValueError(
@@ -362,6 +399,7 @@ def download_attachment_from_webdav(
 
     base_url, username, password = config
     url = f"{base_url}{quote(attachment_key, safe='')}.zip"
+    deadline = time.monotonic() + download_deadline_seconds()
 
     session = requests.Session()
     session.auth = (username, password)
@@ -369,7 +407,15 @@ def download_attachment_from_webdav(
 
     temp_zip_path = None
     try:
-        response = session.get(url, timeout=(10.0, timeout), stream=True)
+        connect_timeout, read_timeout = _remaining_timeout(deadline)
+        response = session.get(
+            url,
+            timeout=(
+                min(connect_timeout, 10.0),
+                min(read_timeout, timeout),
+            ),
+            stream=True,
+        )
         if response.status_code == 404:
             raise FileNotFoundError(f"Attachment {attachment_key} was not found in WebDAV storage")
         response.raise_for_status()
@@ -387,6 +433,10 @@ def download_attachment_from_webdav(
             temp_zip_path = temp_zip.name
             received = 0
             for chunk in response.iter_content(chunk_size=1024 * 64):
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        "WebDAV download exceeded its total time limit"
+                    )
                 if chunk:
                     received += len(chunk)
                     if received > max_download_bytes():
@@ -394,7 +444,12 @@ def download_attachment_from_webdav(
                             "WebDAV archive exceeded the configured download-size limit"
                         )
                     temp_zip.write(chunk)
-        return _extract_archive(temp_zip_path, destination_dir, expected_filename)
+        return _extract_archive(
+            temp_zip_path,
+            destination_dir,
+            expected_filename,
+            deadline=deadline,
+        )
     finally:
         if temp_zip_path and os.path.exists(temp_zip_path):
             os.unlink(temp_zip_path)

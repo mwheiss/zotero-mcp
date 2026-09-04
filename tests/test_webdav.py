@@ -210,6 +210,23 @@ def test_download_attachment_from_webdav_enforces_streamed_size_limit(
         webdav.download_attachment_from_webdav("ABCD1234", tmp_path)
 
 
+def test_download_attachment_from_webdav_enforces_total_deadline(
+    tmp_path, monkeypatch
+):
+    payload = _build_zip_bytes("paper.pdf", b"PDF")
+    session = _FakeSession(_FakeResponse(payload))
+    monkeypatch.setenv("ZOTERO_WEBDAV_URL", "https://dav.example.com/zotero")
+    monkeypatch.setenv("ZOTERO_WEBDAV_USERNAME", "alice")
+    monkeypatch.setenv("ZOTERO_WEBDAV_PASSWORD", "secret")
+    monkeypatch.setenv("ZOTERO_MCP_WEBDAV_DOWNLOAD_DEADLINE_SECONDS", "1")
+    times = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(webdav.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr("requests.Session", lambda: session)
+
+    with pytest.raises(TimeoutError, match="total time limit"):
+        webdav.download_attachment_from_webdav("ABCD1234", tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # upload_attachment_to_webdav
 # ---------------------------------------------------------------------------

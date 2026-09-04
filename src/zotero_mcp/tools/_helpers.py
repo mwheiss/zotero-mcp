@@ -3,11 +3,13 @@
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import socket
 import tempfile
 import threading
+import time
 from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -909,6 +911,8 @@ _MAX_PDF_REDIRECTS = 5
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _DEFAULT_REMOTE_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024
 _HARD_REMOTE_DOWNLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_DEFAULT_REMOTE_DOWNLOAD_DEADLINE_SECONDS = 300.0
+_HARD_REMOTE_DOWNLOAD_DEADLINE_SECONDS = 3600.0
 
 
 def _remote_download_max_bytes() -> int:
@@ -920,8 +924,40 @@ def _remote_download_max_bytes() -> int:
     return max(1, min(value, _HARD_REMOTE_DOWNLOAD_MAX_BYTES))
 
 
-def _stream_pdf_response(response, destination: str | Path) -> int:
+def _remote_download_deadline_seconds() -> float:
+    raw = os.getenv("ZOTERO_MCP_REMOTE_DOWNLOAD_DEADLINE_SECONDS", "").strip()
+    try:
+        value = (
+            float(raw)
+            if raw
+            else _DEFAULT_REMOTE_DOWNLOAD_DEADLINE_SECONDS
+        )
+    except ValueError:
+        value = _DEFAULT_REMOTE_DOWNLOAD_DEADLINE_SECONDS
+    if not math.isfinite(value) or value <= 0:
+        value = _DEFAULT_REMOTE_DOWNLOAD_DEADLINE_SECONDS
+    return min(value, _HARD_REMOTE_DOWNLOAD_DEADLINE_SECONDS)
+
+
+def _remote_download_deadline() -> float:
+    return time.monotonic() + _remote_download_deadline_seconds()
+
+
+def _remote_request_timeout(deadline: float) -> tuple[float, float]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Remote download exceeded its total time limit")
+    return min(10.0, remaining), min(30.0, remaining)
+
+
+def _stream_pdf_response(
+    response,
+    destination: str | Path,
+    *,
+    deadline: float | None = None,
+) -> int:
     """Write a remotely fetched PDF with a hard byte bound and magic check."""
+    deadline = deadline if deadline is not None else _remote_download_deadline()
     maximum = _remote_download_max_bytes()
     raw_length = response.headers.get("Content-Length")
     if raw_length:
@@ -938,6 +974,10 @@ def _stream_pdf_response(response, destination: str | Path) -> int:
     try:
         with path.open("wb") as handle:
             for chunk in response.iter_content(chunk_size=64 * 1024):
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        "Remote PDF exceeded its total download time limit"
+                    )
                 if not chunk:
                     continue
                 written += len(chunk)
@@ -993,7 +1033,7 @@ def _url_resolves_to_public_host(url: str) -> bool:
     return True
 
 
-def _guarded_pdf_get(pdf_url, ctx):
+def _guarded_pdf_get(pdf_url, ctx, *, deadline: float | None = None):
     """GET ``pdf_url`` with SSRF protection.
 
     Validates that the host resolves to public IPs, follows redirects
@@ -1001,12 +1041,18 @@ def _guarded_pdf_get(pdf_url, ctx):
     response, or ``None`` if any URL in the chain is rejected or there are
     too many redirects.
     """
+    deadline = deadline if deadline is not None else _remote_download_deadline()
     current = pdf_url
     for _ in range(_MAX_PDF_REDIRECTS + 1):
         if not _url_resolves_to_public_host(current):
             context_info(ctx, f"PDF URL rejected by SSRF guard: {current}")
             return None
-        resp = requests.get(current, timeout=30, stream=True, allow_redirects=False)
+        resp = requests.get(
+            current,
+            timeout=_remote_request_timeout(deadline),
+            stream=True,
+            allow_redirects=False,
+        )
         if resp.status_code in _REDIRECT_STATUSES:
             location = resp.headers.get("Location")
             try:
@@ -1035,7 +1081,8 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
     on failure so callers can branch with ``if suffix is not None``.
     """
     try:
-        pdf_resp = _guarded_pdf_get(pdf_url, ctx)
+        deadline = _remote_download_deadline()
+        pdf_resp = _guarded_pdf_get(pdf_url, ctx, deadline=deadline)
         if pdf_resp is None:
             return None
         pdf_resp.raise_for_status()
@@ -1048,7 +1095,7 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
         with tempfile.TemporaryDirectory() as tmpdir:
             filename = f"{doi.replace('/', '_')}.pdf"
             filepath = os.path.join(tmpdir, filename)
-            _stream_pdf_response(pdf_resp, filepath)
+            _stream_pdf_response(pdf_resp, filepath, deadline=deadline)
 
             if os.path.getsize(filepath) < 1000:
                 context_info(ctx, "Downloaded file too small, likely not a real PDF")

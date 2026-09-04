@@ -166,8 +166,10 @@ def _fetch_embedded_metadata(
     url: str, ctx: Context
 ) -> tuple[EmbeddedMetadata | None, str]:
     """Fetch a bounded, SSRF-guarded publisher-page head."""
+    response = None
     try:
-        response = _helpers._guarded_pdf_get(url, ctx)
+        deadline = _helpers._remote_download_deadline()
+        response = _helpers._guarded_pdf_get(url, ctx, deadline=deadline)
         if response is None:
             return None, "the URL was rejected by the network safety policy"
         response.raise_for_status()
@@ -178,6 +180,10 @@ def _fetch_embedded_metadata(
         chunks: list[bytes] = []
         total = 0
         for chunk in response.iter_content(chunk_size=16384):
+            if _time.monotonic() > deadline:
+                raise TimeoutError(
+                    "Publisher page exceeded its total download time limit"
+                )
             if not chunk:
                 continue
             remaining = _EMBEDDED_METADATA_MAX_BYTES - total
@@ -186,7 +192,6 @@ def _fetch_embedded_metadata(
             if total >= _EMBEDDED_METADATA_MAX_BYTES:
                 break
         encoding = response.encoding or "utf-8"
-        response.close()
         try:
             html = b"".join(chunks).decode(encoding, errors="replace")
         except LookupError:
@@ -197,6 +202,12 @@ def _fetch_embedded_metadata(
     except Exception as exc:
         context_info(ctx, f"Could not read embedded metadata from {url}: {exc}")
         return None, f"the page could not be fetched ({type(exc).__name__})"
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 def _add_from_embedded_metadata(
@@ -2073,12 +2084,19 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
                 pdf_status = f"no PDF attached ({e})"
         else:
             try:
-                pdf_resp = requests.get(pdf_url, timeout=30, stream=True)
+                deadline = _helpers._remote_download_deadline()
+                pdf_resp = requests.get(
+                    pdf_url,
+                    timeout=_helpers._remote_request_timeout(deadline),
+                    stream=True,
+                )
                 pdf_resp.raise_for_status()
                 with tempfile.TemporaryDirectory() as tmpdir:
                     filename = f"arxiv_{arxiv_id.replace('/', '_')}.pdf"
                     filepath = os.path.join(tmpdir, filename)
-                    _helpers._stream_pdf_response(pdf_resp, filepath)
+                    _helpers._stream_pdf_response(
+                        pdf_resp, filepath, deadline=deadline
+                    )
                     ok, detail, _ = _helpers._attach_and_verify(
                         write_zot,
                         filename,

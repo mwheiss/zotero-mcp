@@ -358,6 +358,73 @@ def test_remote_pdf_stream_rejects_non_pdf_bytes(monkeypatch, tmp_path):
         _helpers._stream_pdf_response(Response(), tmp_path / "fake.pdf")
 
 
+def test_remote_pdf_stream_enforces_absolute_deadline(monkeypatch, tmp_path):
+    class Response:
+        headers = {}
+
+        @staticmethod
+        def iter_content(chunk_size):
+            return iter([b"%PDF-1.7\n", b"body"])
+
+    destination = tmp_path / "slow.pdf"
+    monkeypatch.setattr(_helpers.time, "monotonic", lambda: 2.0)
+
+    with pytest.raises(TimeoutError, match="total download time limit"):
+        _helpers._stream_pdf_response(
+            Response(), destination, deadline=1.0
+        )
+
+    assert not destination.exists()
+
+
+def test_remote_download_deadline_setting_is_bounded(monkeypatch):
+    monkeypatch.setenv("ZOTERO_MCP_REMOTE_DOWNLOAD_DEADLINE_SECONDS", "nan")
+    assert (
+        _helpers._remote_download_deadline_seconds()
+        == _helpers._DEFAULT_REMOTE_DOWNLOAD_DEADLINE_SECONDS
+    )
+    monkeypatch.setenv("ZOTERO_MCP_REMOTE_DOWNLOAD_DEADLINE_SECONDS", "999999")
+    assert (
+        _helpers._remote_download_deadline_seconds()
+        == _helpers._HARD_REMOTE_DOWNLOAD_DEADLINE_SECONDS
+    )
+
+
+def test_publisher_metadata_fetch_enforces_deadline_and_closes(monkeypatch):
+    class Response:
+        headers = {"Content-Type": "text/html"}
+        encoding = "utf-8"
+
+        def __init__(self):
+            self.closed = False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            return iter([b"<html><head></head></html>"])
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    monkeypatch.setattr(_helpers, "_remote_download_deadline", lambda: 1.0)
+    monkeypatch.setattr(
+        _helpers,
+        "_guarded_pdf_get",
+        lambda _url, _ctx, deadline: response,
+    )
+    monkeypatch.setattr(write._time, "monotonic", lambda: 2.0)
+
+    metadata, problem = write._fetch_embedded_metadata(
+        "https://example.test/article", object()
+    )
+
+    assert metadata is None
+    assert "TimeoutError" in problem
+    assert response.closed is True
+
+
 def test_doi_batch_uses_one_crossref_request(monkeypatch):
     class Response:
         status_code = 200
