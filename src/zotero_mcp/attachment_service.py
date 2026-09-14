@@ -27,10 +27,8 @@ from zotero_mcp._file_lock import (
 )
 
 DEFAULT_MAX_UPLOAD_SIZE = 512 * 1024 * 1024
-DEFAULT_MAX_INLINE_SIZE = 1 * 1024 * 1024
-DEFAULT_MAX_RESOURCE_SIZE = 8 * 1024 * 1024
-HARD_MAX_INLINE_SIZE = 32 * 1024 * 1024
-HARD_MAX_RESOURCE_SIZE = 64 * 1024 * 1024
+DEFAULT_MAX_RESOURCE_SIZE = 128 * 1024 * 1024
+HARD_MAX_RESOURCE_SIZE = 512 * 1024 * 1024
 DEFAULT_STATE_LOCK_TIMEOUT = 45.0
 DEFAULT_TOKEN_TTL = 3600
 DEFAULT_UPLOAD_GC_SCAN_LIMIT = 128
@@ -315,15 +313,6 @@ def _bounded_size_setting(name: str, default: int, hard_max: int) -> int:
     except ValueError:
         value = default
     return max(1, min(value, hard_max))
-
-
-def max_inline_size() -> int:
-    """Maximum binary size encoded directly into a tool response."""
-    return _bounded_size_setting(
-        "ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES",
-        DEFAULT_MAX_INLINE_SIZE,
-        HARD_MAX_INLINE_SIZE,
-    )
 
 
 def max_resource_size() -> int:

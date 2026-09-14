@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.7] - 2026-09-15
+
+### Changed
+- `zotero_get_attachment(inline=True)` now returns exact attachment bytes as one native MCP EmbeddedResource with the original filename and MIME type; `inline=False` retains the descriptor and signed-download path.
+- The configurable native MCP resource safety limit now defaults to 128 MiB with a 512 MiB hard cap, replacing the retired JSON/base64 inline limit.
+
 ## [1.4.6] - 2026-09-05
 
 ### Added

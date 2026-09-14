@@ -43,9 +43,8 @@ export ZOTERO_REMOTE_LOCAL_URL=http://127.0.0.1:23120/api
 export ZOTERO_MCP_WRITE_SECRET='choose-a-private-admin-secret'
 # Required only for externally usable signed attachment transfer URLs:
 export ZOTERO_MCP_PUBLIC_BASE_URL='https://example.net/your-zotero-mcp-path'
-# Optional: raise only when your MCP client accepts larger in-memory messages.
-export ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES=1048576
-export ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES=8388608
+# Optional: adjust only when your MCP client accepts larger in-memory resources.
+export ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES=134217728
 ```
 
 Write tools probe that endpoint first and perform both their reads and writes
@@ -57,10 +56,10 @@ endpoints are accepted when explicitly configured, but their local
 authorization key travels unencrypted. An SSH tunnel or HTTPS reverse proxy is
 preferable whenever the network is not fully trusted.
 
-The inline limit is not a Zotero attachment-size limit. Inline payloads are
-base64-encoded inside MCP messages (about 33% larger than the binary) and are
-held in memory by both server and client. Files above the inline/resource
-limits should use the signed streaming URL returned by `zotero_get_attachment`.
+The native-resource limit is not a Zotero attachment-size limit. With
+`inline=True`, exact bytes are returned as a native MCP EmbeddedResource and
+held in memory by both server and client. Files above that safety limit should
+use the signed streaming URL returned by `zotero_get_attachment(inline=False)`.
 
 ### Option 2: Zotero Web API
 

@@ -192,7 +192,7 @@ PARAMETER_DESCRIPTIONS = {
     "identifier": "Seed paper as an 8-character Zotero item key, DOI, or DOI URL.",
     "include_trashed": "Include collections currently in Zotero Trash.",
     "include_subcollections": "Include items filed in descendant collections as well as the named collection.",
-    "inline": "Embed base64 only within the configured inline limit (1 MiB by default).",
+    "inline": "Return exact attachment bytes as one native MCP EmbeddedResource.",
     "idempotency_key": "Caller-generated stable key that makes attachment creation safe to retry.",
     "isbn": "ISBN-10 or ISBN-13, with optional hyphens or URL/isbn prefix.",
     "issn": "Replacement ISSN for the Zotero item.",
@@ -659,6 +659,15 @@ class ToolContractMiddleware(Middleware):
         result = await call_next(context)
         if context.message.name in CONNECTOR_TOOLS:
             return result
+        if (
+            context.message.name == "zotero_get_attachment"
+            and any(getattr(block, "type", None) == "resource" for block in result.content)
+        ):
+            # Preserve FastMCP's native EmbeddedResource without synthesizing the
+            # standard text/structured envelope. A non-None meta value makes
+            # FastMCP pass a CallToolResult through the low-level MCP server, so
+            # the tool's usual published output schema cannot force duplication.
+            return ToolResult(content=result.content, meta=result.meta or {})
         text = _result_text(result)
         meta = copy.deepcopy(result.meta) if result.meta else {}
         # The underlying string-returning function is marked as a wrapped

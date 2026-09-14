@@ -1,5 +1,6 @@
 """Attachment interface, binary transfer, and destructive confirmation tests."""
 
+import base64
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from conftest import DummyContext
+from mcp.types import CallToolResult
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse
@@ -23,6 +25,7 @@ from zotero_mcp import resources
 from zotero_mcp.attachment_http import download_attachment, upload_attachment
 from zotero_mcp.client import AttachmentDownloadResult
 from zotero_mcp.server import (
+    get_attachment,
     list_attachments,
     mcp,
     prepare_attachment_change,
@@ -32,7 +35,15 @@ from zotero_mcp.server import (
 )
 
 
-def _attachment(key="ATTACH01", version=7, md5="abc"):
+def _attachment(
+    key="ATTACH01",
+    version=7,
+    md5="abc",
+    *,
+    filename="paper.pdf",
+    content_type="application/pdf",
+    size=1234,
+):
     return {
         "key": key,
         "version": version,
@@ -41,13 +52,13 @@ def _attachment(key="ATTACH01", version=7, md5="abc"):
             "itemType": "attachment",
             "parentItem": "PARENT01",
             "title": "Paper PDF",
-            "filename": "paper.pdf",
-            "contentType": "application/pdf",
+            "filename": filename,
+            "contentType": content_type,
             "linkMode": "imported_file",
             "md5": md5,
             "dateModified": "2026-09-02T00:00:00Z",
         },
-        "meta": {"fileSize": 1234},
+        "meta": {"fileSize": size},
     }
 
 
@@ -56,7 +67,6 @@ def attachment_state(monkeypatch, tmp_path):
     monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.delenv("ZOTERO_MCP_ATTACHMENT_SECRET", raising=False)
     monkeypatch.delenv("ZOTERO_MCP_PUBLIC_BASE_URL", raising=False)
-    monkeypatch.delenv("ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES", raising=False)
     monkeypatch.delenv("ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES", raising=False)
     return tmp_path
 
@@ -169,6 +179,211 @@ def test_list_attachments_returns_all_children(monkeypatch):
 
     assert result["count"] == 1
     assert result["attachments"][0]["attachment_key"] == "ATTACH01"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "content_type", "payload"),
+    [
+        ("source paper.pdf", "application/pdf", b"%PDF-1.4\nproduction test\n%%EOF\n"),
+        ("dataset.zip", "application/zip", b"PK\x03\x04non-pdf binary"),
+        ("raw.txt", "text/plain", b"exact binary text: \xff\x00"),
+    ],
+)
+async def test_inline_attachment_is_one_native_resource(
+    monkeypatch, filename, content_type, payload
+):
+    downloads = []
+
+    class Zotero:
+        def item(self, key):
+            return _attachment(
+                key=key,
+                filename=filename,
+                content_type=content_type,
+                size=len(payload),
+                md5=hashlib.md5(payload).hexdigest(),  # noqa: S324
+            )
+
+    def download(key, destination, target_filename, **kwargs):
+        downloads.append((key, target_filename, kwargs))
+        path = Path(destination) / target_filename
+        path.write_bytes(payload)
+        return AttachmentDownloadResult(path=path, source="test", errors=[])
+
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_zotero_client", Zotero
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.download_attachment_file", download
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_local_zotero_client", lambda: "local"
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_web_zotero_client", lambda: "web"
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments.service.make_token",
+        lambda *_args, **_kwargs: pytest.fail("inline=True must not create download URLs"),
+    )
+    registered_tool = await mcp.get_tool("zotero_get_attachment")
+    assert registered_tool is not None
+    monkeypatch.setattr(registered_tool, "run_in_thread", False)
+
+    result = await mcp._call_tool_mcp(
+        "zotero_get_attachment",
+        {"attachment_key": "ATTACH01", "inline": True},
+    )
+
+    assert isinstance(result, CallToolResult)
+    wire = json.loads(result.model_dump_json(by_alias=True, exclude_none=True))
+    assert len(wire["content"]) == 1
+    block = wire["content"][0]
+    assert block["type"] == "resource"
+    assert block["resource"]["mimeType"] == content_type
+    assert block["resource"]["uri"] == f"file:///{filename.replace(' ', '%20')}"
+    encoded_binary = block["resource"]["blob"]
+    decoded = base64.b64decode(encoded_binary, validate=True)
+    assert decoded == payload
+    assert len(decoded) == len(payload)
+    assert hashlib.md5(decoded).hexdigest() == hashlib.md5(payload).hexdigest()  # noqa: S324
+    assert not any(content.get("type") == "text" for content in wire["content"])
+    assert "structuredContent" not in wire
+    serialized = json.dumps(wire)
+    assert serialized.count(encoded_binary) == 1
+    assert "data_base64" not in serialized
+    assert "download_url" not in serialized
+    assert downloads == [
+        (
+            "ATTACH01",
+            filename,
+            {"local_client": "local", "web_client": "web"},
+        )
+    ]
+
+
+def test_inline_false_attachment_descriptor_is_unchanged(monkeypatch):
+    requested = []
+
+    class Zotero:
+        def item(self, key):
+            requested.append(key)
+            return _attachment(key=key)
+
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_zotero_client", Zotero
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_current_library",
+        lambda: {"library_id": "0", "library_type": "user"},
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments.service.make_token",
+        lambda action, payload, ttl: f"{action}-{payload['attachment_key']}-{ttl}",
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments.service.public_transfer_url",
+        lambda action, token: f"https://example.test/{action}/{token}",
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.download_attachment_file",
+        lambda *_args, **_kwargs: pytest.fail("inline=False must not download bytes"),
+    )
+
+    result = json.loads(
+        get_attachment(attachment_key="ATTACH01", inline=False, ctx=DummyContext())
+    )
+
+    assert requested == ["ATTACH01"]
+    assert result == {
+        "attachment": service.attachment_descriptor(_attachment()),
+        "resource_uri": "zotero://attachments/ATTACH01/content",
+        "download_url": "https://example.test/download/download-ATTACH01-900",
+        "expires_in_seconds": 900,
+    }
+
+
+def test_inline_native_resource_limit_never_falls_back_to_base64(
+    monkeypatch, attachment_state
+):
+    class Zotero:
+        def item(self, key):
+            return _attachment(key=key, size=5)
+
+    def download(_key, destination, filename, **_kwargs):
+        path = Path(destination) / filename
+        path.write_bytes(b"12345")
+        return AttachmentDownloadResult(path=path, source="test", errors=[])
+
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES", "4")
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_zotero_client", Zotero
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_local_zotero_client", lambda: object()
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.get_web_zotero_client", lambda: object()
+    )
+    monkeypatch.setattr(
+        "zotero_mcp.tools.attachments._client.download_attachment_file", download
+    )
+
+    result = get_attachment(
+        attachment_key="ATTACH01", inline=True, ctx=DummyContext()
+    )
+
+    assert "native MCP resource safety limit" in result
+    assert "inline=False" in result
+    assert "data_base64" not in result
+
+
+@pytest.mark.skipif(
+    os.environ.get("ZOTERO_MCP_RUN_LIVE_ATTACHMENT_TESTS") != "1",
+    reason="requires the configured live Zotero library",
+)
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attachment_key", "expected_size", "expected_md5"),
+    [
+        ("S3Z7HKQ9", 146291, "42ac328b0f176f1aaeffd7a434efa804"),
+        ("ZRCQHHXA", 61419461, "64bb25ec206620f0366594375c40438a"),
+    ],
+)
+async def test_live_inline_attachment_resource_size_and_hash(
+    monkeypatch, attachment_key, expected_size, expected_md5
+):
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    registered_tool = await mcp.get_tool("zotero_get_attachment")
+    assert registered_tool is not None
+    monkeypatch.setattr(registered_tool, "run_in_thread", False)
+
+    result = await mcp._call_tool_mcp(
+        "zotero_get_attachment",
+        {"attachment_key": attachment_key, "inline": True},
+    )
+
+    assert isinstance(result, CallToolResult)
+    assert len(result.content) == 1
+    block = result.content[0]
+    assert block.type == "resource"
+    assert block.resource.mimeType == "application/pdf"
+    assert str(block.resource.uri) == "file:///fulltext.pdf"
+    assert result.structuredContent is None
+
+    digest = hashlib.md5()  # noqa: S324 - regression against Zotero's stored MD5
+    decoded_size = 0
+    chunk_size = 4 * 1024 * 1024
+    for offset in range(0, len(block.resource.blob), chunk_size):
+        decoded = base64.b64decode(
+            block.resource.blob[offset : offset + chunk_size],
+            validate=True,
+        )
+        decoded_size += len(decoded)
+        digest.update(decoded)
+    assert decoded_size == expected_size
+    assert digest.hexdigest() == expected_md5
 
 
 def test_signed_tokens_reject_tampering_and_wrong_action(attachment_state):
@@ -730,20 +945,13 @@ def test_upload_gc_skips_corrupt_expiry_without_blocking_new_uploads(
     assert prepared["status"] == "prepared"
 
 
-def test_inline_and_resource_limits_are_configurable_and_bounded(
-    monkeypatch, attachment_state
-):
-    assert service.max_inline_size() == 1024 * 1024
-    assert service.max_resource_size() == 8 * 1024 * 1024
+def test_native_resource_limit_is_configurable_and_bounded(monkeypatch, attachment_state):
+    assert service.max_resource_size() == 128 * 1024 * 1024
 
-    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES", "2097152")
-    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES", "16777216")
-    assert service.max_inline_size() == 2 * 1024 * 1024
-    assert service.max_resource_size() == 16 * 1024 * 1024
+    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES", "268435456")
+    assert service.max_resource_size() == 256 * 1024 * 1024
 
-    monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES", str(10**12))
     monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES", str(10**12))
-    assert service.max_inline_size() == service.HARD_MAX_INLINE_SIZE
     assert service.max_resource_size() == service.HARD_MAX_RESOURCE_SIZE
 
 

@@ -76,8 +76,7 @@ def get_capabilities(*, ctx: Context) -> str:
         f"**EPUB annotation authoring:** {'yes' if epub_available else 'no'}",
         f"**Local full-text extraction:** {'yes' if local_mode else 'no'}",
         f"**Local paths exposed:** {'yes' if local_paths else 'no'}",
-        f"**Inline attachment limit:** {_attachments.max_inline_size()} bytes",
-        f"**MCP binary resource limit:** {_attachments.max_resource_size()} bytes",
+        f"**Native MCP attachment resource limit:** {_attachments.max_resource_size()} bytes",
         "",
         "Use metadata search for known titles/authors, semantic search for topics, "
         "semantic context for matched evidence, and whole-item full text only for "

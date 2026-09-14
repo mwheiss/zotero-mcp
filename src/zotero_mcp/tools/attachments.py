@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import tempfile
 import time
+from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
+from fastmcp.utilities.types import File
+from pydantic import AnyUrl
 from pyzotero.zotero import build_url
 
 from zotero_mcp import attachment_service as service
@@ -36,6 +39,29 @@ DESTRUCTIVE = {
     "idempotentHint": True,
     "openWorldHint": False,
 }
+
+
+class _NativeAttachmentFile(File):
+    """FastMCP file preserving Zotero's exact filename and MIME type."""
+
+    def __init__(self, *, data: bytes, filename: str, mime_type: str):
+        safe_filename = Path(filename).name
+        suffix = Path(safe_filename).suffix.lstrip(".") or "bin"
+        stem = safe_filename[: -(len(suffix) + 1)] if "." in safe_filename else safe_filename
+        super().__init__(data=data, format=suffix, name=stem)
+        self._attachment_filename = safe_filename
+        self._attachment_mime_type = mime_type
+
+    def to_resource_content(self, mime_type=None, annotations=None):
+        resource = super().to_resource_content(
+            mime_type="application/octet-stream",
+            annotations=annotations,
+        )
+        resource.resource.mimeType = self._attachment_mime_type
+        resource.resource.uri = AnyUrl(
+            f"file:///{quote(self._attachment_filename, safe='')}"
+        )
+        return resource
 
 
 def _json(value) -> str:
@@ -199,11 +225,13 @@ def get_document_text(
     name="zotero_get_attachment",
     annotations=READ_ONLY,
     description=(
-        "Get an exact attachment's binary-delivery descriptor. Returns metadata, "
-        "an MCP resource URI, and a short-lived signed streaming download URL when "
-        "a public base URL is configured. inline=True embeds base64 only within "
-        "the configured limit (1 MiB by default, adjustable up to 32 MiB). It "
-        "never converts the binary to document text."
+        "Get an exact attachment's binary. With inline=False, return metadata, an "
+        "MCP resource URI, and a short-lived signed streaming download URL when a "
+        "public base URL is configured, without embedding the binary. With "
+        "inline=True, return the exact bytes as one native MCP EmbeddedResource "
+        "with the real filename and MIME type. It never converts the attachment "
+        "to document text. For files above the configurable native-resource "
+        "safety limit, call again with inline=False and use the signed download URL."
     ),
 )
 def get_attachment(
@@ -218,6 +246,36 @@ def get_attachment(
         descriptor = service.attachment_descriptor(item)
         if not descriptor["binary_readable"]:
             return _json({"attachment": descriptor, "error": "Attachment has no stored binary"})
+        if inline:
+            filename = Path(
+                descriptor["filename"] or f"{attachment_key}.bin"
+            ).name
+            with tempfile.TemporaryDirectory() as temporary:
+                downloaded = _client.download_attachment_file(
+                    attachment_key,
+                    temporary,
+                    filename,
+                    local_client=_client.get_local_zotero_client(),
+                    web_client=_client.get_web_zotero_client(),
+                )
+                if not downloaded.path:
+                    raise ValueError("; ".join(downloaded.errors) or "binary unavailable")
+                size = downloaded.path.stat().st_size
+                resource_limit = service.max_resource_size()
+                if size > resource_limit:
+                    raise ValueError(
+                        f"attachment is {size} bytes, above the {resource_limit}-byte "
+                        "native MCP resource safety limit; call zotero_get_attachment "
+                        "with inline=False and use its signed download URL, or raise "
+                        "ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES"
+                    )
+                attachment_bytes = downloaded.path.read_bytes()
+            return _NativeAttachmentFile(  # type: ignore[return-value]
+                data=attachment_bytes,
+                filename=filename,
+                mime_type=descriptor["content_type"],
+            )
+
         token = service.make_token(
             "download",
             {
@@ -234,25 +292,6 @@ def get_attachment(
             "download_url": service.public_transfer_url("download", token),
             "expires_in_seconds": 900,
         }
-        if inline:
-            with tempfile.TemporaryDirectory() as temporary:
-                downloaded = _client.download_attachment_file(
-                    attachment_key,
-                    temporary,
-                    descriptor["filename"] or f"{attachment_key}.bin",
-                    local_client=_client.get_local_zotero_client(),
-                    web_client=_client.get_web_zotero_client(),
-                )
-                if not downloaded.path:
-                    raise ValueError("; ".join(downloaded.errors) or "binary unavailable")
-                inline_limit = service.max_inline_size()
-                if downloaded.path.stat().st_size > inline_limit:
-                    raise ValueError(
-                        f"inline binary is limited to {inline_limit} bytes; "
-                        "use download_url or raise "
-                        "ZOTERO_MCP_ATTACHMENT_INLINE_MAX_BYTES"
-                    )
-                result["data_base64"] = base64.b64encode(downloaded.path.read_bytes()).decode("ascii")
         return _json(result)
     except Exception as exc:
         context_error(ctx, f"Could not retrieve attachment: {exc}")
