@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.8] - 2026-09-15
+
+### Changed
+- The default native MCP attachment resource limit is now 1 MiB because larger inline resources can destabilize ChatGPT; larger files remain available through `inline=False` signed downloads.
+
 ## [1.4.7] - 2026-09-15
 
 ### Changed

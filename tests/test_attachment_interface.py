@@ -348,7 +348,6 @@ def test_inline_native_resource_limit_never_falls_back_to_base64(
     ("attachment_key", "expected_size", "expected_md5"),
     [
         ("S3Z7HKQ9", 146291, "42ac328b0f176f1aaeffd7a434efa804"),
-        ("ZRCQHHXA", 61419461, "64bb25ec206620f0366594375c40438a"),
     ],
 )
 async def test_live_inline_attachment_resource_size_and_hash(
@@ -384,6 +383,33 @@ async def test_live_inline_attachment_resource_size_and_hash(
         digest.update(decoded)
     assert decoded_size == expected_size
     assert digest.hexdigest() == expected_md5
+
+
+@pytest.mark.skipif(
+    os.environ.get("ZOTERO_MCP_RUN_LIVE_ATTACHMENT_TESTS") != "1",
+    reason="requires the configured live Zotero library",
+)
+@pytest.mark.asyncio
+async def test_live_large_inline_attachment_uses_streaming_fallback(monkeypatch):
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    registered_tool = await mcp.get_tool("zotero_get_attachment")
+    assert registered_tool is not None
+    monkeypatch.setattr(registered_tool, "run_in_thread", False)
+
+    result = await mcp._call_tool_mcp(
+        "zotero_get_attachment",
+        {"attachment_key": "ZRCQHHXA", "inline": True},
+    )
+
+    assert isinstance(result, CallToolResult)
+    assert [block.type for block in result.content] == ["text"]
+    assert result.structuredContent["status"] == "error"
+    text = result.structuredContent["text"]
+    assert "61419461 bytes" in text
+    assert "1048576-byte native MCP resource safety limit" in text
+    assert "inline=False" in text
+    assert "blob" not in text
+    assert "data_base64" not in text
 
 
 def test_signed_tokens_reject_tampering_and_wrong_action(attachment_state):
@@ -946,7 +972,7 @@ def test_upload_gc_skips_corrupt_expiry_without_blocking_new_uploads(
 
 
 def test_native_resource_limit_is_configurable_and_bounded(monkeypatch, attachment_state):
-    assert service.max_resource_size() == 128 * 1024 * 1024
+    assert service.max_resource_size() == 1 * 1024 * 1024
 
     monkeypatch.setenv("ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES", "268435456")
     assert service.max_resource_size() == 256 * 1024 * 1024

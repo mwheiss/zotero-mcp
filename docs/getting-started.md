@@ -44,7 +44,7 @@ export ZOTERO_MCP_WRITE_SECRET='choose-a-private-admin-secret'
 # Required only for externally usable signed attachment transfer URLs:
 export ZOTERO_MCP_PUBLIC_BASE_URL='https://example.net/your-zotero-mcp-path'
 # Optional: adjust only when your MCP client accepts larger in-memory resources.
-export ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES=134217728
+export ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES=1048576
 ```
 
 Write tools probe that endpoint first and perform both their reads and writes

@@ -478,7 +478,7 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `ZOTERO_MCP_PUBLIC_BASE_URL`: Public MCP URL prefix used to create short-lived signed attachment upload/download URLs
 - `ZOTERO_MCP_ATTACHMENT_SECRET`: Optional persistent capability-token secret; when set, it must contain at least 32 bytes
 - `ZOTERO_MCP_ATTACHMENT_MAX_BYTES`: Maximum staged attachment upload size (default: 512 MiB)
-- `ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES`: Maximum binary returned through an in-memory native MCP resource (default: 128 MiB; hard cap: 512 MiB)
+- `ZOTERO_MCP_ATTACHMENT_RESOURCE_MAX_BYTES`: Maximum binary returned through an in-memory native MCP resource (default: 1 MiB; hard cap: 512 MiB)
 - `ZOTERO_MCP_ATTACHMENT_LOCK_TIMEOUT`: Maximum seconds to wait for the same attachment idempotency key (default: 45)
 - `ZOTERO_MCP_ATTACHMENT_STATE_DIR`: Private staging/token state directory (default: `~/.cache/zotero-mcp/attachments`)
 - `ZOTERO_MCP_ATTACHMENT_GC_SCAN_LIMIT` / `ZOTERO_MCP_ATTACHMENT_GC_DELETE_LIMIT`: Bound manifest checks and deletions per staged-upload cleanup pass (defaults: 128 checked / 32 deleted)
@@ -754,7 +754,7 @@ capability gates.
 - `zotero_get_pdf_outline`: Extract a PDF's embedded outline/bookmarks
 
 Native inline attachment resources are held in memory by both the MCP server
-and client. The 128 MiB default is a transport safety limit, not a Zotero
+and client. The 1 MiB default is a transport safety limit, not a Zotero
 attachment-size limit. Use `inline=False` and its signed streaming URL for
 larger files, or raise the bounded resource setting when both server and client
 have adequate memory and message-size limits.

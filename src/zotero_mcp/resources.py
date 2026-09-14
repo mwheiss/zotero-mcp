@@ -109,7 +109,7 @@ def collection_items_resource(collection_key: str) -> str:
     name="Zotero attachment binary",
     description=(
         "Exact binary content for one Zotero attachment. Intended for MCP clients "
-        "that support binary resources. The in-memory limit is 128 MiB by default; "
+        "that support binary resources. The in-memory limit is 1 MiB by default; "
         "use zotero_get_attachment for a streaming download URL when the file is large."
     ),
     mime_type="application/octet-stream",

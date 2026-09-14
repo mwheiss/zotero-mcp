@@ -50,7 +50,7 @@ def test_resource_descriptions_state_scope_and_fulltext_limits(monkeypatch):
     assert "up to 200 items" in descriptions[
         "zotero://collections/{collection_key}/items"
     ]
-    assert "128 MiB" in descriptions[
+    assert "1 MiB" in descriptions[
         "zotero://attachments/{attachment_key}/content"
     ]
 
