@@ -78,3 +78,23 @@ def test_openai_build_from_config_handles_persisted_config(monkeypatch):
     assert cfg["base_url"] is None
     assert cfg["request_batch_size"] == chroma_client.OpenAIEmbeddingFunction.DEFAULT_REQUEST_BATCH_SIZE
     assert cfg["rate_limit_rps"] is None
+    assert "query_prefix" not in cfg
+    assert "document_prefix" not in cfg
+
+
+def test_openai_build_from_config_round_trips_embedding_prefixes(monkeypatch):
+    pytest.importorskip("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-no-network")
+
+    persisted = {
+        "model_name": "nemotron",
+        "base_url": "http://127.0.0.1:8032/v1",
+        "query_prefix": "query: ",
+        "document_prefix": "passage: ",
+    }
+    ef = known_embedding_functions["openai"].build_from_config(persisted)
+
+    assert ef.query_prefix == "query: "
+    assert ef.document_prefix == "passage: "
+    assert ef.get_config()["query_prefix"] == "query: "
+    assert ef.get_config()["document_prefix"] == "passage: "

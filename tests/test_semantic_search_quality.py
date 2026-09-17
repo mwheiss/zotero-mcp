@@ -171,6 +171,28 @@ class TestGeminiQueryEmbedding:
 
 
 class TestQwenQueryInstruction:
+    @staticmethod
+    def _openai_compatible_ef(
+        *,
+        query_instruction=None,
+        query_prefix=None,
+        document_prefix=None,
+    ):
+        from zotero_mcp.chroma_client import OpenAIEmbeddingFunction
+
+        response = MagicMock()
+        response.data = [MagicMock(embedding=[0.1, 0.2])]
+        ef = OpenAIEmbeddingFunction.__new__(OpenAIEmbeddingFunction)
+        ef.model_name = "api-alias"
+        ef.query_instruction = query_instruction
+        ef.query_prefix = query_prefix
+        ef.document_prefix = document_prefix
+        ef.request_batch_size = 1
+        ef.rate_limit_rps = None
+        ef.client = MagicMock()
+        ef.client.embeddings.create.return_value = response
+        return ef
+
     def test_qwen_ollama_model_gets_default_scientific_instruction(self):
         from zotero_mcp.chroma_client import (
             DEFAULT_QWEN_QUERY_INSTRUCTION,
@@ -182,17 +204,9 @@ class TestQwenQueryInstruction:
         assert ef.query_instruction == DEFAULT_QWEN_QUERY_INSTRUCTION
 
     def test_openai_compatible_query_gets_configured_instruction(self):
-        from zotero_mcp.chroma_client import OpenAIEmbeddingFunction
-
-        response = MagicMock()
-        response.data = [MagicMock(embedding=[0.1, 0.2])]
-        ef = OpenAIEmbeddingFunction.__new__(OpenAIEmbeddingFunction)
-        ef.model_name = "api-alias"
-        ef.query_instruction = "Retrieve scientific papers"
-        ef.request_batch_size = 1
-        ef.rate_limit_rps = None
-        ef.client = MagicMock()
-        ef.client.embeddings.create.return_value = response
+        ef = self._openai_compatible_ef(
+            query_instruction="Retrieve scientific papers"
+        )
 
         result = ef.embed_query("muon capture")
 
@@ -202,22 +216,83 @@ class TestQwenQueryInstruction:
         ]
 
     def test_documents_are_not_prefixed(self):
-        from zotero_mcp.chroma_client import OpenAIEmbeddingFunction
-
-        response = MagicMock()
-        response.data = [MagicMock(embedding=[0.1])]
-        ef = OpenAIEmbeddingFunction.__new__(OpenAIEmbeddingFunction)
-        ef.model_name = "api-alias"
-        ef.query_instruction = "Retrieve scientific papers"
-        ef.request_batch_size = 1
-        ef.rate_limit_rps = None
-        ef.client = MagicMock()
-        ef.client.embeddings.create.return_value = response
+        ef = self._openai_compatible_ef(
+            query_instruction="Retrieve scientific papers"
+        )
 
         ef(["paper body"])
 
         assert ef.client.embeddings.create.call_args.kwargs["input"] == [
             "paper body"
+        ]
+
+    def test_no_prefixes_preserve_raw_query_and_document(self):
+        ef = self._openai_compatible_ef()
+
+        ef.embed_query("muon capture")
+        assert ef.client.embeddings.create.call_args.kwargs["input"] == [
+            "muon capture"
+        ]
+
+        ef(["paper body"])
+        assert ef.client.embeddings.create.call_args.kwargs["input"] == [
+            "paper body"
+        ]
+
+    def test_query_prefix_only(self):
+        ef = self._openai_compatible_ef(query_prefix="query: ")
+
+        ef.embed_query("muon capture")
+
+        assert ef.client.embeddings.create.call_args.kwargs["input"] == [
+            "query: muon capture"
+        ]
+
+    def test_document_prefix_only(self):
+        ef = self._openai_compatible_ef(document_prefix="passage: ")
+
+        ef(["paper body"])
+
+        assert ef.client.embeddings.create.call_args.kwargs["input"] == [
+            "passage: paper body"
+        ]
+
+    def test_both_query_and_document_prefixes(self):
+        ef = self._openai_compatible_ef(
+            query_prefix="query: ",
+            document_prefix="passage: ",
+        )
+
+        ef.embed_query("muon capture")
+        assert ef.client.embeddings.create.call_args.kwargs["input"] == [
+            "query: muon capture"
+        ]
+        ef(["paper body"])
+        assert ef.client.embeddings.create.call_args.kwargs["input"] == [
+            "passage: paper body"
+        ]
+
+    def test_query_instruction_wins_without_stacking_query_prefix(self):
+        ef = self._openai_compatible_ef(
+            query_instruction="Retrieve scientific papers",
+            query_prefix="query: ",
+        )
+
+        ef.embed_query("muon capture")
+
+        assert ef.client.embeddings.create.call_args.kwargs["input"] == [
+            "Instruct: Retrieve scientific papers\nQuery: muon capture"
+        ]
+
+    def test_document_prefix_does_not_mutate_caller_document(self):
+        ef = self._openai_compatible_ef(document_prefix="passage: ")
+        documents = ["paper body"]
+
+        ef(documents)
+
+        assert documents == ["paper body"]
+        assert ef.client.embeddings.create.call_args.kwargs["input"] == [
+            "passage: paper body"
         ]
 
 

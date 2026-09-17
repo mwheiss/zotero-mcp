@@ -148,6 +148,8 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         request_batch_size: int | None = None,
         rate_limit_rps: float | None = None,
         query_instruction: str | None = None,
+        query_prefix: str | None = None,
+        document_prefix: str | None = None,
     ):
         import threading
 
@@ -157,6 +159,8 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         self.request_batch_size = int(request_batch_size) if request_batch_size else self.DEFAULT_REQUEST_BATCH_SIZE
         self.rate_limit_rps: float | None = float(rate_limit_rps) if rate_limit_rps else None
         self.query_instruction = query_instruction
+        self.query_prefix = query_prefix
+        self.document_prefix = document_prefix
         self._rate_lock = threading.Lock()
         self._last_request_ts: float = 0.0
         if not self.api_key:
@@ -177,12 +181,22 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         return "openai"
 
     def get_config(self) -> dict[str, Any]:
-        return {
+        config = {
             "model_name": self.model_name,
             "base_url": self.base_url,
             "request_batch_size": self.request_batch_size,
             "rate_limit_rps": self.rate_limit_rps,
         }
+        # Keep the historical serialized shape exactly when prefixes are not
+        # configured. Chroma compares persisted embedding-function configs, so
+        # adding null keys would make old collections appear incompatible.
+        query_prefix = getattr(self, "query_prefix", None)
+        document_prefix = getattr(self, "document_prefix", None)
+        if query_prefix is not None:
+            config["query_prefix"] = query_prefix
+        if document_prefix is not None:
+            config["document_prefix"] = document_prefix
+        return config
 
     @staticmethod
     def build_from_config(config: dict[str, Any]) -> "OpenAIEmbeddingFunction":
@@ -192,6 +206,8 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
             base_url=config.get("base_url"),
             request_batch_size=config.get("request_batch_size"),
             rate_limit_rps=config.get("rate_limit_rps"),
+            query_prefix=config.get("query_prefix"),
+            document_prefix=config.get("document_prefix"),
         )
 
     def _wait_for_rate_limit(self) -> None:
@@ -212,7 +228,7 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
                 time.sleep(wait)
             self._last_request_ts = time.monotonic()
 
-    def __call__(self, input: Documents) -> Embeddings:
+    def _embed_inputs(self, inputs: Documents) -> Embeddings:
         """Generate embeddings using the OpenAI-compatible API.
 
         ``encoding_format="float"`` is set explicitly. The OpenAI SDK otherwise
@@ -224,11 +240,11 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         """
         batch_size = self.request_batch_size or self.DEFAULT_REQUEST_BATCH_SIZE
         vecs: Embeddings = []
-        for i in range(0, len(input), batch_size):
+        for i in range(0, len(inputs), batch_size):
             cancel_event = getattr(self, "_zotero_mcp_cancel_event", None)
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("Embedding update cancellation requested")
-            sub = input[i : i + batch_size]
+            sub = inputs[i : i + batch_size]
             self._wait_for_rate_limit()
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("Embedding update cancellation requested")
@@ -240,9 +256,33 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
             vecs.extend(data.embedding for data in response.data)
         return vecs
 
+    def __call__(self, input: Documents) -> Embeddings:
+        """Embed documents, applying a request-only document prefix.
+
+        The caller-owned strings are never mutated. Chroma continues to store
+        the original document and derive content hashes from that original.
+        """
+        prefix = getattr(self, "document_prefix", None) or ""
+        # Preserve the exact historical request object when no prefix is set.
+        # Besides avoiding needless copies, a few OpenAI-compatible clients
+        # accept token-ID inputs in addition to strings.
+        documents = input if not prefix else [f"{prefix}{document}" for document in input]
+        return self._embed_inputs(documents)
+
     def embed_query(self, text: str) -> list[float]:
-        """Embed a query, optionally using an asymmetric retrieval prompt."""
-        return self.__call__([_instruct_query(text, self.query_instruction)])[0]
+        """Embed a query using one backwards-compatible prompt mechanism.
+
+        ``query_instruction`` takes precedence so existing Qwen deployments
+        retain their exact ``Instruct: ...\\nQuery: ...`` payload. The generic
+        ``query_prefix`` is used only when no instruction is configured; the
+        two mechanisms are deliberately never stacked.
+        """
+        instruction = getattr(self, "query_instruction", None)
+        if instruction:
+            query = _instruct_query(text, instruction)
+        else:
+            query = f"{getattr(self, 'query_prefix', None) or ''}{text}"
+        return self._embed_inputs([query])[0]
 
     def truncate(self, text: str, max_tokens: int) -> str:
         """Truncate using tiktoken cl100k_base (correct for OpenAI models)."""
@@ -843,6 +883,8 @@ class ChromaClient:
                 request_batch_size=self.embedding_config.get("request_batch_size"),
                 rate_limit_rps=self.embedding_config.get("rate_limit_rps"),
                 query_instruction=query_instruction,
+                query_prefix=self.embedding_config.get("query_prefix"),
+                document_prefix=self.embedding_config.get("document_prefix"),
             )
 
         elif self.embedding_model == "gemini":
