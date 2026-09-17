@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.9] - 2026-09-17
+
+### Fixed
+- Ordinary chunked encoder search now treats `limit` as a parent-item limit, widens until the first excluded parent is observable, and discards the fetched tail at that exact rank boundary while retaining every qualifying supporting passage without changing parent ordering.
+
 ## [1.4.8] - 2026-09-15
 
 ### Changed

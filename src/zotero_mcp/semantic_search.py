@@ -4334,6 +4334,46 @@ class ZoteroSemanticSearch:
                         e,
                     )
 
+    @staticmethod
+    def _trim_chunk_results_to_parent_boundary(
+        results: dict[str, Any],
+        limit: int,
+    ) -> tuple[dict[str, Any], bool]:
+        """Trim ranked chunks before the first excluded parent item.
+
+        ``limit`` is a parent-item limit even though chunked search ranks
+        passages. The best chunk from the ``limit + 1``-th distinct parent is
+        therefore the first excluded result and defines the exact end of the
+        effective candidate set.
+
+        Return ``(results, False)`` when that boundary is not present. In that
+        case the caller preserves the historical enrichment fallback rather
+        than inventing a relevance cutoff.
+        """
+        if limit <= 0 or not results.get("ids") or not results["ids"][0]:
+            return results, False
+
+        seen: set[str] = set()
+        boundary_index: int | None = None
+        for index, raw_id in enumerate(results["ids"][0]):
+            parent = raw_id.split("#", 1)[0]
+            if parent in seen:
+                continue
+            seen.add(parent)
+            if len(seen) == limit + 1:
+                boundary_index = index
+                break
+
+        if boundary_index is None:
+            return results, False
+
+        trimmed = dict(results)
+        for key in ("ids", "distances", "documents", "metadatas"):
+            rows = results.get(key)
+            if rows and rows[0] is not None:
+                trimmed[key] = [rows[0][:boundary_index]]
+        return trimmed, True
+
     def search(self, query: str, limit: int = 10, filters: dict[str, Any] | None = None) -> dict[str, Any]:
         """
         Perform semantic search over the Zotero library.
@@ -4359,9 +4399,12 @@ class ZoteroSemanticSearch:
                 multiplier = self._reranker_config.get("candidate_multiplier", 3)
                 fetch_limit = max(fetch_limit, limit * multiplier)
 
-            # Perform semantic search. If several strong chunks belong to the
-            # same papers, widen the candidate window until it contains enough
-            # distinct parent items or reaches a bounded ceiling.
+            # Encoder-only chunked search needs one excluded parent beyond the
+            # requested parent-item limit. Its best chunk defines the global
+            # rank boundary for supporting hits. Reranking remains separate.
+            use_parent_boundary = self._chunking_enabled and reranker is None and limit > 0
+            distinct_parent_target = limit + 1 if use_parent_boundary else limit
+
             results = self.chroma_client.search(query_texts=[query], n_results=fetch_limit, where=filters)
             if self._chunking_enabled:
                 # A single book can legitimately own hundreds of highly ranked
@@ -4381,11 +4424,19 @@ class ZoteroSemanticSearch:
                             DEFAULT_MAX_CHUNKS_PER_ITEM,
                         )
                     )
-                    max_fetch = max(fetch_limit, limit * max_chunks)
+                    # A non-self-contained item can have one metadata passage
+                    # in addition to max_chunks body passages. Fetch one more
+                    # record beyond the worst case for `limit` parents so the
+                    # first chunk of parent `limit + 1` is observable.
+                    max_records_per_parent = max(1, max_chunks + 1)
+                    max_fetch = max(
+                        fetch_limit,
+                        limit * max_records_per_parent + (1 if use_parent_boundary else 0),
+                    )
                 while fetch_limit < max_fetch:
                     result_ids = (results.get("ids") or [[]])[0]
                     distinct_items = {raw_id.split("#", 1)[0] for raw_id in result_ids}
-                    if len(distinct_items) >= limit or len(result_ids) < fetch_limit:
+                    if len(distinct_items) >= distinct_parent_target or len(result_ids) < fetch_limit:
                         break
                     fetch_limit = min(fetch_limit * 2, max_fetch)
                     results = self.chroma_client.search(
@@ -4393,6 +4444,15 @@ class ZoteroSemanticSearch:
                         n_results=fetch_limit,
                         where=filters,
                     )
+
+            # Geometric widening may fetch a tail beyond the exact boundary.
+            # Remove it before any reranking or enrichment can observe it.
+            all_chunk_candidates_are_hits = False
+            if use_parent_boundary:
+                results, all_chunk_candidates_are_hits = self._trim_chunk_results_to_parent_boundary(
+                    results,
+                    limit,
+                )
 
             # Re-rank results with cross-encoder if enabled. With chunking we
             # rerank ALL candidates (grouping to `limit` items happens in
@@ -4411,7 +4471,8 @@ class ZoteroSemanticSearch:
                 results,
                 query,
                 limit,
-                preserve_input_order=reranker is not None,
+                preserve_input_order=reranker is not None or all_chunk_candidates_are_hits,
+                all_chunk_candidates_are_hits=all_chunk_candidates_are_hits,
             )
 
             return {
@@ -4439,14 +4500,18 @@ class ZoteroSemanticSearch:
         query: str,
         limit: int | None = None,
         preserve_input_order: bool = False,
+        all_chunk_candidates_are_hits: bool = False,
     ) -> list[dict[str, Any]]:
         """Enrich ChromaDB results with full Zotero item data.
 
         Chunk-aware: when the collection is indexed as passages, ids look like
         ``<item_key>#<n>``. Results are grouped back to their parent item. The
-        first (best-ranked) passage supplies the primary result, while up to two
-        independent supporting passages can add a bounded relevance bonus.
-        Item-level collections (ids without ``#``) flow through unchanged.
+        first (best-ranked) passage supplies the primary result. When search
+        has trimmed candidates at the first excluded-parent boundary, every
+        remaining chunk is a qualifying hit and is retained without a support
+        bonus. Otherwise the historical bounded-support heuristic remains the
+        fallback. Item-level collections (ids without ``#``) flow through
+        unchanged.
         """
         enriched: list[dict[str, Any]] = []
 
@@ -4494,26 +4559,30 @@ class ZoteroSemanticSearch:
             selected = [best]
             is_chunked = "#" in best["raw_id"] or "chunk_index" in best["meta"]
 
-            if is_chunked and best_score > 0:
-                for candidate in candidates[1:]:
-                    if len(selected) >= 3:
-                        break
-                    if candidate["similarity"] < max(0, best_score - 0.15):
-                        continue
-                    if any(_passages_overlap(candidate, chosen) for chosen in selected):
-                        continue
-                    selected.append(candidate)
+            if is_chunked and all_chunk_candidates_are_hits:
+                selected = candidates
+                aggregate_score = best_score
+            else:
+                if is_chunked and best_score > 0:
+                    for candidate in candidates[1:]:
+                        if len(selected) >= 3:
+                            break
+                        if candidate["similarity"] < max(0, best_score - 0.15):
+                            continue
+                        if any(_passages_overlap(candidate, chosen) for chosen in selected):
+                            continue
+                        selected.append(candidate)
 
-            support_weights = (0.10, 0.05)
-            support_bonus = (
-                sum(
-                    weight * min(1.0, max(0.0, candidate["similarity"]) / best_score)
-                    for weight, candidate in zip(support_weights, selected[1:])
+                support_weights = (0.10, 0.05)
+                support_bonus = (
+                    sum(
+                        weight * min(1.0, max(0.0, candidate["similarity"]) / best_score)
+                        for weight, candidate in zip(support_weights, selected[1:])
+                    )
+                    if best_score > 0
+                    else 0.0
                 )
-                if best_score > 0
-                else 0.0
-            )
-            aggregate_score = min(1.0, best_score * (1.0 + min(0.15, support_bonus)))
+                aggregate_score = min(1.0, best_score * (1.0 + min(0.15, support_bonus)))
 
             enriched_result: dict[str, Any] = {
                 "item_key": item_key,

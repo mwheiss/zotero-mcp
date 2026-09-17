@@ -6,6 +6,7 @@ chunk-aware indexing path in `_process_item_batch`, and chunk grouping in
 config file or by setting `_chunking_config` directly.
 """
 
+import hashlib
 import json
 import sys
 
@@ -688,3 +689,221 @@ def test_enrich_caps_at_limit(monkeypatch):
     }
     enriched = s._enrich_search_results(chroma_results, "q", limit=2)
     assert [r["item_key"] for r in enriched] == ["A", "B"]
+
+
+class _RankedChunkSearchFake(ChunkingFakeChroma):
+    def __init__(self, ids, *, distances=None, count_available=True, overlapping=True):
+        super().__init__()
+        self.ids = list(ids)
+        self.distances = list(distances or [0.10 + i / 100 for i in range(len(ids))])
+        self.count_available = count_available
+        self.overlapping = overlapping
+        self.fetches = []
+        self.filters = []
+
+    def count_documents(self):
+        if not self.count_available:
+            raise RuntimeError("count unavailable")
+        return len(self.ids)
+
+    def distance_to_similarity(self, distance):
+        return 1.0 - distance
+
+    def search(self, query_texts, n_results, where=None):
+        self.fetches.append(n_results)
+        self.filters.append(where)
+        ids = self.ids[:n_results]
+        return {
+            "ids": [ids],
+            "distances": [self.distances[:n_results]],
+            "documents": [[f"stored text for {raw_id}" for raw_id in ids]],
+            "metadatas": [
+                [
+                    {
+                        "parent_item_key": raw_id.split("#", 1)[0],
+                        "chunk_index": int(raw_id.split("#", 1)[1]),
+                        "n_chunks": 99,
+                        "passage_kind": "body",
+                        # Identical offsets prove boundary-qualified hits are
+                        # not discarded merely because they overlap.
+                        "char_start": 100 if self.overlapping else i * 1000,
+                        "char_end": 200 if self.overlapping else i * 1000 + 100,
+                        "page": 7,
+                    }
+                    for i, raw_id in enumerate(ids)
+                ]
+            ],
+        }
+
+
+def _ranked_chunk_search(monkeypatch, client, *, max_chunks=96):
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: _ZotItemStub())
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=client)
+    search._chunking_config = {
+        "enabled": True,
+        "chunk_size": 6000,
+        "overlap": 750,
+        "max_chunks_per_item": max_chunks,
+    }
+    return search
+
+
+def test_search_uses_limit_plus_one_parent_as_exact_chunk_boundary(monkeypatch):
+    client = _RankedChunkSearchFake(
+        ["A#0", "A#1", "B#0", "A#2", "B#1", "A#3", "C#0", "A#4"]
+    )
+    search = _ranked_chunk_search(monkeypatch, client)
+
+    result = search.search("query", limit=2)
+
+    assert client.fetches == [8]
+    assert [entry["item_key"] for entry in result["results"]] == ["A", "B"]
+    paper_a, paper_b = result["results"]
+    assert [p["chunk_id"] for p in paper_a["matched_passages"]] == [
+        "A#0",
+        "A#1",
+        "A#2",
+        "A#3",
+    ]
+    assert [p["chunk_id"] for p in paper_b["matched_passages"]] == ["B#0", "B#1"]
+    assert paper_a["supporting_chunk_count"] == 3
+    assert paper_a["similarity_score"] == pytest.approx(
+        paper_a["best_chunk_similarity_score"]
+    )
+    first_passage = paper_a["matched_passages"][0]
+    assert first_passage["content_hash"] == hashlib.sha256(
+        b"stored text for A#0"
+    ).hexdigest()
+    assert {
+        "chunk_index": 0,
+        "n_chunks": 99,
+        "passage_kind": "body",
+        "char_start": 100,
+        "char_end": 200,
+        "page": 7,
+    }.items() <= first_passage.items()
+    surfaced = {
+        passage["chunk_id"]
+        for entry in result["results"]
+        for passage in entry["matched_passages"]
+    }
+    assert "C#0" not in surfaced
+    assert "A#4" not in surfaced
+
+
+def test_search_widens_until_limit_plus_one_parent_is_visible(monkeypatch):
+    client = _RankedChunkSearchFake(
+        [
+            "A#0",
+            "A#1",
+            "A#2",
+            "B#0",
+            "A#3",
+            "B#1",
+            "A#4",
+            "B#2",
+            "A#5",
+            "C#0",
+            "A#6",
+            "D#0",
+        ]
+    )
+    search = _ranked_chunk_search(monkeypatch, client)
+
+    result = search.search("query", limit=2)
+
+    assert client.fetches == [8, 12]
+    assert [entry["item_key"] for entry in result["results"]] == ["A", "B"]
+    assert [p["chunk_id"] for p in result["results"][0]["matched_passages"]] == [
+        "A#0",
+        "A#1",
+        "A#2",
+        "A#3",
+        "A#4",
+        "A#5",
+    ]
+
+
+def test_search_widens_past_dominant_parent_when_count_is_unavailable(monkeypatch):
+    # max_chunks_per_item body chunks plus one metadata chunk can all belong to
+    # A. The fallback ceiling must still fetch B#0 to establish the boundary.
+    client = _RankedChunkSearchFake(
+        ["A#0", "A#1", "A#2", "A#3", "A#4", "A#5", "B#0"],
+        count_available=False,
+    )
+    search = _ranked_chunk_search(monkeypatch, client, max_chunks=5)
+
+    result = search.search("query", limit=1)
+
+    assert client.fetches == [4, 7]
+    assert [entry["item_key"] for entry in result["results"]] == ["A"]
+    assert [p["chunk_id"] for p in result["results"][0]["matched_passages"]] == [
+        "A#0",
+        "A#1",
+        "A#2",
+        "A#3",
+        "A#4",
+        "A#5",
+    ]
+
+
+def test_fetched_tail_cannot_add_support_or_break_cutoff_ties(monkeypatch):
+    # All distances tie. Ranked position still makes C#0 the first excluded
+    # parent; A#1 and B#1 in the oversized reservoir must remain invisible.
+    client = _RankedChunkSearchFake(
+        ["A#0", "B#0", "C#0", "A#1", "B#1", "D#0", "A#2", "B#2"],
+        distances=[0.1] * 8,
+    )
+    search = _ranked_chunk_search(monkeypatch, client)
+
+    result = search.search("query", limit=2)
+
+    assert [entry["item_key"] for entry in result["results"]] == ["A", "B"]
+    assert [entry["supporting_chunk_count"] for entry in result["results"]] == [0, 0]
+    assert [
+        passage["chunk_id"]
+        for entry in result["results"]
+        for passage in entry["matched_passages"]
+    ] == ["A#0", "B#0"]
+
+
+@pytest.mark.parametrize(
+    ("limit", "ids", "expected_parents"),
+    [
+        (2, ["A#0", "A#1", "A#2", "A#3", "B#0"], ["A", "B"]),
+        (3, ["A#0", "A#1", "A#2", "A#3", "B#0"], ["A", "B"]),
+    ],
+)
+def test_search_without_excluded_parent_preserves_enrichment_fallback(
+    monkeypatch,
+    limit,
+    ids,
+    expected_parents,
+):
+    client = _RankedChunkSearchFake(ids, overlapping=False)
+    search = _ranked_chunk_search(monkeypatch, client)
+
+    result = search.search("query", limit=limit)
+
+    assert [entry["item_key"] for entry in result["results"]] == expected_parents
+    paper_a = result["results"][0]
+    # Historical no-boundary behavior retains at most two supporting passages
+    # and their bounded relevance bonus.
+    assert [p["chunk_id"] for p in paper_a["matched_passages"]] == [
+        "A#0",
+        "A#1",
+        "A#2",
+    ]
+    assert paper_a["similarity_score"] > paper_a["best_chunk_similarity_score"]
+
+
+def test_filtered_single_parent_search_has_no_invented_cutoff(monkeypatch):
+    client = _RankedChunkSearchFake(["A#0", "A#1", "A#2"])
+    search = _ranked_chunk_search(monkeypatch, client)
+    filters = {"item_key": {"$eq": "A"}}
+
+    result = search.search("query", limit=2, filters=filters)
+
+    assert client.filters == [filters]
+    assert [entry["item_key"] for entry in result["results"]] == ["A"]
+    assert [p["chunk_id"] for p in result["results"][0]["matched_passages"]] == ["A#0"]
