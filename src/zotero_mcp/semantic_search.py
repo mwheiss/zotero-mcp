@@ -4346,9 +4346,10 @@ class ZoteroSemanticSearch:
         therefore the first excluded result and defines the exact end of the
         effective candidate set.
 
-        Return ``(results, False)`` when that boundary is not present. In that
-        case the caller preserves the historical enrichment fallback rather
-        than inventing a relevance cutoff.
+        Return ``(results, False)`` when that boundary is not present. The
+        caller retains the entire retrieved prefix, treating an exhausted
+        candidate set as an open-ended boundary. The boolean reports whether
+        an excluded parent was actually found, not whether chunks may be kept.
         """
         if limit <= 0 or not results.get("ids") or not results["ids"][0]:
             return results, False
@@ -4380,11 +4381,15 @@ class ZoteroSemanticSearch:
 
         Args:
             query: Search query text
-            limit: Maximum number of results to return
+            limit: Maximum number of parent-paper results to return
             filters: Optional metadata filters
 
         Returns:
-            Search results with Zotero item details
+            Search results with Zotero item details. Encoder-only passage
+            searches include ``passage_selection`` describing the ranked
+            prefix and whether its boundary or exhaustion was established.
+            With no excluded paper, every retrieved chunk is retained; a
+            single-paper filter can therefore expose the entire indexed paper.
         """
         try:
             # Over-fetch candidates when re-ranking and/or chunking are on.
@@ -4406,6 +4411,7 @@ class ZoteroSemanticSearch:
             distinct_parent_target = limit + 1 if use_parent_boundary else limit
 
             results = self.chroma_client.search(query_texts=[query], n_results=fetch_limit, where=filters)
+            collection_count: int | None = None
             if self._chunking_enabled:
                 # A single book can legitimately own hundreds of highly ranked
                 # chunks. Keep widening to the collection boundary so those
@@ -4413,11 +4419,10 @@ class ZoteroSemanticSearch:
                 # other parents. Most searches still stop after the first or
                 # second small query once enough distinct items are present.
                 try:
-                    max_fetch = max(
-                        fetch_limit,
-                        self.chroma_client.count_documents(),
-                    )
+                    collection_count = self.chroma_client.count_documents()
+                    max_fetch = max(fetch_limit, collection_count)
                 except Exception:
+                    collection_count = None
                     max_chunks = int(
                         self._chunking_config.get(
                             "max_chunks_per_item",
@@ -4448,11 +4453,45 @@ class ZoteroSemanticSearch:
             # Geometric widening may fetch a tail beyond the exact boundary.
             # Remove it before any reranking or enrichment can observe it.
             all_chunk_candidates_are_hits = False
+            passage_selection: dict[str, Any] | None = None
+            selection_warnings: list[str] = []
             if use_parent_boundary:
-                results, all_chunk_candidates_are_hits = self._trim_chunk_results_to_parent_boundary(
+                candidate_ids = (results.get("ids") or [[]])[0]
+                # A short response exhausts the filtered result set. A full
+                # response exhausts it only if the collection count proves it.
+                # Reaching the configured fallback ceiling is NOT proof of
+                # exhaustion: older indexed items may exceed today's chunk cap.
+                candidates_exhausted = len(candidate_ids) < fetch_limit or (
+                    collection_count is not None
+                    and len(candidate_ids) >= collection_count
+                )
+                results, boundary_found = self._trim_chunk_results_to_parent_boundary(
                     results,
                     limit,
                 )
+                # Use one selection policy even when no excluded parent exists.
+                # In particular, single-paper and small-library searches must
+                # not switch to three supports, overlap filtering or a bonus.
+                all_chunk_candidates_are_hits = True
+                selection_complete = boundary_found or candidates_exhausted
+                passage_selection = {
+                    "policy": "parent_rank_prefix",
+                    "stop_reason": (
+                        "excluded_parent" if boundary_found
+                        else "exhausted" if candidates_exhausted
+                        else "candidate_limit"
+                    ),
+                    "selection_complete": selection_complete,
+                    "candidate_chunks": len(candidate_ids),
+                    "returned_chunks": len((results.get("ids") or [[]])[0]),
+                }
+                if not selection_complete:
+                    selection_warnings.append(
+                        "Passage retrieval reached its candidate ceiling without "
+                        "an excluded-paper boundary or confirmed exhaustion. "
+                        "All retrieved chunks are shown, but additional indexed "
+                        "passages may be missing."
+                    )
 
             # Re-rank results with cross-encoder if enabled. With chunking we
             # rerank ALL candidates (grouping to `limit` items happens in
@@ -4475,13 +4514,18 @@ class ZoteroSemanticSearch:
                 all_chunk_candidates_are_hits=all_chunk_candidates_are_hits,
             )
 
-            return {
+            response: dict[str, Any] = {
                 "query": query,
                 "limit": limit,
                 "filters": filters,
                 "results": enriched_results,
                 "total_found": len(enriched_results),
             }
+            if passage_selection is not None:
+                response["passage_selection"] = passage_selection
+            if selection_warnings:
+                response["warnings"] = selection_warnings
+            return response
 
         except Exception as e:
             logger.error(f"Error performing semantic search: {e}")
@@ -4506,12 +4550,12 @@ class ZoteroSemanticSearch:
 
         Chunk-aware: when the collection is indexed as passages, ids look like
         ``<item_key>#<n>``. Results are grouped back to their parent item. The
-        first (best-ranked) passage supplies the primary result. When search
-        has trimmed candidates at the first excluded-parent boundary, every
-        remaining chunk is a qualifying hit and is retained without a support
-        bonus. Otherwise the historical bounded-support heuristic remains the
-        fallback. Item-level collections (ids without ``#``) flow through
-        unchanged.
+        first (best-ranked) passage supplies the primary result. Encoder-only
+        search retains every chunk in its selected prefix without a support
+        bonus, including an open-ended prefix when no parent is excluded.
+        The historical bounded-support heuristic remains available for the
+        optional reranker and callers that do not request prefix semantics.
+        Item-level collections (ids without ``#``) flow through unchanged.
         """
         enriched: list[dict[str, Any]] = []
 

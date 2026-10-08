@@ -267,3 +267,52 @@ def test_semantic_search_combines_item_key_with_exact_filters(monkeypatch):
             {"item_key": {"$eq": "PAPER001"}},
         ]
     }
+
+
+def test_metadata_failure_preserves_all_selected_supporting_chunks(monkeypatch):
+    class _ResultSearch:
+        def search(self, **_kwargs):
+            return {
+                "results": [{
+                    "item_key": "PAPER001",
+                    "similarity_score": 0.9,
+                    "chunk_id": "PAPER001#0",
+                    "content_hash": "a" * 64,
+                    "matched_passage": "primary evidence",
+                    "matched_passages": [
+                        {"chunk_id": "PAPER001#0", "matched_passage": "primary evidence"},
+                        {"chunk_id": "PAPER001#1", "content_hash": "b" * 64,
+                         "matched_passage": "supporting evidence"},
+                        {"chunk_id": "PAPER001#2", "content_hash": "c" * 64,
+                         "matched_passage": ""},
+                    ],
+                    "error": "Metadata lookup failed",
+                }],
+            }
+
+    monkeypatch.setattr(semantic_module, "create_semantic_search", lambda _path: _ResultSearch())
+    monkeypatch.setattr(search_tools, "_maybe_fire_presearch_sync", lambda _search: None)
+    result = search_tools.semantic_search(query="evidence", ctx=DummyContext())
+
+    assert "**Supporting Passages:**" in result
+    assert f"`PAPER001#1`: `{'b' * 64}`" in result
+    # An empty preview must not hide a retrievable ID/hash either.
+    assert f"`PAPER001#2`: `{'c' * 64}`" in result
+    assert "supporting evidence" in result
+    assert "Metadata lookup failed" in result
+
+
+def test_semantic_search_surfaces_incomplete_candidate_warning(monkeypatch):
+    class _ResultSearch:
+        def search(self, **_kwargs):
+            return {
+                "results": [],
+                "warnings": ["Passage candidate ceiling reached; additional chunks may be missing."],
+            }
+
+    monkeypatch.setattr(semantic_module, "create_semantic_search", lambda _path: _ResultSearch())
+    monkeypatch.setattr(search_tools, "_maybe_fire_presearch_sync", lambda _search: None)
+    result = search_tools.semantic_search(query="evidence", ctx=DummyContext())
+
+    assert "**Partial coverage:**" in result
+    assert "additional chunks may be missing" in result

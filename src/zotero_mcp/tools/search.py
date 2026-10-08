@@ -1062,28 +1062,24 @@ def advanced_search(
 @mcp.tool(
     name="zotero_semantic_search",
     description=(
-        "First-step concept and topic search across the active Zotero "
-        "library. Use this to discover relevant papers, claims, methods, or "
-        "passages by meaning; do not open papers one by one to search. "
-        "Results contain paper metadata, relevance, and a grounded matched "
-        "excerpt. With a passage-chunked index they also contain a Chunk ID "
-        "and Chunk Hash. Normal follow-up: call "
-        "zotero_get_semantic_context with a promising Chunk ID to inspect "
-        "the exact indexed evidence. Call zotero_get_item_fulltext only when "
-        "the user requests whole-paper reading or the task genuinely needs "
-        "information spread across the document; never load every search "
-        "result in full. query: natural-language topic, claim, or question. "
-        "limit: maximum paper-level results, default 10. item_key: optional "
-        "exact parent item key, useful for finding the best indexed passage "
-        "inside one known paper. filters: optional exact-match Chroma metadata "
-        "constraints as a dict or JSON string. Supported indexed fields include "
-        "item_key, item_type, title, date, creators, publication, doi, tags, "
-        "citation_key, has_fulltext, fulltext_source, library_identity, "
-        "library_id, and library_type. Requires a populated "
-        "semantic database; check zotero_get_search_database_status when "
-        "readiness is uncertain. Example: "
-        "zotero_semantic_search(query='negative muon capture in helium', "
-        "limit=5)."
+        "First-step concept and topic search across the active Zotero library. "
+        "Discover papers, claims, methods, or passages by meaning; do not open "
+        "papers one by one to search. Returns paper metadata, relevance, "
+        "matched previews and, with a passage index, Chunk IDs and Hashes. "
+        "Expand evidence with zotero_get_semantic_context; use "
+        "zotero_get_item_fulltext only for requested whole-paper reading or "
+        "information spread across a document, never every result in full. "
+        "query: topic, claim, or question. limit: paper-level maximum (10). "
+        "Encoder-only passage search keeps all chunks before the first excluded "
+        "paper, or all retrieved chunks if none is excluded. item_key: exact "
+        "parent key; can return every indexed chunk of one paper, including "
+        "weak matches. Optional reranking retains bounded support selection. "
+        "filters: exact-match metadata dict or JSON string. Fields: item_key, "
+        "item_type, title, date, creators, publication, doi, tags, citation_key, "
+        "has_fulltext, fulltext_source, library_identity, library_id, library_type. "
+        "Requires a populated semantic database; check "
+        "zotero_get_search_database_status when readiness is uncertain. Example: "
+        "zotero_semantic_search(query='negative muon capture in helium', limit=5)."
     )
 )
 def semantic_search(
@@ -1214,6 +1210,10 @@ def semantic_search(
                             f"{library_type}:{library_id}: {outcome['error']}"
                         )
                         continue
+                    global_warnings.extend(
+                        f"{library_type}:{library_id}: {warning}"
+                        for warning in outcome.get("warnings", [])
+                    )
                     for result in outcome.get("results", []):
                         item = result.get("zotero_item")
                         if isinstance(item, dict):
@@ -1246,6 +1246,7 @@ def semantic_search(
         if results.get("error"):
             return f"Semantic search error: {results['error']}"
 
+        global_warnings.extend(results.get("warnings", []))
         search_results = results.get("results", [])
 
         if not search_results:
@@ -1291,6 +1292,16 @@ def semantic_search(
             elif off := result.get("char_start", result.get("passage_offset")):
                 loc_bits.append(f"char ~{off}")
 
+            supporting_text = "\n\n".join(
+                (
+                    f"`{support['chunk_id']}`: "
+                    f"`{support.get('content_hash', '')}`\n"
+                    f"{support.get('matched_passage', '')[:400]}"
+                )
+                for support in result.get("matched_passages", [])[1:]
+                if support.get("chunk_id")
+            )
+
             if zotero_item:
                 extra = {"Relevance": f"{similarity_score:.3f}"}
                 if chunk_id := result.get("chunk_id"):
@@ -1301,18 +1312,8 @@ def semantic_search(
                     extra["Location"] = ", ".join(loc_bits)
                 if snippet:
                     extra["Matched Passage"] = snippet
-                supporting = result.get("matched_passages", [])[1:]
-                if supporting:
-                    extra["Supporting Passages"] = "\n\n".join(
-                        (
-                            f"`{passage['chunk_id']}`: "
-                            f"`{passage.get('content_hash', '')}`\n"
-                            f"{passage.get('matched_passage', '')[:400]}"
-                        )
-                        for passage in supporting
-                        if passage.get("chunk_id")
-                        and passage.get("matched_passage")
-                    )
+                if supporting_text:
+                    extra["Supporting Passages"] = supporting_text
                 # Override key from result since it may differ from item["key"]
                 zotero_item.setdefault("key", result.get("item_key", ""))
                 output.extend(
@@ -1335,6 +1336,8 @@ def semantic_search(
                     output.append(f"**Location:** {', '.join(loc_bits)}")
                 if snippet:
                     output.append(f"**Matched Passage:** {snippet}")
+                if supporting_text:
+                    output.append(f"**Supporting Passages:** {supporting_text}")
                 if error := result.get("error"):
                     output.append(f"**Error:** {error}")
                 output.append("")

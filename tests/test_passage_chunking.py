@@ -874,7 +874,7 @@ def test_fetched_tail_cannot_add_support_or_break_cutoff_ties(monkeypatch):
         (3, ["A#0", "A#1", "A#2", "A#3", "B#0"], ["A", "B"]),
     ],
 )
-def test_search_without_excluded_parent_preserves_enrichment_fallback(
+def test_search_without_excluded_parent_retains_every_chunk(
     monkeypatch,
     limit,
     ids,
@@ -887,14 +887,17 @@ def test_search_without_excluded_parent_preserves_enrichment_fallback(
 
     assert [entry["item_key"] for entry in result["results"]] == expected_parents
     paper_a = result["results"][0]
-    # Historical no-boundary behavior retains at most two supporting passages
-    # and their bounded relevance bonus.
+    # An exhausted result set is an open-ended ranked prefix, not a reason
+    # to silently switch to three passages or inflate the primary score.
     assert [p["chunk_id"] for p in paper_a["matched_passages"]] == [
         "A#0",
         "A#1",
         "A#2",
+        "A#3",
     ]
-    assert paper_a["similarity_score"] > paper_a["best_chunk_similarity_score"]
+    assert paper_a["similarity_score"] == paper_a["best_chunk_similarity_score"]
+    assert result["passage_selection"]["stop_reason"] == "exhausted"
+    assert result["passage_selection"]["selection_complete"] is True
 
 
 def test_filtered_single_parent_search_has_no_invented_cutoff(monkeypatch):
@@ -906,4 +909,145 @@ def test_filtered_single_parent_search_has_no_invented_cutoff(monkeypatch):
 
     assert client.filters == [filters]
     assert [entry["item_key"] for entry in result["results"]] == ["A"]
-    assert [p["chunk_id"] for p in result["results"][0]["matched_passages"]] == ["A#0"]
+    assert [p["chunk_id"] for p in result["results"][0]["matched_passages"]] == [
+        "A#0", "A#1", "A#2",
+    ]
+    assert result["passage_selection"]["stop_reason"] == "exhausted"
+
+
+@pytest.mark.parametrize("limit", [1, 2, 10, 20])
+def test_single_parent_retains_all_chunks_regardless_of_paper_limit(monkeypatch, limit):
+    ids = [f"A#{i}" for i in range(8)]
+    # Overlapping offsets and poor scores must not reactivate support filtering.
+    client = _RankedChunkSearchFake(ids, distances=[0.1 * i for i in range(8)])
+    search = _ranked_chunk_search(monkeypatch, client)
+    filters = {"item_key": {"$eq": "A"}}
+
+    result = search.search("query", limit=limit, filters=filters)
+
+    [paper] = result["results"]
+    assert [p["chunk_id"] for p in paper["matched_passages"]] == ids
+    assert paper["supporting_chunk_count"] == 7
+    assert paper["similarity_score"] == paper["best_chunk_similarity_score"]
+    assert result["passage_selection"]["selection_complete"] is True
+    assert result["passage_selection"]["stop_reason"] == "exhausted"
+    assert "warnings" not in result
+    assert all(actual == filters for actual in client.filters)
+
+
+def test_increasing_paper_limit_cannot_remove_chunks_at_exhaustion(monkeypatch):
+    ids = [f"A#{i}" for i in range(8)] + ["B#0"]
+    results = [
+        _ranked_chunk_search(monkeypatch, _RankedChunkSearchFake(ids)).search("q", limit=limit)
+        for limit in (1, 2, 3, 20)
+    ]
+
+    for result in results:
+        paper_a = next(paper for paper in result["results"] if paper["item_key"] == "A")
+        assert [p["chunk_id"] for p in paper_a["matched_passages"]] == ids[:8]
+        assert paper_a["similarity_score"] == pytest.approx(0.9)
+    assert results[0]["passage_selection"]["stop_reason"] == "excluded_parent"
+    assert all(r["passage_selection"]["stop_reason"] == "exhausted" for r in results[1:])
+
+
+def test_no_boundary_keeps_best_chunk_order_without_support_bonus(monkeypatch):
+    client = _RankedChunkSearchFake(
+        ["A#0", "B#0", "B#1", "B#2"],
+        distances=[0.10, 0.11, 0.12, 0.13],
+        overlapping=False,
+    )
+    result = _ranked_chunk_search(monkeypatch, client).search("q", limit=2)
+
+    assert [paper["item_key"] for paper in result["results"]] == ["A", "B"]
+    assert [paper["similarity_score"] for paper in result["results"]] == pytest.approx([0.90, 0.89])
+
+
+def test_single_parent_keeps_even_nonpositive_similarity_passages(monkeypatch):
+    ids = ["A#0", "A#1", "A#2", "A#3"]
+    client = _RankedChunkSearchFake(ids, distances=[0.2, 1.0, 1.2, 1.8])
+    result = _ranked_chunk_search(monkeypatch, client).search("q", limit=1)
+
+    assert [p["chunk_id"] for p in result["results"][0]["matched_passages"]] == ids
+    assert result["results"][0]["matched_passages"][-1]["similarity_score"] < 0
+
+
+def test_single_parent_uses_collection_count_not_current_chunk_cap(monkeypatch):
+    ids = [f"A#{i}" for i in range(1037)]
+    client = _RankedChunkSearchFake(ids)
+    result = _ranked_chunk_search(monkeypatch, client, max_chunks=5).search("q", limit=1)
+
+    assert client.fetches[-1] == 1037
+    assert len(result["results"][0]["matched_passages"]) == 1037
+    assert result["passage_selection"]["selection_complete"] is True
+
+
+def test_filtered_exhaustion_does_not_require_whole_collection_count(monkeypatch):
+    class _LargeCollection(_RankedChunkSearchFake):
+        def count_documents(self):
+            return 1000
+
+    ids = [f"A#{i}" for i in range(8)]
+    client = _LargeCollection(ids)
+    result = _ranked_chunk_search(monkeypatch, client).search(
+        "q", limit=1, filters={"item_key": "A"},
+    )
+
+    # Exact-size responses are not proof of exhaustion; one larger query is.
+    assert client.fetches == [4, 8, 16]
+    assert result["passage_selection"] == {
+        "policy": "parent_rank_prefix",
+        "stop_reason": "exhausted",
+        "selection_complete": True,
+        "candidate_chunks": 8,
+        "returned_chunks": 8,
+    }
+
+
+def test_unknown_count_short_response_still_proves_exhaustion(monkeypatch):
+    ids = [f"A#{i}" for i in range(5)]
+    client = _RankedChunkSearchFake(ids, count_available=False)
+    result = _ranked_chunk_search(monkeypatch, client, max_chunks=5).search("q", limit=1)
+
+    assert client.fetches == [4, 7]
+    assert result["passage_selection"]["selection_complete"] is True
+    assert "warnings" not in result
+    assert len(result["results"][0]["matched_passages"]) == 5
+
+
+@pytest.mark.parametrize("actual_count", [7, 30])
+def test_unknown_count_ceiling_is_explicitly_incomplete(monkeypatch, actual_count):
+    client = _RankedChunkSearchFake(
+        [f"A#{i}" for i in range(actual_count)], count_available=False,
+    )
+    result = _ranked_chunk_search(monkeypatch, client, max_chunks=5).search("q", limit=1)
+
+    assert client.fetches == [4, 7]
+    assert len(result["results"][0]["matched_passages"]) == 7
+    assert result["passage_selection"]["stop_reason"] == "candidate_limit"
+    assert result["passage_selection"]["selection_complete"] is False
+    assert "additional indexed passages may be missing" in result["warnings"][0]
+
+
+def test_empty_chunk_search_is_complete_without_fabricated_papers(monkeypatch):
+    result = _ranked_chunk_search(monkeypatch, _RankedChunkSearchFake([])).search("q", limit=1)
+
+    assert result["results"] == []
+    assert result["total_found"] == 0
+    assert result["passage_selection"]["stop_reason"] == "exhausted"
+    assert result["passage_selection"]["returned_chunks"] == 0
+    assert "warnings" not in result
+
+
+def test_optional_reranker_keeps_existing_bounded_support_policy(monkeypatch):
+    class _IdentityReranker:
+        def rerank(self, _query, documents, top_k):
+            return list(range(min(len(documents), top_k)))
+
+    client = _RankedChunkSearchFake([f"A#{i}" for i in range(8)], overlapping=False)
+    search = _ranked_chunk_search(monkeypatch, client)
+    monkeypatch.setattr(search, "_get_reranker", lambda: _IdentityReranker())
+    result = search.search("q", limit=1)
+
+    assert len(result["results"][0]["matched_passages"]) == 3
+    assert result["results"][0]["similarity_score"] > result["results"][0]["best_chunk_similarity_score"]
+    assert "passage_selection" not in result
